@@ -1,0 +1,42 @@
+From 5f3cd707633bba466085ec22ab15645f0e7e3cc1 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 31 Oct 2026 22:22:55 +0100
+Subject: [PATCH] netplay: a multi-region NES 2.0 ROM is NTSC, as in the core
+
+rom_region_from_header() put multi-region (timing 2) together with Dendy and
+refused it, e.g. Super Mario Bros. (World). The core's Auto system type runs
+multi-region as NTSC (NES.sv), so netplay now does the same.
+---
+ support/netplay/netplay_proto.cpp     | 3 ++-
+ support/netplay/test/test_netplay.cpp | 1 +
+ 2 files changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/support/netplay/netplay_proto.cpp b/support/netplay/netplay_proto.cpp
+index 81fac72..18363a4 100644
+--- a/support/netplay/netplay_proto.cpp
++++ b/support/netplay/netplay_proto.cpp
+@@ -95,7 +95,8 @@ uint8_t rom_region_from_header(const uint8_t *hdr, size_t len, const char *ext)
+ 	{
+ 	case 0:  return 0;                          // NTSC
+ 	case 1:  return 1;                          // PAL
+-	default: return 2;                          // multi-region / Dendy
++	case 2:  return 0;                          // multi-region: the core's Auto runs it as NTSC (NES.sv)
++	default: return 2;                          // Dendy
+ 	}
+ }
+ 
+diff --git a/support/netplay/test/test_netplay.cpp b/support/netplay/test/test_netplay.cpp
+index 88a86ef..852c5f3 100644
+--- a/support/netplay/test/test_netplay.cpp
++++ b/support/netplay/test/test_netplay.cpp
+@@ -221,6 +221,7 @@ static void test_settings()
+ 	uint8_t h[16] = {'N', 'E', 'S', 0x1A};
+ 	CHECK(rom_region_from_header(h, 16, "nes") == 0);
+ 	h[7] = 0x08; h[12] = 1; CHECK(rom_region_from_header(h, 16, "nes") == 1);
++	h[12] = 2; CHECK(rom_region_from_header(h, 16, "nes") == 0);   // multi-region, e.g. SMB (World): NTSC like the core
+ 	h[12] = 3; CHECK(rom_region_from_header(h, 16, "nes") == 2);
+ 	h[7] = 0x09; CHECK(rom_region_from_header(h, 16, "nes") == 3);
+ 	CHECK(rom_region_from_header(h, 16, "FDS") == 3);
+-- 
+2.43.0
+

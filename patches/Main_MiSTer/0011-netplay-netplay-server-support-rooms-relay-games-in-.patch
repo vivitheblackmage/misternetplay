@@ -1,0 +1,595 @@
+From 318a6af0a8503cf540ef7886f4c0efe926aae29f Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sun, 1 Nov 2026 03:09:01 +0100
+Subject: [PATCH] netplay: netplay-server support (rooms + relay, games in a
+ RAM folder, catalog)
+
+With server=, room= and key= in netplay.ini, host and join send only to a
+netplay-server, which pairs them by room and relays the session packets; only
+the server needs an open port. At core load the server's games are fetched
+(md5-checked) into a tmpfs, <NES games>/_Netplay server, so the OSD file
+browser shows them and nothing is written to the SD card. The server's
+catalog of bring-your-own versions gives an OSD warning for another version.
+
+The UDP test also runs through a real server (server/build) that hands out
+the game. The harness keeps running briefly after its target so the other
+side is not cut off one frame short.
+---
+ support/netplay/netplay.cpp          | 303 ++++++++++++++++++++++++++-
+ support/netplay/test/Makefile        |   1 +
+ support/netplay/test/run_udp_test.sh |  18 +-
+ support/netplay/test/udp_harness.cpp |  64 +++++-
+ 4 files changed, 371 insertions(+), 15 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 52838eb..496db85 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -14,6 +14,9 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <sys/stat.h>
++#include <sys/mount.h>
++#include <poll.h>
++#include <map>
+ #include <pthread.h>
+ #include <netdb.h>
+ #include <arpa/inet.h>
+@@ -46,6 +49,9 @@ struct Config
+ 	uint16_t port = 7845;
+ 	uint8_t  delay = 2;
+ 	char     file[512] = "";              // empty: one file per game, see recording_path()
++	char     server[128] = {};            // netplay-server "host[:port]": rooms, relay, games
++	char     room[64] = "mister";
++	char     key[64] = {};
+ };
+ 
+ static bool load_config(Config *c)
+@@ -84,11 +90,25 @@ static bool load_config(Config *c)
+ 		else if (!strcasecmp(k, "port"))  c->port = (uint16_t)strtoul(v, nullptr, 10);
+ 		else if (!strcasecmp(k, "delay")) c->delay = (uint8_t)strtoul(v, nullptr, 10);
+ 		else if (!strcasecmp(k, "file"))  snprintf(c->file, sizeof(c->file), "%s", v);
++		else if (!strcasecmp(k, "server")) snprintf(c->server, sizeof(c->server), "%s", v);
++		else if (!strcasecmp(k, "room") && *v) snprintf(c->room, sizeof(c->room), "%s", v);
++		else if (!strcasecmp(k, "key"))   snprintf(c->key, sizeof(c->key), "%s", v);
+ 	}
+ 	fclose(f);
++	for (char *t = c->room; *t; t++) if (*t == ' ') *t = '_';   // one word on the wire
++	for (char *t = c->key; *t; t++) if (*t == ' ') *t = '_';
+ 	return true;
+ }
+ 
++// "host:port" or "host" -> host, port
++static void split_hostport(const char *in, uint16_t def, char *host, size_t cap, uint16_t *port)
++{
++	snprintf(host, cap, "%s", in);
++	*port = def;
++	char *c = strrchr(host, ':');
++	if (c) { *c = 0; *port = (uint16_t)strtoul(c + 1, nullptr, 10); if (!*port) *port = def; }
++}
++
+ // ---------------------------------------------------------------------------
+ // UDP
+ 
+@@ -123,6 +143,43 @@ public:
+ 		return true;
+ 	}
+ 
++	// Through a netplay-server: both sides send only to the server, which pairs
++	// host and join of a room and relays the session packets unchanged.
++	bool open_server(const char *server, uint16_t def_port, const char *key, const char *room, bool host)
++	{
++		fd_ = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++		if (fd_ < 0) return false;
++		sockaddr_in a {};
++		a.sin_family = AF_INET;
++		a.sin_addr.s_addr = htonl(INADDR_ANY);
++		if (bind(fd_, (sockaddr *)&a, sizeof(a)) < 0) return false;
++
++		char h[128];
++		uint16_t port;
++		split_hostport(server, def_port, h, sizeof(h), &port);
++		addrinfo hints {}, *res = nullptr;
++		hints.ai_family = AF_INET;
++		hints.ai_socktype = SOCK_DGRAM;
++		char ps[8];
++		snprintf(ps, sizeof(ps), "%u", port);
++		if (getaddrinfo(h, ps, &hints, &res) || !res) return false;
++		memcpy(&peer_, res->ai_addr, sizeof(peer_));
++		freeaddrinfo(res);
++		have_peer_ = locked_ = server_ = true;
++		snprintf(room_, sizeof(room_), "%s", room);
++		snprintf(reg_, sizeof(reg_), "NPS1 REG %s %s %s", *key ? key : "-", room, host ? "host" : "join");
++		register_now();
++		return true;
++	}
++
++	// A message for the OSD, once per change (server replies)
++	const char *take_notice()
++	{
++		if (notice_seq_ == notice_shown_) return nullptr;
++		notice_shown_ = notice_seq_;
++		return notice_;
++	}
++
+ 	~Udp() override { if (fd_ >= 0) close(fd_); }
+ 
+ 	void send(const uint8_t *buf, size_t len) override
+@@ -133,12 +190,21 @@ public:
+ 
+ 	int recv(uint8_t *buf, size_t cap) override
+ 	{
++		// registration until the server answers, then a keepalive for the room
++		// and the NAT mapping
++		if (server_ && now_ms() - t_reg_ >= (registered_ ? 3000u : 1000u)) register_now();
+ 		for (;;)
+ 		{
+ 			sockaddr_in from {};
+ 			socklen_t fl = sizeof(from);
+ 			ssize_t n = recvfrom(fd_, buf, cap, MSG_DONTWAIT, (sockaddr *)&from, &fl);
+ 			if (n < 0) return -1;
++			if (server_ && n >= 5 && !memcmp(buf, "NPS1 ", 5))
++			{
++				if (from.sin_addr.s_addr == peer_.sin_addr.s_addr && from.sin_port == peer_.sin_port)
++					server_reply((const char *)buf, (size_t)n);
++				continue;
++			}
+ 			if (locked_)
+ 			{
+ 				// ignore everyone but the peer once a session is agreed
+@@ -156,9 +222,49 @@ public:
+ 	void lock_peer() override { if (have_peer_) locked_ = true; }
+ 
+ private:
++	static uint64_t now_ms()
++	{
++		timespec ts;
++		clock_gettime(CLOCK_MONOTONIC, &ts);
++		return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++	}
++
++	void register_now()
++	{
++		t_reg_ = now_ms();
++		sendto(fd_, reg_, strlen(reg_), 0, (sockaddr *)&peer_, sizeof(peer_));
++	}
++
++	void server_reply(const char *b, size_t n)
++	{
++		char r[96];
++		snprintf(r, sizeof(r), "%.*s", (int)(n < sizeof(r) - 1 ? n : sizeof(r) - 1), b);
++		char text[96];
++		if (!strncmp(r, "NPS1 OK", 7))
++		{
++			if (registered_) return;
++			registered_ = true;
++			snprintf(text, sizeof(text), "Netplay: server, room %s", room_);
++		}
++		else if (!strncmp(r, "NPS1 ERR ", 9))
++		{
++			registered_ = false;
++			snprintf(text, sizeof(text), "Netplay: server: %.70s", r + 9);
++		}
++		else return;
++		if (!strcmp(text, notice_)) return;
++		snprintf(notice_, sizeof(notice_), "%s", text);
++		notice_seq_++;
++	}
++
+ 	int fd_ = -1;
+ 	sockaddr_in peer_ {};
+ 	bool have_peer_ = false, locked_ = false;
++	bool server_ = false, registered_ = false;
++	uint64_t t_reg_ = 0;
++	char reg_[200] = {}, room_[64] = {};
++	char notice_[96] = {};
++	uint32_t notice_seq_ = 0, notice_shown_ = 0;
+ };
+ 
+ // ---------------------------------------------------------------------------
+@@ -288,11 +394,20 @@ static void *netplay_thread(void *)
+ 			memcpy(md5, li.rom_md5, 16);
+ 
+ 			bool ok = mode != M_OFF;      // OSD "Off": no session for this ROM
+-			if (mode == M_JOIN && !cfg.peer[0])
++			if (mode == M_JOIN && !cfg.peer[0] && !cfg.server[0])
+ 			{
+-				post_message("Netplay: Join needs peer= in netplay.ini");
++				post_message("Netplay: Join needs peer= or server= in netplay.ini");
+ 				ok = false;
+ 			}
++			else if ((mode == M_HOST || mode == M_JOIN) && cfg.server[0])
++			{
++				udp = new Udp();
++				if (!udp->open_server(cfg.server, cfg.port, cfg.key, cfg.room, mode == M_HOST))
++				{
++					post_message("Netplay: cannot reach server (check server=)");
++					ok = false;
++				}
++			}
+ 			else if (mode == M_HOST || mode == M_JOIN)
+ 			{
+ 				udp = new Udp();
+@@ -323,6 +438,8 @@ static void *netplay_thread(void *)
+ 			if (s->reload_requested() && !reload_req && !reload_done) reload_req = true;
+ 			if (reload_done.exchange(false)) s->reload_done(now);
+ 			if (s->msg_seq() != seen_msg) { seen_msg = s->msg_seq(); post_message(s->message()); }
++			if (udp)
++				if (const char *n = udp->take_notice()) post_message(n);
+ 
+ 			// Only a recording that has frames: a session refused at the start
+ 			// would overwrite the last good file, and hide the reason on the OSD.
+@@ -352,6 +469,180 @@ static void *netplay_thread(void *)
+ // ---------------------------------------------------------------------------
+ // Main-thread side
+ 
++// ---------------------------------------------------------------------------
++// Games from the server: its roms folder is copied into a RAM folder (tmpfs)
++// inside the NES games folder, "_Netplay server", so the OSD file browser shows
++// them and nothing is written to the SD card. Its catalog (versions everyone
++// brings themselves) is kept in memory to warn about a different version.
++
++static std::string        srv_dir;            // the RAM folder
++static bool               srv_mounted = false;
++static pthread_t          dl_thread;
++static bool               dl_running = false;
++static std::atomic<bool>  dl_quit { false };
++static std::mutex         cat_mtx;
++static std::map<std::string, std::string> catalog;   // md5 hex -> name
++
++static std::string url_enc(const char *in)
++{
++	std::string out;
++	for (const unsigned char *p = (const unsigned char *)in; *p; p++)
++	{
++		if (isalnum(*p) || strchr("-_.~", *p)) out += (char)*p;
++		else { char h[4]; snprintf(h, sizeof(h), "%%%02X", *p); out += h; }
++	}
++	return out;
++}
++
++static std::string md5_hex(const uint8_t *d)
++{
++	char h[33];
++	for (int i = 0; i < 16; i++) snprintf(h + 2 * i, 3, "%02x", d[i]);
++	return h;
++}
++
++// Blocking HTTP/1.0 GET to the server's TCP port; 5 s timeouts. Body in *out.
++static bool http_get(const std::string &path, std::string *out, size_t limit)
++{
++	char h[128];
++	uint16_t port;
++	split_hostport(cfg.server, cfg.port, h, sizeof(h), &port);
++	addrinfo hints {}, *res = nullptr;
++	hints.ai_family = AF_INET;
++	hints.ai_socktype = SOCK_STREAM;
++	char ps[8];
++	snprintf(ps, sizeof(ps), "%u", port);
++	if (getaddrinfo(h, ps, &hints, &res) || !res) return false;
++	int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
++	bool ok = fd >= 0;
++	if (ok && connect(fd, res->ai_addr, res->ai_addrlen) < 0)
++	{
++		pollfd pf { fd, POLLOUT, 0 };
++		int err = 0;
++		socklen_t el = sizeof(err);
++		ok = errno == EINPROGRESS && poll(&pf, 1, 5000) == 1
++		  && !getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) && !err;
++	}
++	freeaddrinfo(res);
++	if (!ok) { if (fd >= 0) close(fd); return false; }
++	fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
++	timeval tv { 5, 0 };
++	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++	setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
++
++	std::string req = "GET " + path + " HTTP/1.0\r\nHost: " + h + "\r\nConnection: close\r\n\r\n";
++	std::string resp;
++	ok = ::send(fd, req.data(), req.size(), MSG_NOSIGNAL) == (ssize_t)req.size();
++	char buf[4096];
++	while (ok && !dl_quit)
++	{
++		ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
++		if (n == 0) break;
++		if (n < 0 || resp.size() + n > limit + 4096) { ok = false; break; }
++		resp.append(buf, n);
++	}
++	close(fd);
++	size_t body = resp.find("\r\n\r\n");
++	if (!ok || dl_quit || body == std::string::npos || (resp.compare(0, 12, "HTTP/1.1 200") && resp.compare(0, 12, "HTTP/1.0 200")))
++		return false;
++	*out = resp.substr(body + 4);
++	return true;
++}
++
++// "md5 rest" lines
++static void for_lines(const std::string &text, void (*fn)(const std::string &md5, const std::string &rest, void *), void *arg)
++{
++	size_t pos = 0;
++	while (pos < text.size())
++	{
++		size_t end = text.find('\n', pos);
++		if (end == std::string::npos) end = text.size();
++		std::string line = text.substr(pos, end - pos);
++		pos = end + 1;
++		size_t sp = line.find(' ');
++		if (sp == 32) fn(line.substr(0, 32), line.substr(33), arg);
++	}
++}
++
++static void *download_thread(void *)
++{
++	std::string key = "key=" + url_enc(cfg.key[0] ? cfg.key : "-");
++	int got = 0, offered = 0;
++	std::string list;
++	if (srv_mounted && http_get("/roms?" + key, &list, 1 << 20))
++	{
++		struct Ctx { int *got, *offered; const std::string *key; } ctx { &got, &offered, &key };
++		for_lines(list, [](const std::string &md5, const std::string &rest, void *a) {
++			Ctx *c = (Ctx *)a;
++			if (dl_quit) return;
++			size_t sp = rest.find(' ');                   // "size name"
++			if (sp == std::string::npos) return;
++			std::string name = rest.substr(sp + 1);
++			unsigned long size = strtoul(rest.c_str(), nullptr, 10);
++			if (name.empty() || name[0] == '.' || name.find('/') != std::string::npos || size > (4u << 20)) return;
++			(*c->offered)++;
++			std::string data;
++			if (!http_get("/rom?" + *c->key + "&name=" + url_enc(name.c_str()), &data, 4u << 20)) return;
++			MD5Context m;
++			uint8_t d[16];
++			MD5Init(&m);
++			MD5Update(&m, (const unsigned char *)data.data(), (unsigned)data.size());
++			MD5Final(d, &m);
++			if (md5_hex(d) != md5) return;
++			std::string path = srv_dir + "/" + name;
++			FILE *f = fopen(path.c_str(), "wb");
++			if (!f) return;
++			bool w = fwrite(data.data(), 1, data.size(), f) == data.size();
++			fclose(f);
++			if (!w) { unlink(path.c_str()); return; }
++			(*c->got)++;
++			std::lock_guard<std::mutex> g(cat_mtx);
++			catalog[md5] = name;
++		}, &ctx);
++	}
++
++	std::string cat;
++	if (!dl_quit && http_get("/catalog?" + key, &cat, 1 << 20))
++		for_lines(cat, [](const std::string &md5, const std::string &rest, void *) {
++			std::lock_guard<std::mutex> g(cat_mtx);
++			catalog[md5] = rest;
++		}, nullptr);
++
++	if (dl_quit) return nullptr;
++	char text[96];
++	if (offered && got < offered) snprintf(text, sizeof(text), "Netplay: %d of %d server games loaded", got, offered);
++	else if (got) snprintf(text, sizeof(text), "Netplay: %d games in _Netplay server", got);
++	else if (list.empty() && cat.empty()) snprintf(text, sizeof(text), "Netplay: no answer from server (check server=, key=)");
++	else return nullptr;
++	post_message(text);
++	return nullptr;
++}
++
++// Main thread, at core load.
++static void server_games_start()
++{
++	srv_dir = std::string(getFullPath(user_io_get_core_path(nullptr, 0))) + "/_Netplay server";
++	mkdir(srv_dir.c_str(), 0755);
++	umount2(srv_dir.c_str(), MNT_DETACH);         // a RAM folder left over from a crash
++	srv_mounted = !mount("tmpfs", srv_dir.c_str(), "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=48m,mode=0755");
++	if (!srv_mounted) post_message("Netplay: no RAM folder for server games");
++	{
++		std::lock_guard<std::mutex> g(cat_mtx);
++		catalog.clear();
++	}
++	dl_quit = false;
++	dl_running = pthread_create(&dl_thread, nullptr, download_thread, nullptr) == 0;
++}
++
++static void server_games_stop()
++{
++	dl_quit = true;
++	if (dl_running) pthread_join(dl_thread, nullptr);
++	dl_running = false;
++	if (srv_mounted) umount2(srv_dir.c_str(), MNT_DETACH);   // the games are gone with it
++	srv_mounted = false;
++}
++
+ static bool is_nes_core()
+ {
+ 	return !strcasecmp(user_io_get_core_name(), "NES");
+@@ -405,6 +696,12 @@ void netplay_note_file(const char *name, unsigned char index, char opensave)
+ 	LocalInfo li {};
+ 	uint8_t hdr[16] = {};
+ 	if (!md5_file(name, li.rom_md5, hdr, sizeof(hdr))) return;
++	if (cfg.server[0])
++	{
++		std::lock_guard<std::mutex> g(cat_mtx);
++		if (!catalog.empty() && !catalog.count(md5_hex(li.rom_md5)))
++			post_message("Netplay: not the server's version of this game");
++	}
+ 	const char *dot = strrchr(name, '.');
+ 	li.rom_region = rom_region_from_header(hdr, sizeof(hdr), dot ? dot + 1 : "");
+ 	core_build(li.core_build);
+@@ -455,11 +752,13 @@ void netplay_start(void)
+ 	cfg = Config();
+ 	load_config(&cfg);
+ 	nes_armed = true;
++	if (cfg.server[0]) server_games_start();
+ }
+ 
+ void netplay_stop(void)
+ {
+ 	nes_armed = false;
++	server_games_stop();
+ 	if (!thread_running) return;
+ 	quit = true;
+ 	pthread_join(thread, nullptr);
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index 0c22206..9035510 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -12,6 +12,7 @@ test: test_netplay udp_harness
+ 	./test_netplay
+ 	./run_udp_test.sh
+ 	NP_OSD=1 ./run_udp_test.sh
++	@if [ -x ../../../../server/build/netplay-server-linux-amd64 ]; then NP_SERVER_BIN=$$(cd ../../../../server/build && pwd)/netplay-server-linux-amd64 ./run_udp_test.sh; else echo "SKIP udp (server): build it with server/build.sh"; fi
+ 
+ test_netplay: $(ENGINE) test_netplay.cpp $(HDRS)
+ 	$(CXX) $(CXXFLAGS) -o $@ $(ENGINE) test_netplay.cpp
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+index d71d66e..384a041 100755
+--- a/support/netplay/test/run_udp_test.sh
++++ b/support/netplay/test/run_udp_test.sh
+@@ -7,6 +7,18 @@ frames="${1:-600}"
+ tmp="$(mktemp -d)"
+ mkdir -p "$tmp/host" "$tmp/join"
+ 
++# NP_SERVER_BIN: meet through a real netplay-server, which also hands out the game
++if [ -n "${NP_SERVER_BIN:-}" ]; then
++	mkdir -p "$tmp/srv/roms"
++	"$bin" makerom "$tmp/srv/roms/game.nes"
++	printf 'port=47846\nkey=testkey\nroms=roms\n' > "$tmp/srv/netplay-server.ini"
++	"$NP_SERVER_BIN" -config "$tmp/srv/netplay-server.ini" > "$tmp/server.log" 2>&1 &
++	sp=$!
++	trap 'kill $sp 2>/dev/null' EXIT
++	sleep 0.5
++	export NP_SERVER=127.0.0.1:47846 NP_KEY=testkey
++fi
++
+ "$bin" host "$tmp/host" "$frames" > "$tmp/host.log" 2>&1 &
+ hp=$!
+ sleep 0.3
+@@ -20,10 +32,10 @@ echo "host: $h"
+ echo "join: $j"
+ hd=${h##*digest=}; jd=${j##*digest=}
+ if [ $hr -eq 0 ] && [ $jr -eq 0 ] && [ -n "$hd" ] && [ "$hd" = "$jd" ]; then
+-	echo "PASS udp${NP_OSD:+ (OSD mode)}"
++	echo "PASS udp${NP_OSD:+ (OSD mode)}${NP_SERVER_BIN:+ (server)}"
+ 	rm -rf "$tmp"
+ 	exit 0
+ fi
+-echo "FAIL udp${NP_OSD:+ (OSD mode)} (logs in $tmp)"
+-tail -20 "$tmp/host.log" "$tmp/join.log"
++echo "FAIL udp${NP_OSD:+ (OSD mode)}${NP_SERVER_BIN:+ (server)} (logs in $tmp)"
++tail -20 "$tmp/host.log" "$tmp/join.log" ${NP_SERVER_BIN:+"$tmp/server.log"}
+ exit 1
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index 2f9cf83..d1fe5c2 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -8,6 +8,7 @@
+ // run_udp_test.sh starts a host and a join and compares the digests.
+ 
+ #include <stdio.h>
++#include <sys/stat.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
+@@ -26,6 +27,11 @@ static int         reloads = 0;
+ // --- stubs for the MiSTer functions netplay.cpp uses ------------------------
+ 
+ char *user_io_get_core_name(int) { static char n[] = "NES"; return n; }
++char *user_io_get_core_path(const char *, int) { static char p[] = "games/NES"; return p; }
++
++// The RAM folder for server games is a plain folder here (no root needed).
++extern "C" int mount(const char *, const char *, const char *, unsigned long, const void *) { return 0; }
++extern "C" int umount2(const char *, int) { return 0; }
+ 
+ char *user_io_get_confstr(int index)
+ {
+@@ -73,8 +79,18 @@ static uint64_t now_ms()
+ 	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+ }
+ 
++static void make_rom(const char *path)            // same bytes on both sides
++{
++	FILE *f = fopen(path, "wb");
++	uint8_t hdr[16] = {'N', 'E', 'S', 0x1A, 2, 1};
++	fwrite(hdr, 16, 1, f);
++	for (int i = 0; i < 40960; i++) fputc((i * 7) & 0xFF, f);
++	fclose(f);
++}
++
+ int main(int argc, char **argv)
+ {
++	if (argc == 3 && !strcmp(argv[1], "makerom")) { make_rom(argv[2]); return 0; }
+ 	if (argc != 4) { fprintf(stderr, "usage: udp_harness <host|join> <workdir> <frames>\n"); return 2; }
+ 	bool host = !strcmp(argv[1], "host");
+ 	workdir = argv[2];
+@@ -83,21 +99,39 @@ int main(int argc, char **argv)
+ 	if (osd) osd_netplay = host ? 2 : 3;
+ 	uint32_t want = (uint32_t)atoi(argv[3]);
+ 
++	// NP_SERVER=host:port key: both sides meet in a room on a netplay-server and
++	// load the game it hands out (into games/NES/_Netplay server)
++	const char *server = getenv("NP_SERVER");
++	const char *key = getenv("NP_KEY");
+ 	FILE *f = fopen(getFullPath("netplay.ini"), "w");
+ 	fprintf(f, "; test\n[netplay]\nmode = %s ; comment\npeer=%s\nport=47845\ndelay=3\n",
+-	        osd ? "off" : host ? "host" : "join", host ? "" : "127.0.0.1");
++	        osd ? "off" : host ? "host" : "join", host || server ? "" : "127.0.0.1");
++	if (server) fprintf(f, "server=%s\nroom=test room\nkey=%s\n", server, key ? key : "");
+ 	fclose(f);
+ 
+-	f = fopen(getFullPath("game.nes"), "wb");               // same bytes on both sides
+-	uint8_t hdr[16] = {'N', 'E', 'S', 0x1A, 2, 1};
+-	fwrite(hdr, 16, 1, f);
+-	for (int i = 0; i < 40960; i++) fputc((i * 7) & 0xFF, f);
+-	fclose(f);
++	const char *game = "game.nes";
++	if (server)
++	{
++		std::string d = getFullPath("games");
++		mkdir(d.c_str(), 0755);
++		d += "/NES";
++		mkdir(d.c_str(), 0755);
++		game = "games/NES/_Netplay server/game.nes";
++	}
++	else make_rom(getFullPath(game));
+ 
+ 	fpga = new FakeFpga(host ? 0 : 1);
+ 	netplay_start();
++	if (server)                                // wait for the download
++	{
++		uint64_t t = now_ms();
++		struct stat st;
++		while (stat(getFullPath(game), &st) && now_ms() - t < 10000) { netplay_poll(); usleep(10000); }
++		if (stat(getFullPath(game), &st)) { printf("[harness] no game from the server\n"); return 1; }
++		netplay_poll();
++	}
+ 	netplay_note_file("palette.pal", 3, 0);    // a custom palette must not start a session
+-	netplay_note_file("game.nes", 1, 1);
++	netplay_note_file(game, 1, 1);
+ 
+ 	uint64_t t0 = now_ms();
+ 	while (fpga->frame < want && now_ms() - t0 < 60000)
+@@ -106,10 +140,20 @@ int main(int argc, char **argv)
+ 		netplay_poll();
+ 		usleep(500);
+ 	}
++	// Keep going a moment: stopping sends BYE, and the other side may still be
++	// a frame or two short of the target.
++	uint32_t reached = fpga->frame;
++	for (uint64_t t = now_ms(); now_ms() - t < 500; usleep(500)) { fpga->step(now_ms()); netplay_poll(); }
+ 	netplay_stop();
+ 
+ 	uint64_t digest = 1469598103934665603ULL;
+-	for (auto &p : fpga->seen) { digest = (digest ^ p.first) * 1099511628211ULL; digest = (digest ^ p.second) * 1099511628211ULL; }
+-	printf("RESULT frames=%u stalls=%u reloads=%d digest=%016llx\n", fpga->frame, fpga->stalls, reloads, (unsigned long long)digest);
+-	return (fpga->frame >= want && reloads == 1) ? 0 : 1;
++	uint32_t n = 0;
++	for (auto &p : fpga->seen)
++	{
++		if (n++ >= want) break;                // the same frames on both sides
++		digest = (digest ^ p.first) * 1099511628211ULL;
++		digest = (digest ^ p.second) * 1099511628211ULL;
++	}
++	printf("RESULT frames=%u stalls=%u reloads=%d digest=%016llx\n", reached, fpga->stalls, reloads, (unsigned long long)digest);
++	return (reached >= want && reloads == 1) ? 0 : 1;
+ }
+-- 
+2.43.0
+

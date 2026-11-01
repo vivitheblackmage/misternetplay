@@ -1,0 +1,362 @@
+From ca00e38b2215b3fd3b5788e2bf2160f5616949b7 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Fri, 30 Oct 2026 19:42:03 +0000
+Subject: [PATCH 2/2] netplay: fixes from independent review
+
+- CTRL needs a magic word and is cleared at power-on before MAGIC, so a
+  stray DDR word can never hold a plain NES game in reset
+- frame 0 CRC hashes inputs only (PPU reset ticks vary with wall time)
+- mic, SNAC, Zapper, paddle, Power Pad, keyboard, piano and OSD reset
+  are idle while netplay is active; local pad fed raw
+- PAL cpu_tick_count starts from a fixed phase after reset
+- pending LOCAL/CRC posts are dropped when leaving a session
+- testbench: stale-CTRL scenario, reset-phase PPU ticks modelled
+---
+ NES.sv            | 23 ++++++++++++++++++-----
+ rtl/nes.v         |  4 ++++
+ rtl/netplay.sv    | 41 +++++++++++++++++++++++++++++++++--------
+ sim/Makefile      |  2 +-
+ sim/np_machine.sv | 11 ++++++++++-
+ sim/tb_netplay.sv | 31 +++++++++++++++++++++++++++++--
+ 6 files changed, 95 insertions(+), 17 deletions(-)
+
+diff --git a/NES.sv b/NES.sv
+index d4e13c8..51cff08 100644
+--- a/NES.sv
++++ b/NES.sv
+@@ -518,6 +518,10 @@ assign USER_OUT[6] = 1'b1;
+ 
+ reg [4:0] joypad1_data, joypad2_data;
+ 
++// Netplay status, declared here because the controller logic below needs it
++// (the netplay block itself is further down).
++wire        np_active, np_hold_reset, np_pause_req;
++
+ wire joy0_d0 = snac_p2 ? ~USER_IN[6] : joypad_bits[0];
+ wire joy1_d0 = snac_p2 ? ~USER_IN[6] : joypad_bits2[0];
+ 
+@@ -551,6 +555,14 @@ always_comb begin
+ 		if (status[34:32] == 7) joypad2_data[4:1] = ~famtr;
+ 		if (fkeyb)              joypad2_data[4:1] = key_out;
+ 	end
++
++	// Netplay: only the two standard pads, which come from the mailbox. Mic,
++	// SNAC, Zapper, paddle, Power Pad and keyboard are local hardware the
++	// other player cannot see, so they read as idle.
++	if (np_active) begin
++		joypad1_data = {4'b0000, joypad_bits[0]};
++		joypad2_data = {4'b0000, joypad_bits2[0]};
++	end
+ end
+ 
+ wire mic = (mic_cnt < 8'd215) && mic_button;
+@@ -644,8 +656,9 @@ wire       paddle_btn = paddle_atr ? (joyA[4] | joyB[4] | joyC[4] | joyD[4]) : (
+ wire  [8:0] scanline_emu;
+ wire        ppu_ce_emu;
+ wire        corepaused;
+-wire        np_active, np_hold_reset, np_pause_req;
+ wire  [7:0] np_joy_p1, np_joy_p2;
++// Raw pad 1: nes_joy_A masks A when an Arkanoid paddle is selected.
++wire  [7:0] np_local_joy = { joyA[0], joyA[1], joyA[2], joyA[3], joyA[7], joyA[6], joyA[5], joyA[4] };
+ wire [27:1] np_ddr_addr;
+ wire [63:0] np_ddr_din, np_ddr_dout;
+ wire        np_ddr_req, np_ddr_rnw, np_ddr_ready;
+@@ -661,7 +674,7 @@ netplay netplay
+ 	.color        (color),
+ 	.vbl_line     ((effective_sys_type == 2'd2) ? 9'd291 : 9'd241),
+ 	.core_paused  (corepaused),
+-	.local_joy    (nes_joy_A),
++	.local_joy    (np_local_joy),
+ 	.active       (np_active),
+ 	.hold_reset   (np_hold_reset),
+ 	.pause_req    (np_pause_req),
+@@ -693,7 +706,7 @@ always @(posedge clk) begin
+ 		last_joypad_clock <= 0;
+ 	end else begin
+ 		if (joypad_out[0]) begin
+-			joypad_bits  <= piano ? {15'h0000, uart_data[8:0]}
++			joypad_bits  <= (piano & ~np_active) ? {15'h0000, uart_data[8:0]}
+ 				: {multitap ? {8'h08, nes_joy_C} : 16'hFFFF, port1_joy};
+ 			joypad_bits2 <= {multitap ? {8'h04, nes_joy_D} : 16'hFFFF, port2_joy};
+ 			joypad_d4 <= paddle_en ? paddle_nes : {4'b1111, powerpad[7], powerpad[11], powerpad[2], powerpad[3]};
+@@ -774,8 +787,8 @@ end
+ 
+ wire reset_nes =
+ 	~init_reset_n  ||
+-	buttons[1]     ||
+-	arm_reset      ||
++	(buttons[1] & ~np_active) ||   // a reset on one side only would desync
++	(arm_reset  & ~np_active) ||
+ 	download_reset ||
+ 	loader_fail    ||
+ 	bk_loading     ||
+diff --git a/rtl/nes.v b/rtl/nes.v
+index c02d649..beb18a8 100644
+--- a/rtl/nes.v
++++ b/rtl/nes.v
+@@ -311,6 +311,10 @@ always @(posedge clk) begin
+ 	// Add one extra PPU tick every 5 cpu cycles for PAL.
+ 	if (cpu_ce && (sys_type == 2'b01))
+ 		cpu_tick_count <= cpu_tick_count[2] ? 3'd0 : cpu_tick_count + 1'b1;
++	// Start PAL's 5-cycle pattern from a fixed phase after reset, so that the
++	// CPU/PPU alignment does not depend on when reset was released (netplay).
++	if (reset_nes)
++		cpu_tick_count <= 3'd0;
+ 
+ 	// SDRAM Clock
+ 	div_sys <= div_sys + 1'b1;
+diff --git a/rtl/netplay.sv b/rtl/netplay.sv
+index 27a9660..0ec7f26 100644
+--- a/rtl/netplay.sv
++++ b/rtl/netplay.sv
+@@ -69,6 +69,9 @@ localparam logic [15:0] OFF_CRC    = 16'h1800;
+ localparam logic [15:0] OFF_INPUT  = 16'h2000;
+ 
+ localparam logic [63:0] MAGIC = 64'h313030504E53454E; // "NESNP001"
++// CTRL is only believed with this in its upper half. DDR3 is not cleared when
++// cores change, so a stray word left by another core must never arm netplay.
++localparam logic [31:0] CTRL_MAGIC = 32'h4C525443;      // "CTRL"
+ 
+ localparam logic [2:0] S_IDLE  = 3'd0;
+ localparam logic [2:0] S_ARMED = 3'd1;
+@@ -130,7 +133,8 @@ logic [8:0] sl_prev;
+ wire        tick = (scanline_emu == vbl_line) && (sl_prev != vbl_line);
+ 
+ // Pending mailbox work
+-logic        p_magic, p_status, p_local, p_crc;
++logic        p_ctrl_clr, p_magic, p_status, p_local, p_crc;
++logic        crc_live;     // pixels are hashed only from the first tick on
+ logic [15:0] local_frame;   // only the 16-bit tag is stored
+ logic [7:0]  local_val;
+ logic [15:0] crc_frame;
+@@ -148,6 +152,7 @@ localparam logic [2:0] OP_LOCAL  = 3'd3;
+ localparam logic [2:0] OP_STATUS = 3'd4;
+ localparam logic [2:0] OP_CTRL   = 3'd5;
+ localparam logic [2:0] OP_INPUT  = 3'd6;
++localparam logic [2:0] OP_CTRLCLR = 3'd7;
+ 
+ logic [2:0]  op;
+ logic [31:0] op_frame;   // INPUT frame being fetched
+@@ -157,6 +162,10 @@ wire         fetching   = (state == S_PRIME) || (state == S_RUN);
+ wire         need_input = fetching && !(have0 && have1);
+ wire  [31:0] want_frame = have0 ? base + 32'd1 : base;
+ 
++wire         ctrl_ok  = (ddr_dout[63:32] == CTRL_MAGIC);
++wire         ctrl_en  = ctrl_ok & ddr_dout[0];
++wire         ctrl_run = ctrl_ok & ddr_dout[1];
++
+ wire  [63:0] status_word = {frame, 5'd0, state, error, stalls};
+ 
+ // Tag check for INPUT entries: both halves must carry frame tag and session.
+@@ -209,9 +218,12 @@ always_ff @(posedge clk) begin
+ 
+ 				p_status    <= 1'b1;
+ 				crc         <= crc_byte(crc_byte(CRC_INIT, a_p1), a_p2);
++				crc_live    <= 1'b1;
+ 			end
+ 		end
+-		else if (ppu_ce_emu) begin
++		else if (ppu_ce_emu && crc_live) begin
++			// Frame 0 is not hashed: right after reset release the PPU spends a
++			// few clocks in reset that depend on where PRIME ended in wall time.
+ 			crc <= crc_byte(crc, {2'b00, color});
+ 		end
+ 
+@@ -234,6 +246,7 @@ always_ff @(posedge clk) begin
+ 	if (state == S_PRIME && have0 && have1 && !downloading) begin
+ 		state       <= S_RUN;
+ 		frame       <= 32'd0;
++		crc_live    <= 1'b0;
+ 		joy_p1      <= a_p1;
+ 		joy_p2      <= a_p2;
+ 		have0       <= 1'b1;
+@@ -250,7 +263,11 @@ always_ff @(posedge clk) begin
+ 	// -----------------------------------------------------------------------
+ 	// DDR sequencer: one outstanding request at a time.
+ 	if (op == OP_NONE) begin
+-		if (p_magic) begin
++		if (p_ctrl_clr) begin
++			// Before MAGIC: once Main_MiSTer sees MAGIC, CTRL is known clean.
++			op <= OP_CTRLCLR; ddr_addr <= waddr(OFF_CTRL[15:3]);   ddr_din <= 64'd0;       ddr_rnw <= 1'b0; ddr_req <= 1'b1;
++		end
++		else if (p_magic) begin
+ 			op <= OP_MAGIC;   ddr_addr <= waddr(OFF_MAGIC[15:3]);  ddr_din <= MAGIC;       ddr_rnw <= 1'b0; ddr_req <= 1'b1;
+ 		end
+ 		else if (p_crc) begin
+@@ -278,6 +295,7 @@ always_ff @(posedge clk) begin
+ 	else if (ddr_ready) begin
+ 		op <= OP_NONE;
+ 		case (op)
++			OP_CTRLCLR: p_ctrl_clr <= 1'b0;
+ 			OP_MAGIC:  p_magic  <= 1'b0;
+ 			OP_CRC:    p_crc    <= 1'b0;
+ 			OP_LOCAL:  p_local  <= 1'b0;
+@@ -302,8 +320,9 @@ always_ff @(posedge clk) begin
+ 			end
+ 			OP_CTRL: begin
+ 				ctrl_due <= 1'b0;
++				// without the magic the word means "disabled"
+ 				case (state)
+-					S_IDLE: if (ddr_dout[0]) begin
++					S_IDLE: if (ctrl_en) begin
+ 						state     <= S_ARMED;
+ 						sess      <= ddr_dout[15:8];
+ 						error     <= 8'd0;
+@@ -314,17 +333,21 @@ always_ff @(posedge clk) begin
+ 						p_status  <= 1'b1;
+ 					end
+ 					S_ARMED: begin
+-						if (!ddr_dout[0])     begin state <= S_IDLE;  p_status <= 1'b1; end
+-						else if (ddr_dout[1]) begin state <= S_PRIME; p_status <= 1'b1; end
++						if (!ctrl_en)     begin state <= S_IDLE;  p_status <= 1'b1; end
++						else if (ctrl_run) begin state <= S_PRIME; p_status <= 1'b1; end
+ 					end
+-					S_PRIME, S_ERROR: if (!ddr_dout[0]) begin
++					S_PRIME, S_ERROR: if (!ctrl_en) begin
+ 						state    <= S_IDLE;
+ 						p_status <= 1'b1;
++						p_local  <= 1'b0;
++						p_crc    <= 1'b0;
+ 					end
+-					S_RUN: if (!ddr_dout[0]) begin
++					S_RUN: if (!ctrl_en) begin
+ 						error[ERR_CTRL_DROP] <= 1'b1;
+ 						state    <= S_IDLE;
+ 						p_status <= 1'b1;
++						p_local  <= 1'b0;
++						p_crc    <= 1'b0;
+ 					end
+ 					default: ;
+ 				endcase
+@@ -348,7 +371,9 @@ always_ff @(posedge clk) begin
+ 		joy_p1    <= 8'd0;
+ 		joy_p2    <= 8'd0;
+ 		crc       <= CRC_INIT;
++		p_ctrl_clr <= 1'b1;
+ 		p_magic   <= 1'b1;
++		crc_live  <= 1'b0;
+ 		p_status  <= 1'b1;
+ 		p_local   <= 1'b0;
+ 		p_crc     <= 1'b0;
+diff --git a/sim/Makefile b/sim/Makefile
+index c3ea6d6..3aa2bcf 100644
+--- a/sim/Makefile
++++ b/sim/Makefile
+@@ -7,7 +7,7 @@
+ 
+ RTL        := ../rtl/netplay.sv ../rtl/ddram.sv
+ TB         := np_machine.sv tb_netplay.sv
+-SCENARIOS  := lockstep smooth soak underrun ctrldrop reload badsess
++SCENARIOS  := lockstep smooth soak underrun ctrldrop reload badsess stalectrl
+ OBJ        := obj_dir
+ VERILATOR  ?= verilator
+ 
+diff --git a/sim/np_machine.sv b/sim/np_machine.sv
+index b150a0c..6b4c582 100644
+--- a/sim/np_machine.sv
++++ b/sim/np_machine.sv
+@@ -173,7 +173,11 @@ localparam int FRAME_CLKS = LINES * DOTS * 4;
+ logic [15:0] plfsr;        // models the variable distance to the next instruction boundary
+ 
+ assign scanline_emu = line;
+-assign color        = acc[5:0] ^ {1'b0, dot} ^ line[5:0];
++// Right after reset release the real PPU is still in reset for a few clocks
++// while ppu_ce keeps running; how many depends on wall-clock phase. Model it
++// with a per-machine count and junk colour (review finding C2).
++logic [2:0]  warm;
++assign color        = (warm != 3'd0) ? 6'(SEED * 7) : (acc[5:0] ^ {1'b0, dot} ^ line[5:0]);
+ 
+ // The game log: what the game saw for each of its frames.
+ logic [7:0] seen_p1 [MAX_FRAMES];
+@@ -195,6 +199,11 @@ always @(posedge clk) begin
+ 		game_frames <= 0;
+ 		pause_clks  <= 0;
+ 		plfsr       <= 16'(SEED) | 16'h1;
++		warm        <= 3'(1 + SEED % 5);
++	end
++	else if (warm != 3'd0) begin
++		warm       <= warm - 3'd1;
++		ppu_ce_emu <= 1;
+ 	end
+ 	else begin
+ 		// pause entry: only inside vblank, at a random "instruction boundary"
+diff --git a/sim/tb_netplay.sv b/sim/tb_netplay.sv
+index a8b5c55..af10737 100644
+--- a/sim/tb_netplay.sv
++++ b/sim/tb_netplay.sv
+@@ -14,6 +14,8 @@
+ //   ctrldrop  dropping enable in RUN returns to IDLE with CTRL_DROP
+ //   reload    a ROM load during RUN gives RELOAD
+ //   badsess   INPUT entries with the wrong session id are never accepted
++//   stalectrl words left in DDR by an earlier core never arm netplay; power-on
++//             clears CTRL before MAGIC appears
+ //
+ // Prints PASS or FAIL and exits non-zero on failure.
+ 
+@@ -25,6 +27,7 @@ localparam int D          = 2;        // input delay in frames
+ localparam int MAX_FRAMES = 32768;
+ int            FRAMES     = 400;      // frames to run in lockstep (+frames=N)
+ localparam logic [7:0] SESS = 8'h5A;
++localparam logic [31:0] CTRL_MAGIC = 32'h4C525443;
+ 
+ localparam int OFF_MAGIC  = 'h0000;
+ localparam int OFF_STATUS = 'h0008;
+@@ -185,7 +188,7 @@ task automatic start_session(int lat_a, int lat_b);
+ 	for (int m = 0; m < 2; m++) begin
+ 		if (mb_rd(m, OFF_MAGIC) != 64'h313030504E53454E) fail($sformatf("machine %0d: MAGIC missing", m));
+ 		clear_rings(m);
+-		mb_wr(m, OFF_CTRL, {48'd0, SESS, 8'h01});          // enable
++		mb_wr(m, OFF_CTRL, {CTRL_MAGIC, 16'd0, SESS, 8'h01});          // enable
+ 	end
+ 	wait_state(0, S_ARMED, 5000);
+ 	wait_state(1, S_ARMED, 5000);
+@@ -203,7 +206,7 @@ task automatic start_session(int lat_a, int lat_b);
+ 	end
+ 	next_input = D;
+ 	for (int m = 0; m < 2; m++) begin
+-		mb_wr(m, OFF_CTRL, {48'd0, SESS, 8'h03});          // enable + run
++		mb_wr(m, OFF_CTRL, {CTRL_MAGIC, 16'd0, SESS, 8'h03});          // enable + run
+ 	end
+ 	inv_on = (sess_used == SESS);
+ endtask
+@@ -255,6 +258,13 @@ initial begin
+ 	foreach (local_have[m, f]) local_have[m][f] = 0;
+ 	foreach (crc_have[m, f])   crc_have[m][f] = 0;
+ 
++	if (scenario == "stalectrl") begin
++		// A: enable bit set but no magic (another core's data).
++		// B: a complete, valid-looking CTRL from an earlier netplay session.
++		mb_wr(0, OFF_CTRL, 64'hDEAD_BEEF_0000_5A03);
++		mb_wr(1, OFF_CTRL, {CTRL_MAGIC, 16'd0, SESS, 8'h03});
++	end
++
+ 	repeat (10) @(posedge clk);
+ 	por = 0;
+ 	repeat (2000) @(posedge clk);
+@@ -373,6 +383,23 @@ initial begin
+ 		if (st[0] != S_PRIME || st[1] != S_PRIME) fail($sformatf("expected PRIME, got %0d/%0d", st[0], st[1]));
+ 	end
+ 
++	"stalectrl": begin
++		repeat (20000) @(posedge clk);
++		for (int m = 0; m < 2; m++) begin
++			if (st[m] != S_IDLE) fail($sformatf("machine %0d armed from stale CTRL: state %0d", m, st[m]));
++			if (mb_rd(m, OFF_CTRL) != 64'h0) fail($sformatf("machine %0d: CTRL not cleared at power-on", m));
++			if (mb_rd(m, OFF_MAGIC) != 64'h313030504E53454E) fail($sformatf("machine %0d: no MAGIC", m));
++		end
++		if (mA.dut.hold_reset || mB.dut.hold_reset) fail("core held in reset with netplay off");
++		// and a real session still starts afterwards
++		start_session(200, 200);
++		fork
++			while (gfr[0] < 50 || gfr[1] < 50) begin @(posedge clk); hps_step(); end
++			begin repeat (400000) @(posedge clk); fail("session after stale CTRL never ran"); end
++		join_any
++		disable fork;
++	end
++
+ 	default: fail({"unknown scenario ", scenario});
+ 	endcase
+ 
+-- 
+2.43.0
+

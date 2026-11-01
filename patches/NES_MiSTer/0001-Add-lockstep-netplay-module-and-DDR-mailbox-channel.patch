@@ -1,0 +1,1374 @@
+From 8769b50bd7b82836b00a3492fc86dc102cd55b8b Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Fri, 30 Oct 2026 18:30:57 +0000
+Subject: [PATCH 1/2] Add lockstep netplay module and DDR mailbox channel
+
+- rtl/netplay.sv: frame tick on emulated scanline, two-entry INPUT lookahead,
+  pause request on missing input, LOCAL/CRC/STATUS posts, CTRL polling
+- rtl/ddram.sv: second channel for the netplay mailbox at 0x3C000000; read
+  data is no longer dropped when DDRAM_BUSY is high
+- rtl/nes.v: export emulated-time scanline and ppu_ce
+- NES.sv: wire netplay in; ports 1/2 from mailbox, cheats, savestates,
+  OSD pause and multitap disabled while active
+- sim/: Verilator testbench with two simulated machines (make -C sim test)
+---
+ NES.sv            |  73 ++++++++-
+ files.qip         |   1 +
+ rtl/ddram.sv      |  53 +++++--
+ rtl/nes.v         |   6 +
+ rtl/netplay.sv    | 372 ++++++++++++++++++++++++++++++++++++++++++++
+ sim/.gitignore    |   1 +
+ sim/Makefile      |  40 +++++
+ sim/np_machine.sv | 239 ++++++++++++++++++++++++++++
+ sim/tb_netplay.sv | 386 ++++++++++++++++++++++++++++++++++++++++++++++
+ 9 files changed, 1153 insertions(+), 18 deletions(-)
+ create mode 100644 rtl/netplay.sv
+ create mode 100644 sim/.gitignore
+ create mode 100644 sim/Makefile
+ create mode 100644 sim/np_machine.sv
+ create mode 100644 sim/tb_netplay.sv
+
+diff --git a/NES.sv b/NES.sv
+index 2fb2768..d4e13c8 100644
+--- a/NES.sv
++++ b/NES.sv
+@@ -636,6 +636,54 @@ wire       paddle_en  = (status[34:33] == 2);
+ wire       paddle_atr = paddle_en & status[32];
+ wire       paddle_btn = paddle_atr ? (joyA[4] | joyB[4] | joyC[4] | joyD[4]) : (joyA[10] | joyB[10] | joyC[10] | joyD[10]);
+ 
++////////////////////////////  NETPLAY  ////////////////////////////////////
++// Delay-based lockstep netplay, see SPEC.md and rtl/netplay.sv.
++// Main_MiSTer arms it through a DDR3 mailbox; while idle the core behaves
++// exactly like upstream.
++
++wire  [8:0] scanline_emu;
++wire        ppu_ce_emu;
++wire        corepaused;
++wire        np_active, np_hold_reset, np_pause_req;
++wire  [7:0] np_joy_p1, np_joy_p2;
++wire [27:1] np_ddr_addr;
++wire [63:0] np_ddr_din, np_ddr_dout;
++wire        np_ddr_req, np_ddr_rnw, np_ddr_ready;
++wire  [7:0] np_ddr_be;
++
++netplay netplay
++(
++	.clk          (clk),
++	.reset        (~clock_locked),
++	.downloading  (downloading),
++	.scanline_emu (scanline_emu),
++	.ppu_ce_emu   (ppu_ce_emu),
++	.color        (color),
++	.vbl_line     ((effective_sys_type == 2'd2) ? 9'd291 : 9'd241),
++	.core_paused  (corepaused),
++	.local_joy    (nes_joy_A),
++	.active       (np_active),
++	.hold_reset   (np_hold_reset),
++	.pause_req    (np_pause_req),
++	.joy_p1       (np_joy_p1),
++	.joy_p2       (np_joy_p2),
++	.ddr_addr     (np_ddr_addr),
++	.ddr_din      (np_ddr_din),
++	.ddr_dout     (np_ddr_dout),
++	.ddr_req      (np_ddr_req),
++	.ddr_rnw      (np_ddr_rnw),
++	.ddr_be       (np_ddr_be),
++	.ddr_ready    (np_ddr_ready),
++	.state_o      (),
++	.frame_o      (),
++	.error_o      ()
++);
++
++// In netplay both ports come from the mailbox, swap and multitap are ignored.
++wire       multitap  = status[10] & ~np_active;
++wire [7:0] port1_joy = np_active ? np_joy_p1 : (joy_swap ? nes_joy_B : nes_joy_A);
++wire [7:0] port2_joy = np_active ? np_joy_p2 : (joy_swap ? nes_joy_A : nes_joy_B);
++
+ always @(posedge clk) begin
+ 	if (reset_nes) begin
+ 		joypad_bits <= 0;
+@@ -646,8 +694,8 @@ always @(posedge clk) begin
+ 	end else begin
+ 		if (joypad_out[0]) begin
+ 			joypad_bits  <= piano ? {15'h0000, uart_data[8:0]}
+-				: {status[10] ? {8'h08, nes_joy_C} : 16'hFFFF, joy_swap ? nes_joy_B : nes_joy_A};
+-			joypad_bits2 <= {status[10] ? {8'h04, nes_joy_D} : 16'hFFFF, joy_swap ? nes_joy_A : nes_joy_B};
++				: {multitap ? {8'h08, nes_joy_C} : 16'hFFFF, port1_joy};
++			joypad_bits2 <= {multitap ? {8'h04, nes_joy_D} : 16'hFFFF, port2_joy};
+ 			joypad_d4 <= paddle_en ? paddle_nes : {4'b1111, powerpad[7], powerpad[11], powerpad[2], powerpad[3]};
+ 			joypad_d3 <= {powerpad[6], powerpad[10], powerpad[9], powerpad[5], powerpad[8], powerpad[4], powerpad[0], powerpad[1]};
+ 		end
+@@ -733,6 +781,7 @@ wire reset_nes =
+ 	bk_loading     ||
+ 	bk_loading_req ||
+ 	hold_reset     ||
++	np_hold_reset  ||
+ 	(old_sys_type != effective_sys_type);
+ 
+ reg [1:0] old_sys_type;
+@@ -760,14 +809,14 @@ wire gg_reset = (type_fds | type_gg | type_nes | type_nsf) && ioctl_download;
+ // pause
+ reg       pausecore;
+ reg [1:0] videopause_ce;
+-wire      corepaused;
++// corepaused is declared in the NETPLAY block, which uses it first
+ wire      refresh;
+ wire      sleep_savestate;
+ 
+ assign HDMI_FREEZE = corepaused;
+ 
+ always_ff @(posedge clk) begin
+-	pausecore <= sleep_savestate | (status[41] && OSD_STATUS && !ioctl_download && !reset_nes);
++	pausecore <= sleep_savestate | np_pause_req | (status[41] && OSD_STATUS && !np_active && !ioctl_download && !reset_nes);
+ 
+ 	if (!corepaused) begin
+ 		videopause_ce <= nes_ce + 1'd1;
+@@ -791,7 +840,7 @@ NES nes (
+ 	.vs_dip_switches (vs_dip_switches),
+ 	.nes_div         (nes_ce),
+ 	.mapper_flags    (downloading ? 64'd0 : mapper_flags),
+-	.gg              (status[20]),
++	.gg              (status[20] | np_active),
+ 	.gg_code         (gg_code),
+ 	.gg_reset        (gg_reset && loader_clk && !ioctl_addr),
+ 	.gg_avail        (gg_avail),
+@@ -813,6 +862,8 @@ NES nes (
+ 	.emphasis        (emphasis),
+ 	.cycle           (cycle),
+ 	.scanline        (scanline),
++	.scanline_emu    (scanline_emu),
++	.ppu_ce_emu      (ppu_ce_emu),
+ 	.mask            (hide_overscan[1] ? 2'b00 : status[28:27]),
+ 	.dejitter_timing (status[26] | use_composite), // replacement dots would break the carrier
+ 	// User Input
+@@ -1357,7 +1408,15 @@ ddram ddram
+ 	.ch1_req(ss_req),
+ 	.ch1_rnw(ss_rnw),
+ 	.ch1_be(ss_be),
+-	.ch1_ready(ss_ack)
++	.ch1_ready(ss_ack),
++
++	.ch2_addr(np_ddr_addr),
++	.ch2_din(np_ddr_din),
++	.ch2_dout(np_ddr_dout),
++	.ch2_req(np_ddr_req),
++	.ch2_rnw(np_ddr_rnw),
++	.ch2_be(np_ddr_be),
++	.ch2_ready(np_ddr_ready)
+ );
+ 
+ // saving with keyboard/OSD/gamepad
+@@ -1375,7 +1434,7 @@ savestate_ui savestate_ui
+ (
+ 	.clk            (clk           ),
+ 	.ps2_key        (ps2_key_adjust),
+-	.allow_ss       (rom_loaded & mapper_has_savestate),
++	.allow_ss       (rom_loaded & mapper_has_savestate & ~np_active),
+ 	.joySS          (joyA_unmod[23]),
+ 	.joyRight       (joyA_unmod[0] ),
+ 	.joyLeft        (joyA_unmod[1] ),
+diff --git a/files.qip b/files.qip
+index 6ae248e..c66e13e 100644
+--- a/files.qip
++++ b/files.qip
+@@ -4,6 +4,7 @@ set_global_assignment -name QIP_FILE rtl/SOUND/OPLL/OPLL.qip
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/sdram.sv
+ set_global_assignment -name VHDL_FILE rtl/dpram.vhd
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/ddram.sv
++set_global_assignment -name SYSTEMVERILOG_FILE rtl/netplay.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/EEPROM_24C0x.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/cheatcodes.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/miracle.sv
+diff --git a/rtl/ddram.sv b/rtl/ddram.sv
+index a663454..d5dde84 100644
+--- a/rtl/ddram.sv
++++ b/rtl/ddram.sv
+@@ -39,11 +39,20 @@ module ddram
+ 	input         ch1_req,
+ 	input         ch1_rnw,
+ 	input  [7:0]  ch1_be,
+-	output        ch1_ready
++	output        ch1_ready,
++
++	// netplay mailbox (rtl/netplay.sv)
++	input  [27:1] ch2_addr,
++	output [63:0] ch2_dout,
++	input  [63:0] ch2_din,
++	input         ch2_req,
++	input         ch2_rnw,
++	input  [7:0]  ch2_be,
++	output        ch2_ready
+ );
+ 
+ reg  [7:0] ram_burst;
+-reg [63:0] ram_q[1:1];
++reg [63:0] ram_q[1:2];
+ reg [63:0] ram_data;
+ reg [27:1] ram_address;
+ reg        ram_read = 0;
+@@ -61,15 +70,17 @@ assign DDRAM_WE       = ram_write;
+ 
+ assign ch1_dout  = ram_q[1];
+ assign ch1_ready = ready[1];
++assign ch2_dout  = ram_q[2];
++assign ch2_ready = ready[2];
+ 
+ reg        state  = 0;
+-reg  [0:0] ch = 0; 
+-reg  [1:1] ch_rq;
++reg  [1:0] ch = 0;
++reg  [2:1] ch_rq;
+ 
+ always @(posedge DDRAM_CLK) begin
+ 
+ 
+-	ch_rq <= ch_rq | {ch1_req};
++	ch_rq <= ch_rq | {ch2_req, ch1_req};
+ 	ready <= 0;
+ 
+ 	if(!DDRAM_BUSY) begin
+@@ -77,6 +88,7 @@ always @(posedge DDRAM_CLK) begin
+ 		ram_read  <= 0;
+ 
+ 		case(state)
++			// ch1 (savestates) has priority; netplay is idle while savestates run.
+ 			0: if(ch_rq[1] || ch1_req) begin
+ 					ch_rq[1]         <= 0;
+ 					ch               <= 1;
+@@ -92,16 +104,35 @@ always @(posedge DDRAM_CLK) begin
+ 						ram_read      <= 1;
+ 						state         <= 1;
+ 					end
+-            end
+-
+-			1: if(DDRAM_DOUT_READY) begin
+-					ram_q[ch]        <= DDRAM_DOUT;
+-					ready[ch]        <= 1;
+-					state            <= 0;
++				end
++				else if(ch_rq[2] || ch2_req) begin
++					ch_rq[2]         <= 0;
++					ch               <= 2;
++					ram_data         <= ch2_din;
++					ram_be           <= ch2_be;
++					ram_address      <= ch2_addr;
++					ram_burst        <= 1;
++					if(~ch2_rnw) begin
++						ram_write     <= 1;
++						ready[2]      <= 1;
++					end
++					else begin
++						ram_read      <= 1;
++						state         <= 1;
++					end
+ 				end
+ 
++			default: ;
+ 		endcase
+ 	end
++
++	// Read data is not gated by DDRAM_BUSY: Avalon allows readdatavalid while
++	// waitrequest is high, and gating it here would drop the word and hang.
++	if(state && DDRAM_DOUT_READY) begin
++		ram_q[ch]        <= DDRAM_DOUT;
++		ready[ch]        <= 1;
++		state            <= 0;
++	end
+ end
+ 
+ endmodule
+diff --git a/rtl/nes.v b/rtl/nes.v
+index 1353b7b..c02d649 100644
+--- a/rtl/nes.v
++++ b/rtl/nes.v
+@@ -125,6 +125,10 @@ module NES(
+ 
+ 	output  [8:0] cycle,
+ 	output  [8:0] scanline,
++	// Emulated-time PPU position for netplay: unlike 'scanline' these stand
++	// still while the core is paused.
++	output  [8:0] scanline_emu,
++	output        ppu_ce_emu,
+ 	input         int_audio,
+ 	input         ext_audio,
+ 	output        apu_ce,
+@@ -614,6 +618,8 @@ wire [8:0] ppu_cycle;
+ wire [8:0] scanline_ppu;
+ assign cycle = use_fake_h ? 9'd340 : (corepause_active) ? cycle_paused : ppu_cycle;
+ assign scanline = (corepause_active) ? scanline_paused : scanline_ppu;
++assign scanline_emu = scanline_ppu;
++assign ppu_ce_emu   = ppu_ce;
+ 
+ wire signed [23:0] ppu_pin_a, ppu_pin_b;
+ 
+diff --git a/rtl/netplay.sv b/rtl/netplay.sv
+new file mode 100644
+index 0000000..27a9660
+--- /dev/null
++++ b/rtl/netplay.sv
+@@ -0,0 +1,372 @@
++// netplay.sv
++//
++// Delay-based lockstep netplay for the NES core.
++//
++// The FPGA side never touches the network. It exchanges per-frame controller
++// input with Main_MiSTer through a mailbox in DDR3 (see SPEC.md, section 4):
++//
++//   - At the start of every frame it samples the local pad and posts LOCAL[k].
++//   - It posts a CRC of the previous frame's pixels and inputs as CRC[k-1].
++//   - It keeps a two-entry lookahead of INPUT[] read back from the mailbox.
++//     If INPUT[k+1] is not in hand when frame k starts, it requests the
++//     core's existing savestate pause, which engages in the VBlank that
++//     follows, at an instruction boundary, and is invisible to the emulated
++//     machine. The core only resumes on a whole video frame, so every stall
++//     costs one repeated frame on screen; the lookahead keeps them rare.
++//
++// Frame boundaries are taken from the *emulated* PPU scanline, which stands
++// still while the core is paused, so pausing never shifts the frame count.
++//
++// This program is GPL licensed. See COPYING for the full license.
++
++module netplay #(
++	parameter int          POLL_INTERVAL = 256,   // clocks between INPUT polls
++	parameter int          CTRL_INTERVAL = 4096,  // clocks between CTRL reads
++	parameter logic [27:0] BASE          = 28'h0C000000 // byte offset inside the 0x30000000 DDR window
++)
++(
++	input             clk,
++	input             reset,          // power-on only, never on ROM load
++	input             downloading,    // a ROM load is in progress
++
++	// emulated timing from rtl/nes.v
++	input       [8:0] scanline_emu,
++	input             ppu_ce_emu,
++	input       [5:0] color,
++	input       [8:0] vbl_line,
++	input             core_paused,
++
++	input       [7:0] local_joy,      // same bit order as nes_joy_A
++
++	output            active,
++	output            hold_reset,
++	output            pause_req,
++	output reg  [7:0] joy_p1,
++	output reg  [7:0] joy_p2,
++
++	// DDR3 channel (rtl/ddram.sv ch2)
++	output reg [27:1] ddr_addr,
++	output reg [63:0] ddr_din,
++	input      [63:0] ddr_dout,
++	output reg        ddr_req,
++	output reg        ddr_rnw,
++	output      [7:0] ddr_be,
++	input             ddr_ready,
++
++	// observation
++	output      [2:0] state_o,
++	output     [31:0] frame_o,
++	output      [7:0] error_o
++);
++
++// ---------------------------------------------------------------------------
++// Mailbox layout (byte offsets from BASE), SPEC.md section 4
++localparam logic [15:0] OFF_MAGIC  = 16'h0000;
++localparam logic [15:0] OFF_STATUS = 16'h0008;
++localparam logic [15:0] OFF_CTRL   = 16'h0010;
++localparam logic [15:0] OFF_LOCAL  = 16'h1000;
++localparam logic [15:0] OFF_CRC    = 16'h1800;
++localparam logic [15:0] OFF_INPUT  = 16'h2000;
++
++localparam logic [63:0] MAGIC = 64'h313030504E53454E; // "NESNP001"
++
++localparam logic [2:0] S_IDLE  = 3'd0;
++localparam logic [2:0] S_ARMED = 3'd1;
++localparam logic [2:0] S_PRIME = 3'd2;
++localparam logic [2:0] S_RUN   = 3'd3;
++localparam logic [2:0] S_ERROR = 3'd4;
++
++localparam int ERR_UNDERRUN  = 0;
++localparam int ERR_CTRL_DROP = 1;
++localparam int ERR_RELOAD    = 2;
++
++localparam logic [31:0] CRC_INIT = 32'hFFFFFFFF;
++
++function automatic logic [31:0] crc_byte(input logic [31:0] c, input logic [7:0] d);
++	logic [31:0] x;
++	x = c ^ {24'd0, d};
++	for (int i = 0; i < 8; i++)
++		x = x[0] ? ((x >> 1) ^ 32'hEDB88320) : (x >> 1);
++	return x;
++endfunction
++
++// Mailbox offsets are 8-byte aligned, so the channel's word address is simply
++// (BASE + off) >> 1.
++function automatic logic [27:1] waddr(input logic [15:3] off);
++	return BASE[27:1] + {12'd0, off, 2'b00};
++endfunction
++
++function automatic logic [15:3] ring(input logic [15:3] base, input logic [7:0] slot);
++	return base + {5'd0, slot};
++endfunction
++
++// ---------------------------------------------------------------------------
++// State
++
++logic [2:0]  state;
++logic [31:0] frame;
++logic [7:0]  error;
++logic [15:0] stalls;
++logic [7:0]  sess;
++
++// Lookahead: slot 0 holds INPUT[base], slot 1 INPUT[base+1], where base is
++// the first frame not started yet (0 in PRIME, frame+1 in RUN).
++logic        have0, have1;
++logic [7:0]  a_p1, a_p2;      // slot 0
++logic [7:0]  b_p1, b_p2;      // slot 1
++logic [31:0] crc;
++
++assign active     = (state != S_IDLE);
++assign hold_reset = (state == S_ARMED) || (state == S_PRIME);
++assign pause_req  = ((state == S_RUN) && !have0) || (state == S_ERROR);
++
++assign state_o = state;
++assign frame_o = frame;
++assign error_o = error;
++assign ddr_be  = 8'hFF;
++
++// Frame tick: emulated scanline enters the VBlank start line.
++logic [8:0] sl_prev;
++wire        tick = (scanline_emu == vbl_line) && (sl_prev != vbl_line);
++
++// Pending mailbox work
++logic        p_magic, p_status, p_local, p_crc;
++logic [15:0] local_frame;   // only the 16-bit tag is stored
++logic [7:0]  local_val;
++logic [15:0] crc_frame;
++logic [31:0] crc_val;
++
++// Poll timers
++logic [15:0] poll_cnt, ctrl_cnt;
++logic        poll_due, ctrl_due;
++
++// DDR sequencer
++localparam logic [2:0] OP_NONE   = 3'd0;
++localparam logic [2:0] OP_MAGIC  = 3'd1;
++localparam logic [2:0] OP_CRC    = 3'd2;
++localparam logic [2:0] OP_LOCAL  = 3'd3;
++localparam logic [2:0] OP_STATUS = 3'd4;
++localparam logic [2:0] OP_CTRL   = 3'd5;
++localparam logic [2:0] OP_INPUT  = 3'd6;
++
++logic [2:0]  op;
++logic [31:0] op_frame;   // INPUT frame being fetched
++
++wire  [31:0] base       = (state == S_PRIME) ? 32'd0 : frame + 32'd1;
++wire         fetching   = (state == S_PRIME) || (state == S_RUN);
++wire         need_input = fetching && !(have0 && have1);
++wire  [31:0] want_frame = have0 ? base + 32'd1 : base;
++
++wire  [63:0] status_word = {frame, 5'd0, state, error, stalls};
++
++// Tag check for INPUT entries: both halves must carry frame tag and session.
++wire  [31:0] in_hi = ddr_dout[63:32];
++wire  [31:0] in_lo = ddr_dout[31:0];
++wire         in_ok = (in_hi[31:16] == op_frame[15:0]) && (in_lo[31:16] == op_frame[15:0])
++                  && (in_hi[15:8]  == sess)           && (in_lo[15:8]  == sess);
++
++logic        paused_prev;
++
++always_ff @(posedge clk) begin
++	sl_prev     <= scanline_emu;
++	paused_prev <= core_paused;
++	ddr_req     <= 1'b0;
++
++	// timers
++	if (poll_cnt == POLL_INTERVAL[15:0] - 16'd1) begin poll_cnt <= 16'd0; poll_due <= 1'b1; end
++	else poll_cnt <= poll_cnt + 16'd1;
++	if (ctrl_cnt == CTRL_INTERVAL[15:0] - 16'd1) begin ctrl_cnt <= 16'd0; ctrl_due <= 1'b1; end
++	else ctrl_cnt <= ctrl_cnt + 16'd1;
++
++	// -----------------------------------------------------------------------
++	// Per-frame work in RUN
++	if (state == S_RUN) begin
++		if (core_paused && !paused_prev && stalls != 16'hFFFF) stalls <= stalls + 16'd1;
++
++		if (tick) begin
++			if (!have0) begin
++				error[ERR_UNDERRUN] <= 1'b1;
++				state    <= S_ERROR;
++				p_status <= 1'b1;
++			end
++			else begin
++				frame       <= frame + 32'd1;
++				joy_p1      <= a_p1;
++				joy_p2      <= a_p2;
++				// shift the lookahead
++				have0       <= have1;
++				a_p1        <= b_p1;
++				a_p2        <= b_p2;
++				have1       <= 1'b0;
++
++				crc_frame   <= frame[15:0];
++				crc_val     <= crc;
++				p_crc       <= 1'b1;
++
++				local_frame <= frame[15:0] + 16'd1;
++				local_val   <= local_joy;
++				p_local     <= 1'b1;
++
++				p_status    <= 1'b1;
++				crc         <= crc_byte(crc_byte(CRC_INIT, a_p1), a_p2);
++			end
++		end
++		else if (ppu_ce_emu) begin
++			crc <= crc_byte(crc, {2'b00, color});
++		end
++
++		if (downloading) begin
++			error[ERR_RELOAD] <= 1'b1;
++			state    <= S_ERROR;
++			p_status <= 1'b1;
++		end
++	end
++
++	if (state == S_PRIME && downloading) begin
++		error[ERR_RELOAD] <= 1'b1;
++		state    <= S_ERROR;
++		p_status <= 1'b1;
++	end
++
++	// PRIME -> RUN once INPUT[0] and INPUT[1] are in hand: release reset at
++	// frame 0. INPUT[1] is needed up front because no VBlank (and so no pause
++	// opportunity) comes between reset release and the first tick.
++	if (state == S_PRIME && have0 && have1 && !downloading) begin
++		state       <= S_RUN;
++		frame       <= 32'd0;
++		joy_p1      <= a_p1;
++		joy_p2      <= a_p2;
++		have0       <= 1'b1;
++		a_p1        <= b_p1;
++		a_p2        <= b_p2;
++		have1       <= 1'b0;
++		local_frame <= 16'd0;
++		local_val   <= local_joy;
++		p_local     <= 1'b1;
++		p_status    <= 1'b1;
++		crc         <= crc_byte(crc_byte(CRC_INIT, a_p1), a_p2);
++	end
++
++	// -----------------------------------------------------------------------
++	// DDR sequencer: one outstanding request at a time.
++	if (op == OP_NONE) begin
++		if (p_magic) begin
++			op <= OP_MAGIC;   ddr_addr <= waddr(OFF_MAGIC[15:3]);  ddr_din <= MAGIC;       ddr_rnw <= 1'b0; ddr_req <= 1'b1;
++		end
++		else if (p_crc) begin
++			op <= OP_CRC;     ddr_addr <= waddr(ring(OFF_CRC[15:3], crc_frame[7:0]));
++			ddr_din <= {crc_frame, crc_val[31:16], crc_frame, crc_val[15:0]};
++			ddr_rnw <= 1'b0; ddr_req <= 1'b1;
++		end
++		else if (p_local) begin
++			op <= OP_LOCAL;   ddr_addr <= waddr(ring(OFF_LOCAL[15:3], local_frame[7:0]));
++			ddr_din <= {local_frame, sess, local_val, local_frame, sess, local_val};
++			ddr_rnw <= 1'b0; ddr_req <= 1'b1;
++		end
++		else if (p_status) begin
++			op <= OP_STATUS;  ddr_addr <= waddr(OFF_STATUS[15:3]); ddr_din <= status_word; ddr_rnw <= 1'b0; ddr_req <= 1'b1;
++		end
++		else if (ctrl_due) begin
++			op <= OP_CTRL;    ddr_addr <= waddr(OFF_CTRL[15:3]);   ddr_rnw <= 1'b1; ddr_req <= 1'b1;
++		end
++		else if (poll_due && need_input) begin
++			op <= OP_INPUT;   ddr_addr <= waddr(ring(OFF_INPUT[15:3], want_frame[7:0]));
++			op_frame <= want_frame;
++			ddr_rnw <= 1'b1; ddr_req <= 1'b1;
++		end
++	end
++	else if (ddr_ready) begin
++		op <= OP_NONE;
++		case (op)
++			OP_MAGIC:  p_magic  <= 1'b0;
++			OP_CRC:    p_crc    <= 1'b0;
++			OP_LOCAL:  p_local  <= 1'b0;
++			OP_STATUS: p_status <= 1'b0;
++			OP_INPUT: begin
++				poll_due <= 1'b0;
++				// A tick in this very cycle shifts the lookahead; drop the word
++				// and let the next poll fetch it again rather than race the shift.
++				// A tick earlier in flight moves base, so match op_frame afresh.
++				if (in_ok && fetching && !(state == S_RUN && tick)) begin
++					if (!have0 && op_frame == base) begin
++						a_p1  <= in_lo[7:0];
++						a_p2  <= in_hi[7:0];
++						have0 <= 1'b1;
++					end
++					else if (have0 && !have1 && op_frame == base + 32'd1) begin
++						b_p1  <= in_lo[7:0];
++						b_p2  <= in_hi[7:0];
++						have1 <= 1'b1;
++					end
++				end
++			end
++			OP_CTRL: begin
++				ctrl_due <= 1'b0;
++				case (state)
++					S_IDLE: if (ddr_dout[0]) begin
++						state     <= S_ARMED;
++						sess      <= ddr_dout[15:8];
++						error     <= 8'd0;
++						stalls    <= 16'd0;
++						frame     <= 32'd0;
++						have0     <= 1'b0;
++						have1     <= 1'b0;
++						p_status  <= 1'b1;
++					end
++					S_ARMED: begin
++						if (!ddr_dout[0])     begin state <= S_IDLE;  p_status <= 1'b1; end
++						else if (ddr_dout[1]) begin state <= S_PRIME; p_status <= 1'b1; end
++					end
++					S_PRIME, S_ERROR: if (!ddr_dout[0]) begin
++						state    <= S_IDLE;
++						p_status <= 1'b1;
++					end
++					S_RUN: if (!ddr_dout[0]) begin
++						error[ERR_CTRL_DROP] <= 1'b1;
++						state    <= S_IDLE;
++						p_status <= 1'b1;
++					end
++					default: ;
++				endcase
++			end
++			default: ;
++		endcase
++	end
++
++	if (reset) begin
++		state     <= S_IDLE;
++		frame     <= 32'd0;
++		error     <= 8'd0;
++		stalls    <= 16'd0;
++		sess      <= 8'd0;
++		have0     <= 1'b0;
++		have1     <= 1'b0;
++		a_p1      <= 8'd0;
++		a_p2      <= 8'd0;
++		b_p1      <= 8'd0;
++		b_p2      <= 8'd0;
++		joy_p1    <= 8'd0;
++		joy_p2    <= 8'd0;
++		crc       <= CRC_INIT;
++		p_magic   <= 1'b1;
++		p_status  <= 1'b1;
++		p_local   <= 1'b0;
++		p_crc     <= 1'b0;
++		poll_cnt  <= 16'd0;
++		ctrl_cnt  <= 16'd0;
++		poll_due  <= 1'b0;
++		ctrl_due  <= 1'b1;
++		op        <= OP_NONE;
++		op_frame  <= 32'd0;
++		ddr_req   <= 1'b0;
++		ddr_rnw   <= 1'b1;
++		ddr_addr  <= '0;
++		ddr_din   <= '0;
++		local_frame <= 16'd0;
++		local_val   <= 8'd0;
++		crc_frame   <= 16'd0;
++		crc_val     <= 32'd0;
++	end
++end
++
++endmodule
+diff --git a/sim/.gitignore b/sim/.gitignore
+new file mode 100644
+index 0000000..697cf4f
+--- /dev/null
++++ b/sim/.gitignore
+@@ -0,0 +1 @@
++obj_dir/
+diff --git a/sim/Makefile b/sim/Makefile
+new file mode 100644
+index 0000000..c3ea6d6
+--- /dev/null
++++ b/sim/Makefile
+@@ -0,0 +1,40 @@
++# Simulation and lint for the netplay RTL (SPEC.md tests T1, T2).
++# Needs Verilator 5.x on PATH.
++#
++#   make lint        T1: lint netplay.sv and ddram.sv
++#   make test        T2: run every testbench scenario, prints PASS/FAIL
++#   make test SCENARIO=lockstep   run one scenario
++
++RTL        := ../rtl/netplay.sv ../rtl/ddram.sv
++TB         := np_machine.sv tb_netplay.sv
++SCENARIOS  := lockstep smooth soak underrun ctrldrop reload badsess
++OBJ        := obj_dir
++VERILATOR  ?= verilator
++
++.PHONY: lint test build clean
++
++lint:
++	$(VERILATOR) --lint-only -Wall -Wno-DECLFILENAME --top-module netplay ../rtl/netplay.sv
++	$(VERILATOR) --lint-only -Wall -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-PROCASSINIT --top-module ddram ../rtl/ddram.sv
++	@echo "LINT OK"
++
++$(OBJ)/Vtb_netplay: $(RTL) $(TB)
++	$(VERILATOR) --binary --timing --timescale 1ns/1ps -j 2 -Wno-IMPLICITSTATIC -Wno-fatal -Wno-WIDTH -Wno-DECLFILENAME \
++	  --top-module tb_netplay -o Vtb_netplay $(RTL) $(TB)
++
++build: $(OBJ)/Vtb_netplay
++
++ifdef SCENARIO
++test: build
++	./$(OBJ)/Vtb_netplay +scenario=$(SCENARIO)
++else
++test: build
++	@for s in $(SCENARIOS); do \
++	  ./$(OBJ)/Vtb_netplay +scenario=$$s > $(OBJ)/$$s.log 2>&1 || { cat $(OBJ)/$$s.log; echo "FAIL $$s"; exit 1; }; \
++	  grep -E "^(PASS|compared|frames)" $(OBJ)/$$s.log; \
++	done
++	@echo "ALL SCENARIOS PASS"
++endif
++
++clean:
++	rm -rf $(OBJ)
+diff --git a/sim/np_machine.sv b/sim/np_machine.sv
+new file mode 100644
+index 0000000..b150a0c
+--- /dev/null
++++ b/sim/np_machine.sv
+@@ -0,0 +1,239 @@
++// np_machine.sv — one simulated MiSTer for the netplay testbench.
++//
++// Contains the real rtl/netplay.sv and rtl/ddram.sv, a behavioural DDR3 port
++// with random busy/latency, and a tiny fake NES whose emulated time stops
++// while paused or held in reset, like rtl/nes.v.
++//
++// The fake game reads the controller at a fixed emulated point each frame and
++// folds what it read into its own state, which drives the pixel colours. Two
++// machines that read different inputs therefore produce different CRCs.
++
++module np_machine #(
++	parameter int SEED        = 1,
++	parameter int LINES       = 30,   // scanlines per fake frame
++	parameter int DOTS        = 16,   // dots per fake scanline
++	parameter int VBL_LINE    = 20,
++	parameter int VBL_END     = 27,   // last vblank line (pause window)
++	parameter int MAX_FRAMES  = 32768
++)
++(
++	input            clk,
++	input            por,             // power-on reset
++	input            downloading,
++	input      [7:0] local_joy,
++	input            ignore_pause,    // fault injection: core never pauses
++
++	output     [2:0] state,
++	output    [31:0] frame,
++	output     [7:0] error,
++	output reg [31:0] game_frames,
++	output reg       paused
++);
++
++// ---------------------------------------------------------------------------
++// Behavioural DDR3: 0x4000-byte window is all the mailbox needs.
++localparam int WORDS = 2048;
++logic [63:0] mem [WORDS];
++
++logic [28:0] DDRAM_ADDR;
++logic  [7:0] DDRAM_BURSTCNT, DDRAM_BE;
++logic [63:0] DDRAM_DIN, DDRAM_DOUT;
++logic        DDRAM_RD, DDRAM_WE, DDRAM_DOUT_READY, DDRAM_BUSY;
++
++// byte address inside the window: DDRAM_ADDR counts 64-bit words from 0
++wire [31:0] byte_addr = {DDRAM_ADDR, 3'b000};
++wire [31:0] win_off   = byte_addr - 32'h3C000000;
++wire [10:0] widx      = win_off[13:3];
++
++int  rd_wait;
++bit  rd_pend;
++logic [10:0] rd_idx;
++int unsigned rng;
++
++
++initial begin
++	rng = SEED;
++	foreach (mem[i]) mem[i] = 64'h0;
++	DDRAM_BUSY = 0;
++	DDRAM_DOUT_READY = 0;
++	rd_pend = 0;
++end
++
++always @(posedge clk) begin
++	rng <= rng * 32'd1664525 + 32'd1013904223;
++	DDRAM_DOUT_READY <= 0;
++	DDRAM_BUSY <= (rng[15:8] % 8'd5) == 0;
++
++	if (!DDRAM_BUSY) begin
++		if (DDRAM_WE) begin
++			assert (win_off < 32'h4000) else $fatal(1, "DDR write outside mailbox: %h", byte_addr);
++			for (int b = 0; b < 8; b++)
++				if (DDRAM_BE[b]) mem[widx][b*8 +: 8] <= DDRAM_DIN[b*8 +: 8];
++		end
++		if (DDRAM_RD) begin
++			assert (win_off < 32'h4000) else $fatal(1, "DDR read outside mailbox: %h", byte_addr);
++			assert (!rd_pend) else $fatal(1, "overlapping DDR reads");
++			rd_pend <= 1;
++			rd_idx  <= widx;
++			rd_wait <= 2 + int'(rng[23:16] % 8'd20);
++		end
++	end
++
++	if (rd_pend) begin
++		if (rd_wait == 0) begin
++			DDRAM_DOUT       <= mem[rd_idx];
++			DDRAM_DOUT_READY <= 1;
++			rd_pend          <= 0;
++		end
++		else rd_wait <= rd_wait - 1;
++	end
++end
++
++// ---------------------------------------------------------------------------
++// DUT: real arbiter + real netplay module
++
++logic [27:1] ch2_addr;
++logic [63:0] ch2_din, ch2_dout;
++logic        ch2_req, ch2_rnw, ch2_ready;
++logic  [7:0] ch2_be;
++
++ddram ddram
++(
++	.DDRAM_CLK        (clk),
++	.DDRAM_BUSY       (DDRAM_BUSY),
++	.DDRAM_BURSTCNT   (DDRAM_BURSTCNT),
++	.DDRAM_ADDR       (DDRAM_ADDR),
++	.DDRAM_DOUT       (DDRAM_DOUT),
++	.DDRAM_DOUT_READY (DDRAM_DOUT_READY),
++	.DDRAM_RD         (DDRAM_RD),
++	.DDRAM_DIN        (DDRAM_DIN),
++	.DDRAM_BE         (DDRAM_BE),
++	.DDRAM_WE         (DDRAM_WE),
++
++	.ch1_addr  ('0),
++	.ch1_dout  (),
++	.ch1_din   ('0),
++	.ch1_req   (1'b0),
++	.ch1_rnw   (1'b1),
++	.ch1_be    ('0),
++	.ch1_ready (),
++
++	.ch2_addr  (ch2_addr),
++	.ch2_dout  (ch2_dout),
++	.ch2_din   (ch2_din),
++	.ch2_req   (ch2_req),
++	.ch2_rnw   (ch2_rnw),
++	.ch2_be    (ch2_be),
++	.ch2_ready (ch2_ready)
++);
++
++logic [8:0] scanline_emu;
++logic       ppu_ce_emu;
++logic [5:0] color;
++logic       active, hold_reset, pause_req;
++logic [7:0] joy_p1, joy_p2;
++
++netplay #(.POLL_INTERVAL(64), .CTRL_INTERVAL(512)) dut
++(
++	.clk          (clk),
++	.reset        (por),
++	.downloading  (downloading),
++	.scanline_emu (scanline_emu),
++	.ppu_ce_emu   (ppu_ce_emu),
++	.color        (color),
++	.vbl_line     (9'(VBL_LINE)),
++	.core_paused  (paused),
++	.local_joy    (local_joy),
++	.active       (active),
++	.hold_reset   (hold_reset),
++	.pause_req    (pause_req),
++	.joy_p1       (joy_p1),
++	.joy_p2       (joy_p2),
++	.ddr_addr     (ch2_addr),
++	.ddr_din      (ch2_din),
++	.ddr_dout     (ch2_dout),
++	.ddr_req      (ch2_req),
++	.ddr_rnw      (ch2_rnw),
++	.ddr_be       (ch2_be),
++	.ddr_ready    (ch2_ready),
++	.state_o      (state),
++	.frame_o      (frame),
++	.error_o      (error)
++);
++
++// ---------------------------------------------------------------------------
++// Fake NES. Emulated time = dot/line counters, advanced only on ppu_ce_emu.
++
++logic [1:0]  div;
++logic [4:0]  dot;
++logic [8:0]  line;
++logic [31:0] acc;          // game state, depends on everything it has read
++int          pause_clks;   // clocks since the pause engaged
++localparam int FRAME_CLKS = LINES * DOTS * 4;
++logic [15:0] plfsr;        // models the variable distance to the next instruction boundary
++
++assign scanline_emu = line;
++assign color        = acc[5:0] ^ {1'b0, dot} ^ line[5:0];
++
++// The game log: what the game saw for each of its frames.
++logic [7:0] seen_p1 [MAX_FRAMES];
++logic [7:0] seen_p2 [MAX_FRAMES];
++
++wire in_vblank = (line >= 9'(VBL_LINE)) && (line <= 9'(VBL_END));
++wire core_reset = por || hold_reset;
++
++always @(posedge clk) begin
++	ppu_ce_emu <= 0;
++	plfsr <= {plfsr[14:0], plfsr[15] ^ plfsr[13] ^ plfsr[12] ^ plfsr[10]};
++
++	if (core_reset) begin
++		div         <= 0;
++		dot         <= 0;
++		line        <= 0;
++		acc         <= 32'h12345678;
++		paused      <= 0;
++		game_frames <= 0;
++		pause_clks  <= 0;
++		plfsr       <= 16'(SEED) | 16'h1;
++	end
++	else begin
++		// pause entry: only inside vblank, at a random "instruction boundary"
++		if (!paused && pause_req && !ignore_pause && in_vblank && plfsr[2:0] == 3'd0)
++			paused <= 1;
++		// Like rtl/nes.v, the core only resumes when the free-running video
++		// copy of the PPU has come round to the frozen position again, i.e. on
++		// whole frames: every stall costs at least one full frame.
++		if (paused) begin
++			pause_clks <= pause_clks + 1;
++			if (!pause_req && pause_clks > 0 && (pause_clks % FRAME_CLKS) == 0) begin
++				paused     <= 0;
++				pause_clks <= 0;
++			end
++		end
++
++		if (!paused) begin
++			div <= div + 1'd1;
++			if (div == 2'd3) begin
++				ppu_ce_emu <= 1;
++				if (dot == 5'(DOTS - 1)) begin
++					dot  <= 0;
++					line <= (line == 9'(LINES - 1)) ? 9'd0 : line + 1'd1;
++					// game counts frames on entering vblank, like an NMI
++					if (line + 1 == VBL_LINE) game_frames <= game_frames + 1;
++				end
++				else dot <= dot + 1'd1;
++
++				// the game's NMI reads the pads two lines into vblank
++				if (line == 9'(VBL_LINE + 2) && dot == 0) begin
++					if (game_frames < MAX_FRAMES) begin
++						seen_p1[game_frames] <= joy_p1;
++						seen_p2[game_frames] <= joy_p2;
++					end
++					acc <= (acc * 32'd31) ^ {16'd0, joy_p2, joy_p1};
++				end
++			end
++		end
++	end
++end
++
++endmodule
+diff --git a/sim/tb_netplay.sv b/sim/tb_netplay.sv
+new file mode 100644
+index 0000000..a8b5c55
+--- /dev/null
++++ b/sim/tb_netplay.sv
+@@ -0,0 +1,386 @@
++// tb_netplay.sv — testbench for rtl/netplay.sv (SPEC.md test T2)
++//
++// Two simulated MiSTers (np_machine) run the same fake game. A behavioural
++// "HPS + network" in this file plays the part of Main_MiSTer on both sides:
++// it reads LOCAL[k] from each mailbox and writes INPUT[k+D] back into both,
++// with independent random latency and torn (half-then-half) 64-bit writes.
++//
++// Scenarios (+scenario=<name>):
++//   lockstep  both machines must see identical input every frame, equal to
++//             what the protocol says, and post identical CRCs (jittery link)
++//   smooth    a link well inside the delay budget must never stall
++//   soak      lockstep for 20000 frames, so that rare same-cycle races happen
++//   underrun  a core that ignores pause must be caught with UNDERRUN
++//   ctrldrop  dropping enable in RUN returns to IDLE with CTRL_DROP
++//   reload    a ROM load during RUN gives RELOAD
++//   badsess   INPUT entries with the wrong session id are never accepted
++//
++// Prints PASS or FAIL and exits non-zero on failure.
++
++
++
++module tb_netplay;
++
++localparam int D          = 2;        // input delay in frames
++localparam int MAX_FRAMES = 32768;
++int            FRAMES     = 400;      // frames to run in lockstep (+frames=N)
++localparam logic [7:0] SESS = 8'h5A;
++
++localparam int OFF_MAGIC  = 'h0000;
++localparam int OFF_STATUS = 'h0008;
++localparam int OFF_CTRL   = 'h0010;
++localparam int OFF_LOCAL  = 'h1000;
++localparam int OFF_CRC    = 'h1800;
++localparam int OFF_INPUT  = 'h2000;
++
++localparam logic [2:0] S_IDLE = 0, S_ARMED = 1, S_PRIME = 2, S_RUN = 3, S_ERROR = 4;
++
++string scenario;
++
++logic clk = 0;
++always #5 clk = ~clk;
++
++logic       por = 1;
++logic [1:0] dl;
++logic [7:0] ljoy [2];
++logic [1:0] ign_pause;
++
++logic [2:0]  st   [2];
++logic [31:0] fr   [2];
++logic [7:0]  er   [2];
++logic [31:0] gfr  [2];
++logic [1:0]  pz;
++
++np_machine #(.SEED(11), .MAX_FRAMES(MAX_FRAMES)) mA (
++	.clk(clk), .por(por), .downloading(dl[0]), .local_joy(ljoy[0]), .ignore_pause(ign_pause[0]),
++	.state(st[0]), .frame(fr[0]), .error(er[0]), .game_frames(gfr[0]), .paused(pz[0]));
++
++np_machine #(.SEED(97), .MAX_FRAMES(MAX_FRAMES)) mB (
++	.clk(clk), .por(por), .downloading(dl[1]), .local_joy(ljoy[1]), .ignore_pause(ign_pause[1]),
++	.state(st[1]), .frame(fr[1]), .error(er[1]), .game_frames(gfr[1]), .paused(pz[1]));
++
++// ---------------------------------------------------------------------------
++// Mailbox access, as the ARM would do it (64-bit words, may tear)
++
++function automatic logic [63:0] mb_rd(int m, int off);
++	return (m == 0) ? mA.mem[off >> 3] : mB.mem[off >> 3];
++endfunction
++
++task automatic mb_wr(int m, int off, logic [63:0] v);
++	if (m == 0) mA.mem[off >> 3] = v; else mB.mem[off >> 3] = v;
++endtask
++
++task automatic mb_wr_lo(int m, int off, logic [31:0] v);
++	if (m == 0) mA.mem[off >> 3][31:0] = v; else mB.mem[off >> 3][31:0] = v;
++endtask
++
++task automatic mb_wr_hi(int m, int off, logic [31:0] v);
++	if (m == 0) mA.mem[off >> 3][63:32] = v; else mB.mem[off >> 3][63:32] = v;
++endtask
++
++function automatic logic [63:0] input_word(int f, logic [7:0] p1, logic [7:0] p2, logic [7:0] s);
++	return {f[15:0], s, p2, f[15:0], s, p1};
++endfunction
++
++// ---------------------------------------------------------------------------
++// Bookkeeping
++
++int          errors = 0;
++logic [7:0]  local_seen [2][MAX_FRAMES];
++bit          local_have [2][MAX_FRAMES];
++logic [31:0] crc_seen   [2][MAX_FRAMES];
++bit          crc_have   [2][MAX_FRAMES];
++logic [7:0]  input_p1   [MAX_FRAMES];
++logic [7:0]  input_p2   [MAX_FRAMES];
++int          next_local [2];
++int          next_crc   [2];
++int          next_input;                  // next INPUT frame to schedule
++
++// pending INPUT writes per machine: frame, due cycle, torn half
++typedef struct { int f; longint due; bit hi_done; bit lo_done; longint hi_due; } wr_t;
++wr_t         q [2][$];
++
++longint      cyc = 0;
++int unsigned hrng = 32'hC0FFEE;
++int          max_lat [2];
++logic [7:0]  sess_used = SESS;
++
++function automatic int unsigned hr();
++	hrng = hrng * 32'd1103515245 + 32'd12345;
++	return hrng >> 8;
++endfunction
++
++task automatic fail(string msg);
++	errors++;
++	if (errors <= 20) $display("FAIL: %s", msg);
++endtask
++
++task automatic clear_rings(int m);
++	for (int i = 0; i < 256; i++) begin
++		mb_wr(m, OFF_LOCAL + i*8, 64'h0);
++		mb_wr(m, OFF_CRC   + i*8, 64'h0);
++		// deliberately mismatched tags: never valid
++		mb_wr(m, OFF_INPUT + i*8, 64'hFFFF_0000_0000_0000);
++	end
++endtask
++
++task automatic wait_state(int m, logic [2:0] s, int timeout);
++	int t = 0;
++	while (st[m] != s && t < timeout) begin @(posedge clk); t++; end
++	if (st[m] != s) fail($sformatf("machine %0d: waited for state %0d, still %0d", m, s, st[m]));
++endtask
++
++// Collect LOCAL / CRC posts and schedule INPUT writes every cycle.
++task automatic hps_step();
++	cyc++;
++	for (int m = 0; m < 2; m++) begin
++		logic [63:0] w;
++		// LOCAL
++		w = mb_rd(m, OFF_LOCAL + (next_local[m] & 255) * 8);
++		if (w[63:48] == 16'(next_local[m]) && w[31:16] == 16'(next_local[m]) && w[47:40] == SESS && w[15:8] == SESS) begin
++			if (w[39:32] != w[7:0]) fail("LOCAL halves disagree");
++			local_seen[m][next_local[m]] = w[7:0];
++			local_have[m][next_local[m]] = 1;
++			next_local[m]++;
++		end
++		// CRC
++		w = mb_rd(m, OFF_CRC + (next_crc[m] & 255) * 8);
++		if (w[63:48] == 16'(next_crc[m]) && w[31:16] == 16'(next_crc[m]) && (next_crc[m] != 0 || w != 64'h0)) begin
++			crc_seen[m][next_crc[m]] = {w[47:32], w[15:0]};
++			crc_have[m][next_crc[m]] = 1;
++			next_crc[m]++;
++		end
++	end
++
++	// INPUT[k+D] = {p1: A's LOCAL[k], p2: B's LOCAL[k]}
++	while (next_input - D >= 0 && next_input < MAX_FRAMES
++	       && local_have[0][next_input - D] && local_have[1][next_input - D]) begin
++		input_p1[next_input] = local_seen[0][next_input - D];
++		input_p2[next_input] = local_seen[1][next_input - D];
++		for (int m = 0; m < 2; m++) begin
++			wr_t e;
++			e.f = next_input;
++			e.due = cyc + (hr() % (max_lat[m] + 1));
++			e.lo_done = 0; e.hi_done = 0;
++			e.hi_due = e.due + 1 + (hr() % 40);   // torn: lo lands first, hi later
++			q[m].push_back(e);
++		end
++		next_input++;
++	end
++
++	for (int m = 0; m < 2; m++) begin
++		for (int i = 0; i < q[m].size(); i++) begin
++			logic [63:0] v = input_word(q[m][i].f, input_p1[q[m][i].f], input_p2[q[m][i].f], sess_used);
++			int off = OFF_INPUT + (q[m][i].f & 255) * 8;
++			if (!q[m][i].lo_done && cyc >= q[m][i].due)    begin mb_wr_lo(m, off, v[31:0]);  q[m][i].lo_done = 1; end
++			if (!q[m][i].hi_done && cyc >= q[m][i].hi_due) begin mb_wr_hi(m, off, v[63:32]); q[m][i].hi_done = 1; end
++		end
++		while (q[m].size() > 0 && q[m][0].lo_done && q[m][0].hi_done) void'(q[m].pop_front());
++	end
++endtask
++
++// Bring both machines from power-on to RUN following SPEC.md "Sessionsstart".
++task automatic start_session(int lat_a, int lat_b);
++	max_lat[0] = lat_a; max_lat[1] = lat_b;
++	for (int m = 0; m < 2; m++) begin
++		if (mb_rd(m, OFF_MAGIC) != 64'h313030504E53454E) fail($sformatf("machine %0d: MAGIC missing", m));
++		clear_rings(m);
++		mb_wr(m, OFF_CTRL, {48'd0, SESS, 8'h01});          // enable
++	end
++	wait_state(0, S_ARMED, 5000);
++	wait_state(1, S_ARMED, 5000);
++
++	// ROM reload while ARMED must be harmless
++	dl = 2'b11;
++	repeat (300) @(posedge clk);
++	dl = 2'b00;
++	repeat (50) @(posedge clk);
++	if (st[0] != S_ARMED || st[1] != S_ARMED) fail("ROM load in ARMED changed state");
++
++	for (int f = 0; f < D; f++) begin
++		input_p1[f] = 0; input_p2[f] = 0;
++		for (int m = 0; m < 2; m++) mb_wr(m, OFF_INPUT + f*8, input_word(f, 0, 0, sess_used));
++	end
++	next_input = D;
++	for (int m = 0; m < 2; m++) begin
++		mb_wr(m, OFF_CTRL, {48'd0, SESS, 8'h03});          // enable + run
++	end
++	inv_on = (sess_used == SESS);
++endtask
++
++// Invariant, checked every cycle on both machines: whatever sits in the
++// lookahead must be exactly INPUT[base] / INPUT[base+1], and what the game
++// currently sees must be INPUT[frame].
++logic        inv_on = 0;
++int          inv_events = 0;
++always @(posedge clk) if (inv_on) begin
++	if (st[0] == S_RUN) check_inv(0);
++	if (st[1] == S_RUN) check_inv(1);
++end
++
++task automatic check_inv(int m);
++	logic h0, h1; logic [7:0] ap1, ap2, bp1, bp2, j1, j2; int f;
++	if (m == 0) begin h0 = mA.dut.have0; h1 = mA.dut.have1; ap1 = mA.dut.a_p1; ap2 = mA.dut.a_p2;
++	                  bp1 = mA.dut.b_p1; bp2 = mA.dut.b_p2; j1 = mA.dut.joy_p1; j2 = mA.dut.joy_p2; f = fr[0]; end
++	else        begin h0 = mB.dut.have0; h1 = mB.dut.have1; ap1 = mB.dut.a_p1; ap2 = mB.dut.a_p2;
++	                  bp1 = mB.dut.b_p1; bp2 = mB.dut.b_p2; j1 = mB.dut.joy_p1; j2 = mB.dut.joy_p2; f = fr[1]; end
++	if (f + 2 >= MAX_FRAMES) return;
++	if (j1 !== input_p1[f] || j2 !== input_p2[f]) fail($sformatf("m%0d frame %0d: joy %h/%h != INPUT %h/%h", m, f, j1, j2, input_p1[f], input_p2[f]));
++	if (h0 && (ap1 !== input_p1[f+1] || ap2 !== input_p2[f+1])) fail($sformatf("m%0d frame %0d: slot0 holds wrong frame", m, f));
++	if (h1 && (bp1 !== input_p1[f+2] || bp2 !== input_p2[f+2])) fail($sformatf("m%0d frame %0d: slot1 holds wrong frame", m, f));
++	if (h1 && !h0) fail($sformatf("m%0d: slot1 valid without slot0", m));
++endtask
++
++// Count the race the soak scenario is after: a tick on the same cycle as a
++// valid INPUT read for slot 1.
++always @(posedge clk) begin
++	if (mA.dut.state == S_RUN && mA.dut.tick && mA.dut.ddr_ready && mA.dut.op == 3'd6 && mA.dut.in_ok) inv_events++;
++	if (mB.dut.state == S_RUN && mB.dut.tick && mB.dut.ddr_ready && mB.dut.op == 3'd6 && mB.dut.in_ok) inv_events++;
++end
++
++// Real-time pad changes, independent per machine
++always @(posedge clk) begin
++	if ((hr() % 97) == 0) ljoy[0] <= 8'(hr());
++	if ((hr() % 131) == 0) ljoy[1] <= 8'(hr());
++end
++
++// ---------------------------------------------------------------------------
++
++initial begin
++	if (!$value$plusargs("scenario=%s", scenario)) scenario = "lockstep";
++	$display("scenario: %s", scenario);
++
++	dl = 0; ign_pause = 0; ljoy[0] = 0; ljoy[1] = 0;
++	next_local = '{0, 0}; next_crc = '{0, 0}; next_input = 0;
++	foreach (local_have[m, f]) local_have[m][f] = 0;
++	foreach (crc_have[m, f])   crc_have[m][f] = 0;
++
++	repeat (10) @(posedge clk);
++	por = 0;
++	repeat (2000) @(posedge clk);
++
++	case (scenario)
++
++	"lockstep", "smooth", "soak": begin
++		int stalls_a, stalls_b;
++		// lockstep: A has a fast "network", B a slow, jittery one (~1.5 frames
++		// worst case, so it sometimes misses the 1-frame budget of D=2).
++		// smooth: both comfortably inside the budget.
++		if (scenario == "soak") FRAMES = 20000;
++		if (scenario != "smooth") start_session(200, 2800);
++		else                        start_session(300, 1200);
++		fork
++			while (gfr[0] < FRAMES || gfr[1] < FRAMES) begin @(posedge clk); hps_step(); end
++			begin repeat (FRAMES * 4000) @(posedge clk); fail("lockstep timed out"); end
++		join_any
++		disable fork;
++
++		for (int m = 0; m < 2; m++)
++			if (st[m] != S_RUN) fail($sformatf("machine %0d left RUN: state %0d error %b", m, st[m], er[m]));
++
++		// what each game saw must equal the protocol's INPUT[k], and each other
++		for (int f = 1; f < FRAMES; f++) begin
++			if (mA.seen_p1[f] !== input_p1[f] || mA.seen_p2[f] !== input_p2[f])
++				fail($sformatf("A frame %0d saw %h/%h, expected %h/%h", f, mA.seen_p1[f], mA.seen_p2[f], input_p1[f], input_p2[f]));
++			if (mB.seen_p1[f] !== mA.seen_p1[f] || mB.seen_p2[f] !== mA.seen_p2[f])
++				fail($sformatf("frame %0d: A saw %h/%h, B saw %h/%h", f, mA.seen_p1[f], mA.seen_p2[f], mB.seen_p1[f], mB.seen_p2[f]));
++		end
++
++		// the inputs must actually vary, or the test proves nothing
++		begin
++			int changes = 0;
++			for (int f = D + 1; f < FRAMES; f++) if (input_p1[f] != input_p1[f-1]) changes++;
++			if (changes < 20) fail($sformatf("only %0d input changes, test too weak", changes));
++		end
++
++		// CRCs must agree frame by frame
++		begin
++			int compared = 0;
++			for (int f = 0; f < FRAMES - 2; f++) begin
++				if (!crc_have[0][f] || !crc_have[1][f]) begin fail($sformatf("CRC %0d missing", f)); break; end
++				if (crc_seen[0][f] != crc_seen[1][f]) fail($sformatf("CRC mismatch at frame %0d", f));
++				compared++;
++			end
++			$display("compared %0d CRCs", compared);
++		end
++
++		stalls_a = mA.dut.stalls;
++		stalls_b = mB.dut.stalls;
++		$display("frames A=%0d B=%0d, stalls A=%0d B=%0d, same-cycle races %0d", fr[0], fr[1], stalls_a, stalls_b, inv_events);
++		if (scenario == "soak" && inv_events == 0) fail("soak never hit the tick/read race");
++		if (scenario != "smooth") begin
++			if (stalls_a + stalls_b == 0) fail("no stalls: pause path not exercised");
++			if (stalls_a > FRAMES / 3 || stalls_b > FRAMES / 3) fail("stalling far more often than the link requires");
++		end
++		else if (stalls_a + stalls_b != 0) fail("stalls on a link inside the budget");
++
++		// a deliberate input difference must show up as a CRC difference:
++		// covered by the 'badsess'-free design; here check CRC depends on input
++		begin
++			bit any_diff = 0;
++			for (int f = 1; f < FRAMES - 2; f++) if (crc_seen[0][f] != crc_seen[0][f-1]) any_diff = 1;
++			if (!any_diff) fail("CRC never changes");
++		end
++	end
++
++	"underrun": begin
++		ign_pause = 2'b01;                // machine A's core ignores pause
++		start_session(200, 200);
++		// stop feeding after a while: A must notice it ran past a missing input
++		fork
++			while (gfr[0] < 30) begin @(posedge clk); hps_step(); end
++			begin repeat (200000) @(posedge clk); fail("never reached frame 30"); end
++		join_any
++		disable fork;
++		repeat (20000) @(posedge clk);    // no hps_step: inputs dry up
++		if (st[0] != S_ERROR || !er[0][0]) fail($sformatf("A: expected ERROR/UNDERRUN, got state %0d error %b", st[0], er[0]));
++		if (st[1] != S_RUN) fail($sformatf("B (honours pause) should still wait in RUN, got %0d", st[1]));
++		if (!pz[1]) fail("B should be paused while waiting");
++	end
++
++	"ctrldrop": begin
++		start_session(200, 200);
++		fork
++			while (gfr[0] < 20) begin @(posedge clk); hps_step(); end
++			begin repeat (200000) @(posedge clk); fail("never reached frame 20"); end
++		join_any
++		disable fork;
++		mb_wr(0, OFF_CTRL, 64'h0);
++		repeat (2000) @(posedge clk);
++		if (st[0] != S_IDLE || !er[0][1]) fail($sformatf("A: expected IDLE/CTRL_DROP, got %0d %b", st[0], er[0]));
++		if (mA.dut.pause_req || mA.dut.hold_reset) fail("A still pausing/holding after drop");
++	end
++
++	"reload": begin
++		start_session(200, 200);
++		fork
++			while (gfr[1] < 20) begin @(posedge clk); hps_step(); end
++			begin repeat (200000) @(posedge clk); fail("never reached frame 20"); end
++		join_any
++		disable fork;
++		dl = 2'b10;
++		repeat (20) @(posedge clk);
++		dl = 2'b00;
++		repeat (100) @(posedge clk);
++		if (st[1] != S_ERROR || !er[1][2]) fail($sformatf("B: expected ERROR/RELOAD, got %0d %b", st[1], er[1]));
++	end
++
++	"badsess": begin
++		sess_used = SESS ^ 8'hFF;         // HPS writes the wrong session id
++		start_session(100, 100);
++		repeat (60000) begin @(posedge clk); hps_step(); end
++		// INPUT[0] was prefilled with the wrong session too: never leaves PRIME
++		if (st[0] != S_PRIME || st[1] != S_PRIME) fail($sformatf("expected PRIME, got %0d/%0d", st[0], st[1]));
++	end
++
++	default: fail({"unknown scenario ", scenario});
++	endcase
++
++	if (errors == 0) begin
++		$display("PASS %s", scenario);
++		$finish;
++	end
++	else $fatal(1, "FAIL %s (%0d errors)", scenario, errors);
++end
++
++endmodule
+-- 
+2.43.0
+

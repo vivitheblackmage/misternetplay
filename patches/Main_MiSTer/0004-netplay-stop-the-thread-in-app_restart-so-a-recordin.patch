@@ -1,0 +1,38 @@
+From 6093d9d3534b45563ffc771a8c26b567b116fb6f Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 31 Oct 2026 21:17:15 +0100
+Subject: [PATCH] netplay: stop the thread in app_restart so a recording is
+ saved on core change
+
+Loading another core ends the process in app_restart() (_exit after fork).
+netplay_stop() was only reached in the next process, so mode=record never
+saved its recording when the user left the core.
+---
+ fpga_io.cpp | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/fpga_io.cpp b/fpga_io.cpp
+index b64cfe5..2f16770 100644
+--- a/fpga_io.cpp
++++ b/fpga_io.cpp
+@@ -16,6 +16,7 @@
+ #include "menu.h"
+ #include "shmem.h"
+ #include "offload.h"
++#include "support/netplay/netplay.h"
+ 
+ #include "fpga_base_addr_ac5.h"
+ #include "fpga_manager.h"
+@@ -619,6 +620,9 @@ char *getappname()
+ 
+ void app_restart(const char *path, const char *xml, const char *exe)
+ {
++	// Before this process exits: stopping the netplay thread is what saves a
++	// recording (mode=record), so leaving the core by loading another one keeps it.
++	netplay_stop();
+ 	sync();
+ 	fpga_core_reset(1);
+ 
+-- 
+2.43.0
+

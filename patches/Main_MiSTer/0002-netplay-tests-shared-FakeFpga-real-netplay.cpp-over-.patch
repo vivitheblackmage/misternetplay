@@ -1,0 +1,499 @@
+From ad8ab032cfb4509a9521413b63b0c093a7530838 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Fri, 30 Oct 2026 18:42:02 +0000
+Subject: [PATCH 2/3] netplay tests: shared FakeFpga, real netplay.cpp over UDP
+ on localhost
+---
+ support/netplay/test/.gitignore       |   2 +
+ support/netplay/test/Makefile         |  25 +++--
+ support/netplay/test/fake_fpga.h      | 138 ++++++++++++++++++++++++++
+ support/netplay/test/run_udp_test.sh  |  29 ++++++
+ support/netplay/test/test_netplay.cpp | 122 +----------------------
+ support/netplay/test/udp_harness.cpp  | 107 ++++++++++++++++++++
+ 6 files changed, 295 insertions(+), 128 deletions(-)
+ create mode 100644 support/netplay/test/fake_fpga.h
+ create mode 100755 support/netplay/test/run_udp_test.sh
+ create mode 100644 support/netplay/test/udp_harness.cpp
+
+diff --git a/support/netplay/test/.gitignore b/support/netplay/test/.gitignore
+index 2a3e9df..548819e 100644
+--- a/support/netplay/test/.gitignore
++++ b/support/netplay/test/.gitignore
+@@ -1 +1,3 @@
+ test_netplay
++udp_harness
++md5.o
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index 38e6c69..d74f0cc 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -1,16 +1,27 @@
+-# x86 tests for the netplay engine (SPEC.md T3). Needs only g++.
+-#   make        build and run
++# x86 tests for the netplay engine and its MiSTer glue (SPEC.md T3). Needs g++.
++#   make        engine tests, then host+join over real UDP on localhost
+ 
+ CXX      ?= g++
+ CXXFLAGS ?= -std=gnu++14 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined
+-SRC      := ../netplay_proto.cpp ../netplay_session.cpp test_netplay.cpp
++ROOT     := ../../..
++ENGINE   := ../netplay_proto.cpp ../netplay_session.cpp
++HDRS     := ../netplay_proto.h ../netplay_session.h fake_fpga.h
+ 
+ .PHONY: test clean
+-test: test_netplay
++test: test_netplay udp_harness
+ 	./test_netplay
++	./run_udp_test.sh
+ 
+-test_netplay: $(SRC) ../netplay_proto.h ../netplay_session.h
+-	$(CXX) $(CXXFLAGS) -o $@ $(SRC)
++test_netplay: $(ENGINE) test_netplay.cpp $(HDRS)
++	$(CXX) $(CXXFLAGS) -o $@ $(ENGINE) test_netplay.cpp
++
++# The real netplay.cpp, with MiSTer functions stubbed in udp_harness.cpp.
++md5.o: $(ROOT)/lib/md5/md5.c
++	$(CC) -O1 -g -fsanitize=address,undefined -c -o $@ $<
++
++udp_harness: $(ENGINE) ../netplay.cpp ../netplay.h udp_harness.cpp $(HDRS) md5.o
++	$(CXX) $(CXXFLAGS) -Wno-psabi -D_FILE_OFFSET_BITS=64 -I$(ROOT) -I$(ROOT)/lib/md5 \
++	  -o $@ $(ENGINE) ../netplay.cpp udp_harness.cpp md5.o -lpthread
+ 
+ clean:
+-	rm -f test_netplay
++	rm -f test_netplay udp_harness md5.o
+diff --git a/support/netplay/test/fake_fpga.h b/support/netplay/test/fake_fpga.h
+new file mode 100644
+index 0000000..3fadc89
+--- /dev/null
++++ b/support/netplay/test/fake_fpga.h
+@@ -0,0 +1,138 @@
++// fake_fpga.h — rtl/netplay.sv modelled at the DDR3 mailbox level (test only)
++
++#ifndef FAKE_FPGA_H
++#define FAKE_FPGA_H
++
++#include <stdint.h>
++#include <vector>
++#include <utility>
++#include <functional>
++#include "../netplay_proto.h"
++#include "../netplay_session.h"
++
++namespace netplay {
++
++// FakeFpga: rtl/netplay.sv at the mailbox level, plus a "game" whose state
++// folds in every input it is given.
++
++struct FakeFpga
++{
++	uint8_t own[MB_SIZE] = {};
++	uint8_t *mem = own;
++	Mailbox mb { own };
++
++	int      id;
++	uint32_t frame_ms = 16;
++	uint8_t  state = FS_IDLE, error = 0, sess = 0;
++	uint32_t frame = 0;
++	uint16_t stalls = 0;
++	bool     have0 = false, have1 = false;
++	uint8_t  a1 = 0, a2 = 0, b1 = 0, b2 = 0, cur1 = 0, cur2 = 0;
++	uint64_t next_tick = 0;
++	uint32_t game = 0x12345678;
++	int      corrupt_crc_at = -1;
++	bool     stalled = false;
++	std::vector<std::pair<uint8_t, uint8_t>> seen;   // inputs per frame
++	std::vector<uint8_t> posted;                     // LOCAL[] per frame
++	std::function<uint8_t(uint64_t)> pad;
++
++	explicit FakeFpga(int i) : id(i)
++	{
++		mb.wr(MB_MAGIC, MAGIC_VALUE);
++		pad = [i](uint64_t now) { return (uint8_t)((now / (37 + 11 * i)) * (i ? 0x5B : 0x3D)); };
++	}
++
++	void status() { mb.wr(MB_STATUS, (uint64_t)frame << 32 | (uint64_t)state << 24 | (uint64_t)error << 16 | stalls); }
++
++	bool fetch(uint32_t f, uint8_t *p1, uint8_t *p2)
++	{
++		uint64_t w = mb.rd(ring_off(MB_INPUT, f));
++		uint32_t hi = (uint32_t)(w >> 32), lo = (uint32_t)w;
++		uint32_t tag = (f & 0xFFFF) << 16 | (uint32_t)sess << 8;
++		if ((hi & 0xFFFFFF00) != tag || (lo & 0xFFFFFF00) != tag) return false;
++		*p1 = (uint8_t)lo; *p2 = (uint8_t)hi;
++		return true;
++	}
++
++	void post_local(uint32_t f, uint8_t j)
++	{
++		if (posted.size() == f) posted.push_back(j);
++		uint32_t half = (f & 0xFFFF) << 16 | (uint32_t)sess << 8 | j;
++		mb.wr(ring_off(MB_LOCAL, f), (uint64_t)half << 32 | half);
++	}
++
++	void post_crc(uint32_t f, uint32_t c)
++	{
++		uint64_t w = (uint64_t)((f & 0xFFFF) << 16 | (c >> 16)) << 32 | ((f & 0xFFFF) << 16 | (c & 0xFFFF));
++		mb.wr(ring_off(MB_CRC, f), w);
++	}
++
++	void apply(uint8_t p1, uint8_t p2)
++	{
++		cur1 = p1; cur2 = p2;
++		game = game * 31 + (uint32_t)(p1 | p2 << 8) + 1;
++		seen.push_back({p1, p2});
++	}
++
++	void step(uint64_t now)
++	{
++		uint64_t ctrl = mb.rd(MB_CTRL);
++		bool en = ctrl & 1, run = ctrl & 2;
++
++		switch (state)
++		{
++		case FS_IDLE:
++			if (en) { state = FS_ARMED; sess = (uint8_t)(ctrl >> 8); frame = 0; error = 0; stalls = 0; have0 = have1 = false; status(); }
++			break;
++		case FS_ARMED:
++			if (!en) { state = FS_IDLE; status(); }
++			else if (run) { state = FS_PRIME; status(); }
++			break;
++		case FS_PRIME:
++			if (!en) { state = FS_IDLE; status(); break; }
++			if (!have0) have0 = fetch(0, &a1, &a2);
++			if (have0 && !have1) have1 = fetch(1, &b1, &b2);
++			if (have0 && have1)
++			{
++				state = FS_RUN; frame = 0;
++				apply(a1, a2);
++				a1 = b1; a2 = b2; have1 = false;
++				post_local(0, pad(now));
++				next_tick = now + frame_ms;
++				status();
++			}
++			break;
++		case FS_RUN:
++			if (!en) { state = FS_IDLE; error |= FE_CTRL_DROP; status(); break; }
++			if (!have0) have0 = fetch(frame + 1, &a1, &a2);
++			else if (!have1) have1 = fetch(frame + 2, &b1, &b2);
++			if (now >= next_tick)
++			{
++				if (!have0)
++				{
++					// real core pauses in vblank and resumes a whole frame later
++					if (!stalled) { stalls++; stalled = true; }
++					next_tick = now + frame_ms;
++					break;
++				}
++				stalled = false;
++				uint32_t c = game ^ (corrupt_crc_at == (int)frame ? 1u : 0u);
++				post_crc(frame, c);
++				frame++;
++				apply(a1, a2);
++				have0 = have1; a1 = b1; a2 = b2; have1 = false;
++				post_local(frame, pad(now));
++				next_tick += frame_ms;
++				status();
++			}
++			break;
++		default:
++			if (!en) { state = FS_IDLE; status(); }
++			break;
++		}
++	}
++};
++
++} // namespace netplay
++
++#endif
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+new file mode 100755
+index 0000000..43eb12b
+--- /dev/null
++++ b/support/netplay/test/run_udp_test.sh
+@@ -0,0 +1,29 @@
++#!/usr/bin/env bash
++# Host and join as two processes over real UDP on localhost (SPEC.md T3).
++set -u
++here="$(cd "$(dirname "$0")" && pwd)"
++bin="$here/udp_harness"
++frames="${1:-600}"
++tmp="$(mktemp -d)"
++mkdir -p "$tmp/host" "$tmp/join"
++
++"$bin" host "$tmp/host" "$frames" > "$tmp/host.log" 2>&1 &
++hp=$!
++sleep 0.3
++"$bin" join "$tmp/join" "$frames" > "$tmp/join.log" 2>&1 &
++jp=$!
++wait $hp; hr=$?
++wait $jp; jr=$?
++
++h=$(grep RESULT "$tmp/host.log"); j=$(grep RESULT "$tmp/join.log")
++echo "host: $h"
++echo "join: $j"
++hd=${h##*digest=}; jd=${j##*digest=}
++if [ $hr -eq 0 ] && [ $jr -eq 0 ] && [ -n "$hd" ] && [ "$hd" = "$jd" ]; then
++	echo "PASS udp"
++	rm -rf "$tmp"
++	exit 0
++fi
++echo "FAIL udp (logs in $tmp)"
++tail -20 "$tmp/host.log" "$tmp/join.log"
++exit 1
+diff --git a/support/netplay/test/test_netplay.cpp b/support/netplay/test/test_netplay.cpp
+index 6fa3d73..69d609a 100644
+--- a/support/netplay/test/test_netplay.cpp
++++ b/support/netplay/test/test_netplay.cpp
+@@ -14,6 +14,7 @@
+ 
+ #include "../netplay_proto.h"
+ #include "../netplay_session.h"
++#include "fake_fpga.h"
+ 
+ using namespace netplay;
+ 
+@@ -24,127 +25,6 @@ static int g_fail = 0, g_checks = 0;
+ static uint32_t rng_state = 12345;
+ static uint32_t rnd() { rng_state = rng_state * 1103515245u + 12345u; return rng_state >> 8; }
+ 
+-// ---------------------------------------------------------------------------
+-// FakeFpga: rtl/netplay.sv at the mailbox level, plus a "game" whose state
+-// folds in every input it is given.
+-
+-struct FakeFpga
+-{
+-	uint8_t mem[MB_SIZE] = {};
+-	Mailbox mb { mem };
+-
+-	int      id;
+-	uint32_t frame_ms = 16;
+-	uint8_t  state = FS_IDLE, error = 0, sess = 0;
+-	uint32_t frame = 0;
+-	uint16_t stalls = 0;
+-	bool     have0 = false, have1 = false;
+-	uint8_t  a1 = 0, a2 = 0, b1 = 0, b2 = 0, cur1 = 0, cur2 = 0;
+-	uint64_t next_tick = 0;
+-	uint32_t game = 0x12345678;
+-	int      corrupt_crc_at = -1;
+-	bool     stalled = false;
+-	std::vector<std::pair<uint8_t, uint8_t>> seen;   // inputs per frame
+-	std::vector<uint8_t> posted;                     // LOCAL[] per frame
+-	std::function<uint8_t(uint64_t)> pad;
+-
+-	explicit FakeFpga(int i) : id(i)
+-	{
+-		mb.wr(MB_MAGIC, MAGIC_VALUE);
+-		pad = [i](uint64_t now) { return (uint8_t)((now / (37 + 11 * i)) * (i ? 0x5B : 0x3D)); };
+-	}
+-
+-	void status() { mb.wr(MB_STATUS, (uint64_t)frame << 32 | (uint64_t)state << 24 | (uint64_t)error << 16 | stalls); }
+-
+-	bool fetch(uint32_t f, uint8_t *p1, uint8_t *p2)
+-	{
+-		uint64_t w = mb.rd(ring_off(MB_INPUT, f));
+-		uint32_t hi = (uint32_t)(w >> 32), lo = (uint32_t)w;
+-		uint32_t tag = (f & 0xFFFF) << 16 | (uint32_t)sess << 8;
+-		if ((hi & 0xFFFFFF00) != tag || (lo & 0xFFFFFF00) != tag) return false;
+-		*p1 = (uint8_t)lo; *p2 = (uint8_t)hi;
+-		return true;
+-	}
+-
+-	void post_local(uint32_t f, uint8_t j)
+-	{
+-		if (posted.size() == f) posted.push_back(j);
+-		uint32_t half = (f & 0xFFFF) << 16 | (uint32_t)sess << 8 | j;
+-		mb.wr(ring_off(MB_LOCAL, f), (uint64_t)half << 32 | half);
+-	}
+-
+-	void post_crc(uint32_t f, uint32_t c)
+-	{
+-		uint64_t w = (uint64_t)((f & 0xFFFF) << 16 | (c >> 16)) << 32 | ((f & 0xFFFF) << 16 | (c & 0xFFFF));
+-		mb.wr(ring_off(MB_CRC, f), w);
+-	}
+-
+-	void apply(uint8_t p1, uint8_t p2)
+-	{
+-		cur1 = p1; cur2 = p2;
+-		game = game * 31 + (uint32_t)(p1 | p2 << 8) + 1;
+-		seen.push_back({p1, p2});
+-	}
+-
+-	void step(uint64_t now)
+-	{
+-		uint64_t ctrl = mb.rd(MB_CTRL);
+-		bool en = ctrl & 1, run = ctrl & 2;
+-
+-		switch (state)
+-		{
+-		case FS_IDLE:
+-			if (en) { state = FS_ARMED; sess = (uint8_t)(ctrl >> 8); frame = 0; error = 0; stalls = 0; have0 = have1 = false; status(); }
+-			break;
+-		case FS_ARMED:
+-			if (!en) { state = FS_IDLE; status(); }
+-			else if (run) { state = FS_PRIME; status(); }
+-			break;
+-		case FS_PRIME:
+-			if (!en) { state = FS_IDLE; status(); break; }
+-			if (!have0) have0 = fetch(0, &a1, &a2);
+-			if (have0 && !have1) have1 = fetch(1, &b1, &b2);
+-			if (have0 && have1)
+-			{
+-				state = FS_RUN; frame = 0;
+-				apply(a1, a2);
+-				a1 = b1; a2 = b2; have1 = false;
+-				post_local(0, pad(now));
+-				next_tick = now + frame_ms;
+-				status();
+-			}
+-			break;
+-		case FS_RUN:
+-			if (!en) { state = FS_IDLE; error |= FE_CTRL_DROP; status(); break; }
+-			if (!have0) have0 = fetch(frame + 1, &a1, &a2);
+-			else if (!have1) have1 = fetch(frame + 2, &b1, &b2);
+-			if (now >= next_tick)
+-			{
+-				if (!have0)
+-				{
+-					// real core pauses in vblank and resumes a whole frame later
+-					if (!stalled) { stalls++; stalled = true; }
+-					next_tick = now + frame_ms;
+-					break;
+-				}
+-				stalled = false;
+-				uint32_t c = game ^ (corrupt_crc_at == (int)frame ? 1u : 0u);
+-				post_crc(frame, c);
+-				frame++;
+-				apply(a1, a2);
+-				have0 = have1; a1 = b1; a2 = b2; have1 = false;
+-				post_local(frame, pad(now));
+-				next_tick += frame_ms;
+-				status();
+-			}
+-			break;
+-		default:
+-			if (!en) { state = FS_IDLE; status(); }
+-			break;
+-		}
+-	}
+-};
+-
+ // ---------------------------------------------------------------------------
+ // Simulated network between exactly two endpoints
+ 
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+new file mode 100644
+index 0000000..57398d4
+--- /dev/null
++++ b/support/netplay/test/udp_harness.cpp
+@@ -0,0 +1,107 @@
++// udp_harness.cpp — runs the real support/netplay/netplay.cpp (thread, UDP,
++// ini parsing, ROM reload handshake) on x86 against a FakeFpga, with the few
++// MiSTer functions it calls stubbed out. One process per player:
++//
++//   udp_harness <host|join> <workdir> <frames>
++//
++// Prints "RESULT frames=<n> digest=<hash of every input seen>" on success.
++// run_udp_test.sh starts a host and a join and compares the digests.
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++#include <string>
++
++#include "../netplay.h"
++#include "fake_fpga.h"
++
++using namespace netplay;
++
++static FakeFpga   *fpga;
++static std::string workdir;
++static int         reloads = 0;
++
++// --- stubs for the MiSTer functions netplay.cpp uses ------------------------
++
++char *user_io_get_core_name(int) { static char n[] = "NES"; return n; }
++
++char *user_io_get_confstr(int index)
++{
++	static char a[] = "NES", b[] = "V,v261030";
++	return index == 0 ? a : index == 1 ? b : nullptr;
++}
++
++uint32_t user_io_status_get(const char *opt, int)
++{
++	if (!strcmp(opt, "[66:65]")) return 1;   // RAM Clear $00
++	if (!strcmp(opt, "[20]")) return 1;      // cheats off
++	return 0;
++}
++
++int user_io_file_tx(const char *name, unsigned char index, char, char, char, uint32_t)
++{
++	reloads++;
++	printf("[harness] reload %s index %u\n", name, index);
++	netplay_note_file(name, index);           // like the real one: must be ignored
++	return 1;
++}
++
++const char *getFullPath(const char *name)
++{
++	static char buf[1024];
++	snprintf(buf, sizeof(buf), "%s/%s", workdir.c_str(), name);
++	return buf;
++}
++
++void Info(const char *message, int, int, int, int) { printf("[osd] %s\n", message); fflush(stdout); }
++
++void *shmem_map(uint32_t, uint32_t) { return fpga->own; }
++int shmem_unmap(void *, uint32_t) { return 1; }
++
++// -----------------------------------------------------------------------------
++
++static uint64_t now_ms()
++{
++	timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
++}
++
++int main(int argc, char **argv)
++{
++	if (argc != 4) { fprintf(stderr, "usage: udp_harness <host|join> <workdir> <frames>\n"); return 2; }
++	bool host = !strcmp(argv[1], "host");
++	workdir = argv[2];
++	uint32_t want = (uint32_t)atoi(argv[3]);
++
++	FILE *f = fopen(getFullPath("netplay.ini"), "w");
++	fprintf(f, "; test\n[netplay]\nmode = %s ; comment\npeer=%s\nport=47845\ndelay=3\n",
++	        host ? "host" : "join", host ? "" : "127.0.0.1");
++	fclose(f);
++
++	f = fopen(getFullPath("game.nes"), "wb");               // same bytes on both sides
++	uint8_t hdr[16] = {'N', 'E', 'S', 0x1A, 2, 1};
++	fwrite(hdr, 16, 1, f);
++	for (int i = 0; i < 40960; i++) fputc((i * 7) & 0xFF, f);
++	fclose(f);
++
++	fpga = new FakeFpga(host ? 0 : 1);
++	netplay_start();
++	netplay_note_file("game.nes", 1);
++
++	uint64_t t0 = now_ms();
++	while (fpga->frame < want && now_ms() - t0 < 60000)
++	{
++		fpga->step(now_ms());
++		netplay_poll();
++		usleep(500);
++	}
++	netplay_stop();
++
++	uint64_t digest = 1469598103934665603ULL;
++	for (auto &p : fpga->seen) { digest = (digest ^ p.first) * 1099511628211ULL; digest = (digest ^ p.second) * 1099511628211ULL; }
++	printf("RESULT frames=%u stalls=%u reloads=%d digest=%016llx\n", fpga->frame, fpga->stalls, reloads, (unsigned long long)digest);
++	return (fpga->frame >= want && reloads == 1) ? 0 : 1;
++}
+-- 
+2.43.0
+

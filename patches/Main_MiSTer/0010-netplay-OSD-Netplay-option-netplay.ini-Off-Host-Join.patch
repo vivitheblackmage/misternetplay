@@ -1,0 +1,256 @@
+From 6fe4f60524bd4e69332babb8622f00ff6c3ca5c6 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sun, 1 Nov 2026 00:13:19 +0100
+Subject: [PATCH] netplay: OSD "Netplay" option (netplay.ini/Off/Host/Join)
+ picks the mode per ROM
+
+The NES core's new OSD option (status [89:88]) is read when a game is
+loaded, so host/join can be chosen without editing netplay.ini or reloading
+the core. 0 keeps the ini's mode=. The ini is now optional (Host works with
+the defaults; Join needs peer=). The netplay thread starts with the first
+ROM whose mode is not Off, instead of at core load.
+
+The UDP test also runs with mode=off in the ini and the mode from the OSD.
+---
+ support/netplay/netplay.cpp          | 70 +++++++++++++++++++---------
+ support/netplay/test/Makefile        |  1 +
+ support/netplay/test/run_udp_test.sh |  4 +-
+ support/netplay/test/udp_harness.cpp |  8 +++-
+ 4 files changed, 59 insertions(+), 24 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 6112a96..52838eb 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -203,6 +203,7 @@ static bool load_recording(const char *path, Recording *r, uint8_t *md5)
+ static Config            cfg;
+ static pthread_t         thread;
+ static bool              thread_running = false;
++static bool              nes_armed = false;  // an NES core is loaded; the thread starts with the first netplay ROM
+ static std::atomic<bool> quit { false };
+ 
+ static std::mutex        info_mtx;          // guards the fields below
+@@ -211,6 +212,7 @@ static std::string       rom_path;
+ static unsigned char     rom_index = 0;
+ static char              rom_opensave = 0;
+ static uint32_t          rom_seq = 0;        // bumps on every user ROM load
++static Mode              rom_mode = M_OFF;   // session mode for that ROM (OSD, else netplay.ini)
+ 
+ static std::atomic<bool> reload_req { false };
+ static std::atomic<bool> reload_done { false };
+@@ -245,6 +247,7 @@ static void *netplay_thread(void *)
+ 	Recording rec;
+ 	uint8_t   md5[16] = {};
+ 	char      rec_path[512] = "";   // this session's recording file
++	Mode      mode = M_OFF;         // this session's mode
+ 	uint32_t  seen_rom = 0, seen_msg = 0;
+ 	bool      saved = false;
+ 
+@@ -264,7 +267,7 @@ static void *netplay_thread(void *)
+ 			if (s)
+ 			{
+ 				s->stop(now, "Netplay: new ROM");
+-				if (cfg.mode == M_RECORD && !saved && !rec.joy.empty())
++				if (mode == M_RECORD && !saved && !rec.joy.empty())
+ 					post_message(save_recording(rec_path, rec, md5) ? "Netplay: recording saved" : "Netplay: cannot save recording");
+ 				delete s;
+ 				s = nullptr;
+@@ -279,21 +282,27 @@ static void *netplay_thread(void *)
+ 			{
+ 				std::lock_guard<std::mutex> g(info_mtx);
+ 				li = rom_info;
++				mode = rom_mode;
+ 				recording_path(rec_path, sizeof(rec_path), cfg.file, rom_path.c_str());
+ 			}
+ 			memcpy(md5, li.rom_md5, 16);
+ 
+-			bool ok = true;
+-			if (cfg.mode == M_HOST || cfg.mode == M_JOIN)
++			bool ok = mode != M_OFF;      // OSD "Off": no session for this ROM
++			if (mode == M_JOIN && !cfg.peer[0])
++			{
++				post_message("Netplay: Join needs peer= in netplay.ini");
++				ok = false;
++			}
++			else if (mode == M_HOST || mode == M_JOIN)
+ 			{
+ 				udp = new Udp();
+-				if (!udp->open_socket(cfg.port, cfg.mode == M_JOIN ? cfg.peer : nullptr))
++				if (!udp->open_socket(cfg.port, mode == M_JOIN ? cfg.peer : nullptr))
+ 				{
+-					post_message(cfg.mode == M_JOIN ? "Netplay: cannot reach peer (check peer=)" : "Netplay: cannot open port");
++					post_message(mode == M_JOIN ? "Netplay: cannot reach peer (check peer=)" : "Netplay: cannot open port");
+ 					ok = false;
+ 				}
+ 			}
+-			else if (cfg.mode == M_REPLAY)
++			else if (mode == M_REPLAY)
+ 			{
+ 				uint8_t rmd5[16];
+ 				if (!load_recording(rec_path, &rec, rmd5)) { post_message("Netplay: cannot read recording"); ok = false; }
+@@ -303,7 +312,7 @@ static void *netplay_thread(void *)
+ 			if (ok)
+ 			{
+ 				uint8_t seed = (uint8_t)((now ^ (now >> 8) ^ getpid()) | 1);
+-				s = new Session(cfg.mode, cfg.delay, mb, udp, &rec, seed);
++				s = new Session(mode, cfg.delay, mb, udp, &rec, seed);
+ 				s->set_local(li);
+ 			}
+ 		}
+@@ -317,7 +326,7 @@ static void *netplay_thread(void *)
+ 
+ 			// Only a recording that has frames: a session refused at the start
+ 			// would overwrite the last good file, and hide the reason on the OSD.
+-			if (cfg.mode == M_RECORD && s->phase() == PH_DONE && !saved)
++			if (mode == M_RECORD && s->phase() == PH_DONE && !saved)
+ 			{
+ 				saved = true;
+ 				if (!rec.joy.empty())
+@@ -331,7 +340,7 @@ static void *netplay_thread(void *)
+ 	if (s)
+ 	{
+ 		s->stop(now_ms(), "Netplay: stopped");
+-		if (cfg.mode == M_RECORD && !saved && !rec.joy.empty()) save_recording(rec_path, rec, md5);
++		if (mode == M_RECORD && !saved && !rec.joy.empty()) save_recording(rec_path, rec, md5);
+ 		delete s;
+ 	}
+ 	delete udp;
+@@ -378,13 +387,21 @@ static bool md5_file(const char *path, uint8_t out[16], uint8_t *hdr, size_t hdr
+ 	return true;
+ }
+ 
++static void start_thread();
++
+ void netplay_note_file(const char *name, unsigned char index, char opensave)
+ {
+-	if (!thread_running || own_reload || !is_nes_core()) return;
++	if (!nes_armed || own_reload || !is_nes_core()) return;
+ 	// Only the game slot ("FS,NESFDSNSF", OSD index 1) starts a session. Index 0
+ 	// is boot0.rom, 2 the FDS BIOS, 3 a custom palette.
+ 	if ((index & 0x3F) != 1) return;
+ 
++	// OSD "Netplay" [89:88]: 0 netplay.ini, 1 Off, 2 Host, 3 Join
++	static const Mode osd_modes[4] = { M_OFF, M_OFF, M_HOST, M_JOIN };
++	uint32_t osd = user_io_status_get("[89:88]");
++	Mode mode = osd ? osd_modes[osd & 3] : cfg.mode;
++	if (mode == M_OFF && !thread_running) return;   // nothing to stop, nothing to start
++
+ 	LocalInfo li {};
+ 	uint8_t hdr[16] = {};
+ 	if (!md5_file(name, li.rom_md5, hdr, sizeof(hdr))) return;
+@@ -409,20 +426,20 @@ void netplay_note_file(const char *name, unsigned char index, char opensave)
+ 	li.settings.cheats_off = (uint8_t)user_io_status_get("[20]");
+ 	li.settings.debug_dots = (uint8_t)user_io_status_get("[69]");
+ 
+-	std::lock_guard<std::mutex> g(info_mtx);
+-	rom_info = li;
+-	rom_path = name;
+-	rom_index = index;
+-	rom_opensave = opensave;
+-	rom_seq++;
++	{
++		std::lock_guard<std::mutex> g(info_mtx);
++		rom_info = li;
++		rom_path = name;
++		rom_index = index;
++		rom_opensave = opensave;
++		rom_mode = mode;
++		rom_seq++;
++	}
++	if (!thread_running) start_thread();   // it sees rom_seq != 0 and starts the session
+ }
+ 
+-void netplay_start(void)
++static void start_thread()
+ {
+-	if (thread_running || !is_nes_core()) return;
+-	cfg = Config();
+-	if (!load_config(&cfg) || cfg.mode == M_OFF) return;
+-
+ 	quit = false;
+ 	reload_req = false;
+ 	reload_done = false;
+@@ -430,8 +447,19 @@ void netplay_start(void)
+ 	else printf("netplay: cannot start thread\n");
+ }
+ 
++// A core was loaded. netplay.ini is optional: without it the OSD "Netplay"
++// option can still host (port 7845, delay 2); Join needs its peer=.
++void netplay_start(void)
++{
++	if (thread_running || !is_nes_core()) return;
++	cfg = Config();
++	load_config(&cfg);
++	nes_armed = true;
++}
++
+ void netplay_stop(void)
+ {
++	nes_armed = false;
+ 	if (!thread_running) return;
+ 	quit = true;
+ 	pthread_join(thread, nullptr);
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index d74f0cc..0c22206 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -11,6 +11,7 @@ HDRS     := ../netplay_proto.h ../netplay_session.h fake_fpga.h
+ test: test_netplay udp_harness
+ 	./test_netplay
+ 	./run_udp_test.sh
++	NP_OSD=1 ./run_udp_test.sh
+ 
+ test_netplay: $(ENGINE) test_netplay.cpp $(HDRS)
+ 	$(CXX) $(CXXFLAGS) -o $@ $(ENGINE) test_netplay.cpp
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+index 43eb12b..d71d66e 100755
+--- a/support/netplay/test/run_udp_test.sh
++++ b/support/netplay/test/run_udp_test.sh
+@@ -20,10 +20,10 @@ echo "host: $h"
+ echo "join: $j"
+ hd=${h##*digest=}; jd=${j##*digest=}
+ if [ $hr -eq 0 ] && [ $jr -eq 0 ] && [ -n "$hd" ] && [ "$hd" = "$jd" ]; then
+-	echo "PASS udp"
++	echo "PASS udp${NP_OSD:+ (OSD mode)}"
+ 	rm -rf "$tmp"
+ 	exit 0
+ fi
+-echo "FAIL udp (logs in $tmp)"
++echo "FAIL udp${NP_OSD:+ (OSD mode)} (logs in $tmp)"
+ tail -20 "$tmp/host.log" "$tmp/join.log"
+ exit 1
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index f2f4fe4..2f9cf83 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -33,8 +33,11 @@ char *user_io_get_confstr(int index)
+ 	return index == 0 ? a : index == 1 ? b : nullptr;
+ }
+ 
++static uint32_t osd_netplay = 0;            // [89:88]: 0 = netplay.ini, 2 Host, 3 Join
++
+ uint32_t user_io_status_get(const char *opt, int)
+ {
++	if (!strcmp(opt, "[89:88]")) return osd_netplay;
+ 	if (!strcmp(opt, "[66:65]")) return 1;   // RAM Clear $00
+ 	if (!strcmp(opt, "[20]")) return 1;      // cheats off
+ 	return 0;
+@@ -75,11 +78,14 @@ int main(int argc, char **argv)
+ 	if (argc != 4) { fprintf(stderr, "usage: udp_harness <host|join> <workdir> <frames>\n"); return 2; }
+ 	bool host = !strcmp(argv[1], "host");
+ 	workdir = argv[2];
++	// NP_OSD=1: netplay.ini says mode=off, the OSD "Netplay" option picks host/join
++	bool osd = getenv("NP_OSD") != nullptr;
++	if (osd) osd_netplay = host ? 2 : 3;
+ 	uint32_t want = (uint32_t)atoi(argv[3]);
+ 
+ 	FILE *f = fopen(getFullPath("netplay.ini"), "w");
+ 	fprintf(f, "; test\n[netplay]\nmode = %s ; comment\npeer=%s\nport=47845\ndelay=3\n",
+-	        host ? "host" : "join", host ? "" : "127.0.0.1");
++	        osd ? "off" : host ? "host" : "join", host ? "" : "127.0.0.1");
+ 	fclose(f);
+ 
+ 	f = fopen(getFullPath("game.nes"), "wb");               // same bytes on both sides
+-- 
+2.43.0
+

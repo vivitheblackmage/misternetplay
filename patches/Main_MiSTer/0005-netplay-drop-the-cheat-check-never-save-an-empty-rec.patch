@@ -1,0 +1,108 @@
+From 03e772a9b5e42eeecefb5abbccf4f677a1b1e89a Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 31 Oct 2026 21:25:52 +0100
+Subject: [PATCH] netplay: drop the cheat check, never save an empty recording
+
+The Cheats Enabled option is hidden when the game has no cheat file and then
+stays at On, so check_local() refused every such game with no way to fix it
+from the OSD. The core already forces cheats off while netplay is active
+(gg = status[20] | np_active), so the bit is neither checked nor compared.
+
+A session refused at the start ended with an empty recording being saved:
+it overwrote the last good file and its "recording saved" hid the reason.
+---
+ support/netplay/netplay.cpp           | 7 +++++--
+ support/netplay/netplay_proto.cpp     | 2 --
+ support/netplay/netplay_proto.h       | 5 +++--
+ support/netplay/test/test_netplay.cpp | 4 +++-
+ 4 files changed, 11 insertions(+), 7 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 8279d80..aa49f19 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -307,10 +307,13 @@ static void *netplay_thread(void *)
+ 			if (reload_done.exchange(false)) s->reload_done(now);
+ 			if (s->msg_seq() != seen_msg) { seen_msg = s->msg_seq(); post_message(s->message()); }
+ 
++			// Only a recording that has frames: a session refused at the start
++			// would overwrite the last good file, and hide the reason on the OSD.
+ 			if (cfg.mode == M_RECORD && s->phase() == PH_DONE && !saved)
+ 			{
+ 				saved = true;
+-				post_message(save_recording(cfg.file, rec, md5) ? "Netplay: recording saved" : "Netplay: cannot save recording");
++				if (!rec.joy.empty())
++					post_message(save_recording(cfg.file, rec, md5) ? "Netplay: recording saved" : "Netplay: cannot save recording");
+ 			}
+ 		}
+ 
+@@ -320,7 +323,7 @@ static void *netplay_thread(void *)
+ 	if (s)
+ 	{
+ 		s->stop(now_ms(), "Netplay: stopped");
+-		if (cfg.mode == M_RECORD && !saved) save_recording(cfg.file, rec, md5);
++		if (cfg.mode == M_RECORD && !saved && !rec.joy.empty()) save_recording(cfg.file, rec, md5);
+ 		delete s;
+ 	}
+ 	delete udp;
+diff --git a/support/netplay/netplay_proto.cpp b/support/netplay/netplay_proto.cpp
+index cecbeff..631fc47 100644
+--- a/support/netplay/netplay_proto.cpp
++++ b/support/netplay/netplay_proto.cpp
+@@ -49,7 +49,6 @@ uint32_t pack_settings(const Settings &s)
+ 	     | (uint32_t)(s.extra_spr & 1) << 6
+ 	     | (uint32_t)(s.mask_edges & 3) << 7
+ 	     | (uint32_t)(s.overscan & 3) << 9
+-	     | (uint32_t)(s.cheats_off & 1) << 11
+ 	     | (uint32_t)(s.debug_dots & 1) << 12;
+ }
+ 
+@@ -76,7 +75,6 @@ uint8_t check_local(const Settings &s, uint8_t rom_region, uint8_t delay)
+ {
+ 	if (delay < 2 || delay > 15) return REJ_DELAY;
+ 	if (s.ram_clear != 1 && s.ram_clear != 2) return REJ_RAM_CLEAR;
+-	if (!s.cheats_off) return REJ_CHEATS;
+ 	// System Type: 0 Auto, 1 NTSC, 2 PAL, 3 Dendy, 4 Vs.
+ 	if (s.sys_type == 3 || s.sys_type >= 4) return REJ_SYSTEM;
+ 	if (s.sys_type == 0 && rom_region >= 2) return REJ_SYSTEM;
+diff --git a/support/netplay/netplay_proto.h b/support/netplay/netplay_proto.h
+index 631a78a..1ef33eb 100644
+--- a/support/netplay/netplay_proto.h
++++ b/support/netplay/netplay_proto.h
+@@ -75,7 +75,8 @@ struct Settings
+ 	uint8_t extra_spr;     // status [25]
+ 	uint8_t mask_edges;    // status [28:27]
+ 	uint8_t overscan;      // status [68:67]
+-	uint8_t cheats_off;    // status [20], 1 = off
++	uint8_t cheats_off;    // status [20], 1 = off. Not checked: the core forces cheats off while netplay is active,
++	                       // and the option is hidden (left at On) when the game has no cheat file
+ 	uint8_t debug_dots;    // status [69], changes the picture
+ };
+ 
+@@ -91,7 +92,7 @@ enum Reject : uint8_t
+ 	REJ_SAV,           // different battery save
+ 	REJ_SETTINGS,      // different OSD settings
+ 	REJ_RAM_CLEAR,     // RAM Clear must be $00 or $FF
+-	REJ_CHEATS,        // cheats must be off
++	REJ_CHEATS,        // no longer sent (kept so the values stay the same)
+ 	REJ_SYSTEM,        // Dendy, Vs. System, FDS and NSF are not supported in v1
+ 	REJ_DELAY,         // delay outside 2..15
+ 	REJ_BUSY,          // host already has a peer
+diff --git a/support/netplay/test/test_netplay.cpp b/support/netplay/test/test_netplay.cpp
+index 04aad95..b773796 100644
+--- a/support/netplay/test/test_netplay.cpp
++++ b/support/netplay/test/test_netplay.cpp
+@@ -197,7 +197,9 @@ static void test_settings()
+ 	CHECK(check_local(s, 0, 16) == REJ_DELAY);
+ 	s.ram_clear = 0; CHECK(check_local(s, 0, 3) == REJ_RAM_CLEAR);
+ 	s.ram_clear = 3; CHECK(check_local(s, 0, 3) == REJ_RAM_CLEAR);
+-	s.ram_clear = 2; s.cheats_off = 0; CHECK(check_local(s, 0, 3) == REJ_CHEATS);
++	// cheats are forced off by the core; the hidden OSD option (status[20]=0) must not refuse
++	s.ram_clear = 2; s.cheats_off = 0; CHECK(check_local(s, 0, 3) == REJ_OK);
++	{ Settings a = s, b = s; a.cheats_off = 0; b.cheats_off = 1; CHECK(pack_settings(a) == pack_settings(b)); }
+ 	s.cheats_off = 1; s.sys_type = 3; CHECK(check_local(s, 0, 3) == REJ_SYSTEM);
+ 	s.sys_type = 4; CHECK(check_local(s, 0, 3) == REJ_SYSTEM);
+ 	s.sys_type = 0; CHECK(check_local(s, 2, 3) == REJ_SYSTEM);
+-- 
+2.43.0
+

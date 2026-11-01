@@ -1,0 +1,17 @@
+; NES netplay — copy to /media/fat/netplay.ini on each MiSTer.
+; Read when the NES core starts. The session begins when you load a ROM.
+;
+; Both players need: the same core build, the same ROM file, and the same
+; OSD settings. Set "RAM Clear" to $00 or $FF (Advanced menu), cheats off.
+
+[netplay]
+mode=off            ; host | join | record | replay | off. The core's OSD "Netplay" option overrides it (Off/Host/Join)
+peer=               ; join: the host's IP address. host: leave empty
+port=7845           ; UDP port. host: forward this port if playing over the internet
+delay=2             ; frames of input delay, 2-15. LAN: 2. Internet: 3-6. Host's value is used.
+server=             ; optional netplay-server (host[:port]): a lobby, no port forwarding at the players. peer= is then unused.
+                    ; Host opens a room; others join it from the folder _Netplay/Rooms in the file browser
+key=                ; server: the key from netplay-server.ini
+name=               ; server: your name in the lobby, at most 16 letters (default MiSTer-xxxx)
+direct=yes          ; server: no = always through the server (no direct connection between the MiSTers)
+file=               ; record/replay: empty = one file per game, netplay/<ROM name>.npr under /media/fat

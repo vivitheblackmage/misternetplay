@@ -1,0 +1,394 @@
+From 6087072b61f0be7774cf095610043fa9068390f9 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Fri, 30 Oct 2026 19:42:04 +0000
+Subject: [PATCH 3/3] netplay: fixes from independent review
+
+- CTRL carries a magic word; rings cleared with never-valid words (a zero
+  word decoded as CRC[0] = 0)
+- a new session waits for the core to report IDLE before arming
+- only OSD slot 1 starts a session; ROM reload keeps opensave so .sav loads
+- recording saved on ROM change; NPR2 stores the delay, replay uses it
+- debug dots in the settings check; peer CRCs kept during START wait;
+  INPUT frame-number wrap rejected
+- tests for each of the above
+---
+ support/netplay/netplay.cpp           | 32 ++++++++++----
+ support/netplay/netplay.h             |  2 +-
+ support/netplay/netplay_proto.cpp     |  3 +-
+ support/netplay/netplay_proto.h       |  8 +++-
+ support/netplay/netplay_session.cpp   | 19 ++++++--
+ support/netplay/netplay_session.h     |  1 +
+ support/netplay/test/fake_fpga.h      |  3 +-
+ support/netplay/test/test_netplay.cpp | 62 +++++++++++++++++++++++++++
+ support/netplay/test/udp_harness.cpp  | 10 +++--
+ user_io.cpp                           |  2 +-
+ 10 files changed, 122 insertions(+), 20 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 40ad73e..8279d80 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -161,15 +161,15 @@ private:
+ };
+ 
+ // ---------------------------------------------------------------------------
+-// Recordings (.npr): "NPR1", rom md5[16], u32 frames, joy[frames], u32 crcs, crc[crcs]
++// Recordings (.npr): "NPR2", rom md5[16], u8 delay, u32 frames, joy[frames], u32 crcs, crc[crcs]
+ 
+ static bool save_recording(const char *path, const Recording &r, const uint8_t *md5)
+ {
+ 	FILE *f = fopen(getFullPath(path), "wb");
+ 	if (!f) return false;
+ 	uint32_t n = (uint32_t)r.joy.size(), m = (uint32_t)r.crc.size();
+-	bool ok = fwrite("NPR1", 4, 1, f) == 1 && fwrite(md5, 16, 1, f) == 1
+-	       && fwrite(&n, 4, 1, f) == 1 && (!n || fwrite(r.joy.data(), n, 1, f) == 1)
++	bool ok = fwrite("NPR2", 4, 1, f) == 1 && fwrite(md5, 16, 1, f) == 1
++	       && fwrite(&r.delay, 1, 1, f) == 1 && fwrite(&n, 4, 1, f) == 1 && (!n || fwrite(r.joy.data(), n, 1, f) == 1)
+ 	       && fwrite(&m, 4, 1, f) == 1 && (!m || fwrite(r.crc.data(), 4 * m, 1, f) == 1);
+ 	fclose(f);
+ 	return ok;
+@@ -181,7 +181,8 @@ static bool load_recording(const char *path, Recording *r, uint8_t *md5)
+ 	if (!f) return false;
+ 	char magic[4];
+ 	uint32_t n = 0, m = 0;
+-	bool ok = fread(magic, 4, 1, f) == 1 && !memcmp(magic, "NPR1", 4) && fread(md5, 16, 1, f) == 1
++	bool ok = fread(magic, 4, 1, f) == 1 && !memcmp(magic, "NPR2", 4) && fread(md5, 16, 1, f) == 1
++	       && fread(&r->delay, 1, 1, f) == 1 && r->delay >= 2 && r->delay <= 15
+ 	       && fread(&n, 4, 1, f) == 1 && n < 10000000;
+ 	if (ok) { r->joy.resize(n); ok = !n || fread(r->joy.data(), n, 1, f) == 1; }
+ 	if (ok) ok = fread(&m, 4, 1, f) == 1 && m < 10000000;
+@@ -202,6 +203,7 @@ static std::mutex        info_mtx;          // guards the fields below
+ static LocalInfo         rom_info;
+ static std::string       rom_path;
+ static unsigned char     rom_index = 0;
++static char              rom_opensave = 0;
+ static uint32_t          rom_seq = 0;        // bumps on every user ROM load
+ 
+ static std::atomic<bool> reload_req { false };
+@@ -252,7 +254,14 @@ static void *netplay_thread(void *)
+ 		if (seq != seen_rom)
+ 		{
+ 			seen_rom = seq;
+-			if (s) { s->stop(now, "Netplay: new ROM"); delete s; s = nullptr; }
++			if (s)
++			{
++				s->stop(now, "Netplay: new ROM");
++				if (cfg.mode == M_RECORD && !saved && !rec.joy.empty())
++					post_message(save_recording(cfg.file, rec, md5) ? "Netplay: recording saved" : "Netplay: cannot save recording");
++				delete s;
++				s = nullptr;
++			}
+ 			delete udp; udp = nullptr;
+ 			rec = Recording();
+ 			saved = false;
+@@ -358,10 +367,12 @@ static bool md5_file(const char *path, uint8_t out[16], uint8_t *hdr, size_t hdr
+ 	return true;
+ }
+ 
+-void netplay_note_file(const char *name, unsigned char index)
++void netplay_note_file(const char *name, unsigned char index, char opensave)
+ {
+ 	if (!thread_running || own_reload || !is_nes_core()) return;
+-	if ((index & 0x3F) == 0) return;                      // FDS BIOS (boot0) is not a game
++	// Only the game slot ("FS,NESFDSNSF", OSD index 1) starts a session. Index 0
++	// is boot0.rom, 2 the FDS BIOS, 3 a custom palette.
++	if ((index & 0x3F) != 1) return;
+ 
+ 	LocalInfo li {};
+ 	uint8_t hdr[16] = {};
+@@ -385,11 +396,13 @@ void netplay_note_file(const char *name, unsigned char index)
+ 	li.settings.mask_edges = (uint8_t)user_io_status_get("[28:27]");
+ 	li.settings.overscan   = (uint8_t)user_io_status_get("[68:67]");
+ 	li.settings.cheats_off = (uint8_t)user_io_status_get("[20]");
++	li.settings.debug_dots = (uint8_t)user_io_status_get("[69]");
+ 
+ 	std::lock_guard<std::mutex> g(info_mtx);
+ 	rom_info = li;
+ 	rom_path = name;
+ 	rom_index = index;
++	rom_opensave = opensave;
+ 	rom_seq++;
+ }
+ 
+@@ -422,13 +435,16 @@ void netplay_poll(void)
+ 	{
+ 		std::string path;
+ 		unsigned char index;
++		char opensave;
+ 		{
+ 			std::lock_guard<std::mutex> g(info_mtx);
+ 			path = rom_path;
+ 			index = rom_index;
++			opensave = rom_opensave;
+ 		}
+ 		own_reload = true;                 // keep netplay_note_file from starting a new session
+-		user_io_file_tx(path.c_str(), index);
++		// same opensave as the user's load, so the .sav is mounted and loaded again
++		user_io_file_tx(path.c_str(), index, opensave);
+ 		own_reload = false;
+ 		reload_done = true;                // before clearing the request, so the
+ 		reload_req = false;                // thread never sees both false and asks again
+diff --git a/support/netplay/netplay.h b/support/netplay/netplay.h
+index d773f9c..f5aba98 100644
+--- a/support/netplay/netplay.h
++++ b/support/netplay/netplay.h
+@@ -6,6 +6,6 @@
+ void netplay_start(void);                                // a core was loaded; arms only for NES
+ void netplay_stop(void);                                 // core is about to change
+ void netplay_poll(void);                                 // main loop
+-void netplay_note_file(const char *name, unsigned char index);   // from user_io_file_tx
++void netplay_note_file(const char *name, unsigned char index, char opensave);   // from user_io_file_tx
+ 
+ #endif
+diff --git a/support/netplay/netplay_proto.cpp b/support/netplay/netplay_proto.cpp
+index c151666..cecbeff 100644
+--- a/support/netplay/netplay_proto.cpp
++++ b/support/netplay/netplay_proto.cpp
+@@ -49,7 +49,8 @@ uint32_t pack_settings(const Settings &s)
+ 	     | (uint32_t)(s.extra_spr & 1) << 6
+ 	     | (uint32_t)(s.mask_edges & 3) << 7
+ 	     | (uint32_t)(s.overscan & 3) << 9
+-	     | (uint32_t)(s.cheats_off & 1) << 11;
++	     | (uint32_t)(s.cheats_off & 1) << 11
++	     | (uint32_t)(s.debug_dots & 1) << 12;
+ }
+ 
+ const char *reject_text(uint8_t r)
+diff --git a/support/netplay/netplay_proto.h b/support/netplay/netplay_proto.h
+index c8a22ff..631a78a 100644
+--- a/support/netplay/netplay_proto.h
++++ b/support/netplay/netplay_proto.h
+@@ -39,9 +39,14 @@ struct Status
+ 
+ inline uint32_t ring_off(uint32_t base, uint32_t frame) { return base + (frame & (MB_RING - 1)) * 8; }
+ 
++// CTRL is only believed by the FPGA with CTRL_MAGIC in its upper half: DDR3
++// is not cleared between cores, and a stray word must never arm netplay.
++constexpr uint32_t CTRL_MAGIC    = 0x4C525443;   // "CTRL"
++
+ inline uint64_t ctrl_word(bool enable, bool run, uint8_t session)
+ {
+-	return (uint64_t)session << 8 | (run ? 2u : 0u) | (enable ? 1u : 0u);
++	if (!enable) return 0;
++	return (uint64_t)CTRL_MAGIC << 32 | (uint64_t)session << 8 | (run ? 2u : 0u) | 1u;
+ }
+ 
+ // INPUT[f]: both 32-bit halves carry the frame tag and session, so a torn
+@@ -71,6 +76,7 @@ struct Settings
+ 	uint8_t mask_edges;    // status [28:27]
+ 	uint8_t overscan;      // status [68:67]
+ 	uint8_t cheats_off;    // status [20], 1 = off
++	uint8_t debug_dots;    // status [69], changes the picture
+ };
+ 
+ uint32_t pack_settings(const Settings &s);
+diff --git a/support/netplay/netplay_session.cpp b/support/netplay/netplay_session.cpp
+index 57f56c3..8c8363d 100644
+--- a/support/netplay/netplay_session.cpp
++++ b/support/netplay/netplay_session.cpp
+@@ -11,6 +11,9 @@ Session::Session(Mode mode, uint8_t delay, Mailbox mb, Transport *net, Recording
+                  uint8_t session_seed, Timing t)
+ 	: mode_(mode), delay_(delay), mb_(mb), net_(net), rec_(rec), t_(t), seed_(session_seed)
+ {
++	// A replay must use the delay it was recorded with, or every input shifts.
++	if (mode_ == M_REPLAY && rec_ && rec_->delay) delay_ = rec_->delay;
++	if (mode_ == M_RECORD && rec_) rec_->delay = delay_;
+ 	local_.assign(WIN, Slot8{0, 0, false});
+ 	remote_.assign(WIN, Slot8{0, 0, false});
+ 	my_crc_.assign(WIN, Slot32{0, 0, false});
+@@ -127,6 +130,13 @@ void Session::step(uint64_t now)
+ 	{
+ 	case PH_WAIT_CORE:
+ 		if (!have_info_ || mb_.rd(MB_MAGIC) != MAGIC_VALUE) break;
++		// A previous session may have just written CTRL=0: wait until the core
++		// has seen it, or a fast re-arm would land before it ever went IDLE.
++		if (decode_status(mb_.rd(MB_STATUS)).state != FS_IDLE)
++		{
++			mb_.wr(MB_CTRL, ctrl_word(false, false, 0));
++			break;
++		}
+ 		{
+ 			uint8_t r = check_local(info_.settings, info_.rom_region, delay_);
+ 			if (r != REJ_OK)
+@@ -276,6 +286,7 @@ void Session::handle_packet(uint64_t now, const Packet &p)
+ 		for (uint32_t i = 0; i < p.input.count; i++)
+ 		{
+ 			uint32_t f = p.input.first_frame + i;
++			if (f < p.input.first_frame) break;       // wrapped: malformed
+ 			if (f < remote_next_ || f >= remote_next_ + WIN) continue;
+ 			Slot8 &s = remote_[f % WIN];
+ 			s.f = f; s.v = p.input.joy[i]; s.ok = true;
+@@ -285,7 +296,8 @@ void Session::handle_packet(uint64_t now, const Packet &p)
+ 		break;
+ 
+ 	case P_CRC:
+-		if (phase_ == PH_RUN) put_crc(peer_crc_.data(), p.crc.frame, p.crc.crc, now);
++		// the peer may start a little earlier: keep its CRCs while we wait
++		if (phase_ == PH_RUN || phase_ == PH_READY) put_crc(peer_crc_.data(), p.crc.frame, p.crc.crc, now);
+ 		break;
+ 
+ 	case P_BYE:
+@@ -301,8 +313,9 @@ void Session::arm(uint64_t now)
+ {
+ 	for (uint32_t i = 0; i < MB_RING; i++)
+ 	{
+-		mb_.wr(MB_LOCAL + i * 8, 0);
+-		mb_.wr(MB_CRC + i * 8, 0);
++		// INVALID_WORD, not 0: a zero CRC word decodes as a valid CRC[0] = 0.
++		mb_.wr(MB_LOCAL + i * 8, INVALID_WORD);
++		mb_.wr(MB_CRC + i * 8, INVALID_WORD);
+ 		mb_.wr(MB_INPUT + i * 8, INVALID_WORD);
+ 	}
+ 	mb_.wr(MB_CTRL, ctrl_word(true, false, sess_));
+diff --git a/support/netplay/netplay_session.h b/support/netplay/netplay_session.h
+index 61f9a3e..27ca995 100644
+--- a/support/netplay/netplay_session.h
++++ b/support/netplay/netplay_session.h
+@@ -56,6 +56,7 @@ struct LocalInfo
+ // Record/replay data: one controller byte and one CRC per frame.
+ struct Recording
+ {
++	uint8_t               delay = 0;   // input delay the recording was made with
+ 	std::vector<uint8_t>  joy;
+ 	std::vector<uint32_t> crc;
+ };
+diff --git a/support/netplay/test/fake_fpga.h b/support/netplay/test/fake_fpga.h
+index 3fadc89..00bd8ce 100644
+--- a/support/netplay/test/fake_fpga.h
++++ b/support/netplay/test/fake_fpga.h
+@@ -77,7 +77,8 @@ struct FakeFpga
+ 	void step(uint64_t now)
+ 	{
+ 		uint64_t ctrl = mb.rd(MB_CTRL);
+-		bool en = ctrl & 1, run = ctrl & 2;
++		bool ok = (uint32_t)(ctrl >> 32) == CTRL_MAGIC;   // as rtl/netplay.sv
++		bool en = ok && (ctrl & 1), run = ok && (ctrl & 2);
+ 
+ 		switch (state)
+ 		{
+diff --git a/support/netplay/test/test_netplay.cpp b/support/netplay/test/test_netplay.cpp
+index 69d609a..04aad95 100644
+--- a/support/netplay/test/test_netplay.cpp
++++ b/support/netplay/test/test_netplay.cpp
+@@ -388,6 +388,65 @@ static void test_record_replay()
+ 	}
+ }
+ 
++static void test_ring_clear_is_invalid()
++{
++	printf("rings are cleared to words that never decode (review C3)\n");
++	FakeFpga f(0);
++	f.frame_ms = 1000000;                          // core never posts anything
++	Session s(M_RECORD, 2, f.mb, nullptr, nullptr, 0x21);
++	s.set_local(make_info());
++	for (uint64_t now = 1; now < 200; now++) { f.step(now); s.step(now); if (s.reload_requested()) s.reload_done(now); }
++	uint32_t c; uint8_t j;
++	CHECK(!decode_crc(f.mb.rd(ring_off(MB_CRC, 0)), 0, &c));
++	CHECK(!decode_local(f.mb.rd(ring_off(MB_LOCAL, 0)), 0, 0x21, &j));
++	CHECK(f.mb.rd(MB_CTRL) >> 32 == CTRL_MAGIC);
++}
++
++static void test_restart_rearms()
++{
++	printf("a new session right after the last one re-arms the core (review M6)\n");
++	FakeFpga f(0);
++	Recording rec;
++	Session *s = new Session(M_RECORD, 2, f.mb, nullptr, &rec, 0x31);
++	s->set_local(make_info());
++	uint64_t now = 0;
++	while (f.frame < 100 && now < 20000) { now++; f.step(now); s->step(now); if (s->reload_requested()) s->reload_done(now); }
++	CHECK(f.state == FS_RUN);
++	// what the netplay thread does on a new ROM: stop and re-create in one go,
++	// before the core has had a chance to look at CTRL
++	s->stop(now, "Netplay: new ROM");
++	delete s;
++	Recording rec2;
++	s = new Session(M_RECORD, 2, f.mb, nullptr, &rec2, 0x33);
++	s->set_local(make_info());
++	uint64_t t0 = now;
++	while (s->phase() != PH_RUN && now < t0 + 10000) { now++; s->step(now); f.step(now); if (s->reload_requested()) s->reload_done(now); }
++	CHECKM(s->phase() == PH_RUN, "second session stuck: '%s'", s->message());
++	CHECK(f.sess == 0x33);
++	delete s;
++}
++
++static void test_replay_uses_recorded_delay()
++{
++	printf("replay uses the recording's delay (review m2)\n");
++	Recording rec;
++	{
++		FakeFpga f(0);
++		Session s(M_RECORD, 5, f.mb, nullptr, &rec, 0x41);
++		s.set_local(make_info());
++		uint64_t now = 0;
++		while (f.frame < 300 && now < 30000) { now++; f.step(now); s.step(now); if (s.reload_requested()) s.reload_done(now); }
++		s.stop(now, "done");
++	}
++	CHECK(rec.delay == 5);
++	FakeFpga f(1);
++	Session s(M_REPLAY, 2, f.mb, nullptr, &rec, 0x42);   // ini says 2, recording says 5
++	s.set_local(make_info());
++	uint64_t now = 0;
++	while (s.phase() != PH_DONE && now < 30000) { now++; f.step(now); s.step(now); if (s.reload_requested()) s.reload_done(now); }
++	CHECKM(!s.failed() && strstr(s.message(), "replay OK"), "'%s'", s.message());
++}
++
+ static void test_core_without_netplay()
+ {
+ 	printf("core without netplay support\n");
+@@ -428,6 +487,9 @@ int main()
+ 	test_bye();
+ 	test_lost_ack();
+ 	test_record_replay();
++	test_ring_clear_is_invalid();
++	test_restart_rearms();
++	test_replay_uses_recorded_delay();
+ 	test_core_without_netplay();
+ 	test_bad_local_settings();
+ 
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index 57398d4..f2f4fe4 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -40,11 +40,12 @@ uint32_t user_io_status_get(const char *opt, int)
+ 	return 0;
+ }
+ 
+-int user_io_file_tx(const char *name, unsigned char index, char, char, char, uint32_t)
++int user_io_file_tx(const char *name, unsigned char index, char opensave, char, char, uint32_t)
+ {
+ 	reloads++;
+-	printf("[harness] reload %s index %u\n", name, index);
+-	netplay_note_file(name, index);           // like the real one: must be ignored
++	printf("[harness] reload %s index %u opensave %d\n", name, index, opensave);
++	if (!opensave) { printf("[harness] reload without opensave: .sav would not load\n"); reloads += 100; }
++	netplay_note_file(name, index, opensave);   // like the real one: must be ignored
+ 	return 1;
+ }
+ 
+@@ -89,7 +90,8 @@ int main(int argc, char **argv)
+ 
+ 	fpga = new FakeFpga(host ? 0 : 1);
+ 	netplay_start();
+-	netplay_note_file("game.nes", 1);
++	netplay_note_file("palette.pal", 3, 0);    // a custom palette must not start a session
++	netplay_note_file("game.nes", 1, 1);
+ 
+ 	uint64_t t0 = now_ms();
+ 	while (fpga->frame < want && now_ms() - t0 < 60000)
+diff --git a/user_io.cpp b/user_io.cpp
+index ac17bca..065b1fd 100644
+--- a/user_io.cpp
++++ b/user_io.cpp
+@@ -2854,7 +2854,7 @@ int user_io_file_tx(const char* name, unsigned char index, char opensave, char m
+ 
+ 	/* transmit the entire file using one transfer */
+ 	printf("Selected file %s with %u bytes to send for index %d.%d\n", name, bytes2send, index & 0x3F, index >> 6);
+-	netplay_note_file(name, index);
++	netplay_note_file(name, index, opensave);
+ 	if(load_addr) printf("Load to address 0x%X\n", load_addr);
+ 
+ 	// set index byte (0=bios rom, 1-n=OSD entry index)
+-- 
+2.43.0
+

@@ -1,0 +1,35 @@
+From fbf4d6de94d9a98b22f3392947dbaaff691827bb Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sun, 1 Nov 2026 01:05:42 +0100
+Subject: [PATCH] netplay: OSD option "Netplay" (netplay.ini/Off/Host/Join),
+ status [89:88]
+
+Read by Main_MiSTer when a game is loaded; 0 keeps netplay.ini's mode=.
+Bitmap comment notes the bits above 63.
+---
+ NES.sv | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/NES.sv b/NES.sv
+index 51cff08..1c1bab7 100644
+--- a/NES.sv
++++ b/NES.sv
+@@ -65,6 +65,7 @@ end
+ // 01234567890123456789012345678901 23456789012345678901234567890123
+ // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
+ // XXXXXXXX XX     XXXXXXXXXXXXX XX XXXXXXXXXXXXXXXXXXXXXX
++// Above 63 (O[n:m]): 64-87 taken, 88-89 Netplay (read by Main_MiSTer netplay.cpp), 90-127 free.
+ 
+ `include "build_id.v"
+ parameter CONF_STR = {
+@@ -73,6 +74,7 @@ parameter CONF_STR = {
+ 	"H1F2,BIN,Load FDS BIOS;",
+ 	"-;",
+ 	"O[72:70],System Type,Auto,NTSC,PAL,Dendy,Vs.;",
++	"O[89:88],Netplay,netplay.ini,Off,Host,Join;",
+ 	"-;",
+ 	"C,Cheats;",
+ 	"H2OK,Cheats Enabled,On,Off;",
+-- 
+2.43.0
+

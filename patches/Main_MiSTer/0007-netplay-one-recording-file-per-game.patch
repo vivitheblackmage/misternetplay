@@ -1,0 +1,173 @@
+From c7f1142adbebbeadfdd8914fdbd5dfa1ab180a6a Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 31 Oct 2026 21:54:06 +0100
+Subject: [PATCH] netplay: one recording file per game
+
+Without file= in netplay.ini, record and replay use
+netplay/<ROM file name>.npr, so recording another game (or the core's
+autoloaded one) no longer overwrites the last recording, and replay finds
+the recording for the game being loaded. The netplay folder is created on
+the first save.
+---
+ support/netplay/netplay.cpp           | 18 +++++++++++++-----
+ support/netplay/netplay_proto.cpp     | 12 ++++++++++++
+ support/netplay/netplay_proto.h       |  4 ++++
+ support/netplay/test/test_netplay.cpp | 13 +++++++++++++
+ 4 files changed, 42 insertions(+), 5 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index aa49f19..2f6b739 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -13,6 +13,7 @@
+ #include <time.h>
+ #include <errno.h>
+ #include <fcntl.h>
++#include <sys/stat.h>
+ #include <pthread.h>
+ #include <netdb.h>
+ #include <arpa/inet.h>
+@@ -44,7 +45,7 @@ struct Config
+ 	char     peer[128] = {};
+ 	uint16_t port = 7845;
+ 	uint8_t  delay = 2;
+-	char     file[512] = "netplay/rec.npr";
++	char     file[512] = "";              // empty: one file per game, see recording_path()
+ };
+ 
+ static bool load_config(Config *c)
+@@ -165,6 +166,11 @@ private:
+ 
+ static bool save_recording(const char *path, const Recording &r, const uint8_t *md5)
+ {
++	// the folder may not exist yet (first recording)
++	std::string dir = getFullPath(path);
++	size_t slash = dir.rfind('/');
++	if (slash != std::string::npos && slash > 0) { dir.resize(slash); mkdir(dir.c_str(), 0777); }
++
+ 	FILE *f = fopen(getFullPath(path), "wb");
+ 	if (!f) return false;
+ 	uint32_t n = (uint32_t)r.joy.size(), m = (uint32_t)r.crc.size();
+@@ -238,6 +244,7 @@ static void *netplay_thread(void *)
+ 	Udp      *udp = nullptr;
+ 	Recording rec;
+ 	uint8_t   md5[16] = {};
++	char      rec_path[512] = "";   // this session's recording file
+ 	uint32_t  seen_rom = 0, seen_msg = 0;
+ 	bool      saved = false;
+ 
+@@ -258,7 +265,7 @@ static void *netplay_thread(void *)
+ 			{
+ 				s->stop(now, "Netplay: new ROM");
+ 				if (cfg.mode == M_RECORD && !saved && !rec.joy.empty())
+-					post_message(save_recording(cfg.file, rec, md5) ? "Netplay: recording saved" : "Netplay: cannot save recording");
++					post_message(save_recording(rec_path, rec, md5) ? "Netplay: recording saved" : "Netplay: cannot save recording");
+ 				delete s;
+ 				s = nullptr;
+ 			}
+@@ -272,6 +279,7 @@ static void *netplay_thread(void *)
+ 			{
+ 				std::lock_guard<std::mutex> g(info_mtx);
+ 				li = rom_info;
++				recording_path(rec_path, sizeof(rec_path), cfg.file, rom_path.c_str());
+ 			}
+ 			memcpy(md5, li.rom_md5, 16);
+ 
+@@ -288,7 +296,7 @@ static void *netplay_thread(void *)
+ 			else if (cfg.mode == M_REPLAY)
+ 			{
+ 				uint8_t rmd5[16];
+-				if (!load_recording(cfg.file, &rec, rmd5)) { post_message("Netplay: cannot read recording"); ok = false; }
++				if (!load_recording(rec_path, &rec, rmd5)) { post_message("Netplay: cannot read recording"); ok = false; }
+ 				else if (memcmp(rmd5, li.rom_md5, 16)) { post_message("Netplay: recording is for another ROM"); ok = false; }
+ 			}
+ 
+@@ -313,7 +321,7 @@ static void *netplay_thread(void *)
+ 			{
+ 				saved = true;
+ 				if (!rec.joy.empty())
+-					post_message(save_recording(cfg.file, rec, md5) ? "Netplay: recording saved" : "Netplay: cannot save recording");
++					post_message(save_recording(rec_path, rec, md5) ? "Netplay: recording saved" : "Netplay: cannot save recording");
+ 			}
+ 		}
+ 
+@@ -323,7 +331,7 @@ static void *netplay_thread(void *)
+ 	if (s)
+ 	{
+ 		s->stop(now_ms(), "Netplay: stopped");
+-		if (cfg.mode == M_RECORD && !saved && !rec.joy.empty()) save_recording(cfg.file, rec, md5);
++		if (cfg.mode == M_RECORD && !saved && !rec.joy.empty()) save_recording(rec_path, rec, md5);
+ 		delete s;
+ 	}
+ 	delete udp;
+diff --git a/support/netplay/netplay_proto.cpp b/support/netplay/netplay_proto.cpp
+index 631fc47..81fac72 100644
+--- a/support/netplay/netplay_proto.cpp
++++ b/support/netplay/netplay_proto.cpp
+@@ -1,5 +1,6 @@
+ // netplay_proto.cpp — see netplay_proto.h
+ 
++#include <stdio.h>
+ #include <string.h>
+ #include <strings.h>
+ #include "netplay_proto.h"
+@@ -98,6 +99,17 @@ uint8_t rom_region_from_header(const uint8_t *hdr, size_t len, const char *ext)
+ 	}
+ }
+ 
++void recording_path(char *out, size_t cap, const char *file, const char *rom)
++{
++	if (file && *file) { snprintf(out, cap, "%s", file); return; }
++	const char *base = rom ? strrchr(rom, '/') : nullptr;
++	base = base ? base + 1 : (rom ? rom : "");
++	const char *dot = strrchr(base, '.');
++	int len = dot && dot != base ? (int)(dot - base) : (int)strlen(base);
++	if (!len) { snprintf(out, cap, "netplay/rec.npr"); return; }
++	snprintf(out, cap, "netplay/%.*s.npr", len, base);
++}
++
+ // ---------------------------------------------------------------------------
+ // Packets
+ 
+diff --git a/support/netplay/netplay_proto.h b/support/netplay/netplay_proto.h
+index 1ef33eb..4b60e45 100644
+--- a/support/netplay/netplay_proto.h
++++ b/support/netplay/netplay_proto.h
+@@ -106,6 +106,10 @@ uint8_t check_local(const Settings &s, uint8_t rom_region, uint8_t delay);
+ // rom_region from the iNES header: 0 NTSC, 1 PAL, 2 Dendy/multi, 3 Vs. or not iNES.
+ uint8_t rom_region_from_header(const uint8_t *hdr, size_t len, const char *ext);
+ 
++// Recording file for record/replay: the ini's file= if set, otherwise one file
++// per game, "netplay/<ROM file name>.npr" (relative to /media/fat).
++void recording_path(char *out, size_t cap, const char *file, const char *rom);
++
+ // ---------------------------------------------------------------------------
+ // UDP packets (all little endian)
+ 
+diff --git a/support/netplay/test/test_netplay.cpp b/support/netplay/test/test_netplay.cpp
+index b773796..88a86ef 100644
+--- a/support/netplay/test/test_netplay.cpp
++++ b/support/netplay/test/test_netplay.cpp
+@@ -201,6 +201,19 @@ static void test_settings()
+ 	s.ram_clear = 2; s.cheats_off = 0; CHECK(check_local(s, 0, 3) == REJ_OK);
+ 	{ Settings a = s, b = s; a.cheats_off = 0; b.cheats_off = 1; CHECK(pack_settings(a) == pack_settings(b)); }
+ 	s.cheats_off = 1; s.sys_type = 3; CHECK(check_local(s, 0, 3) == REJ_SYSTEM);
++	{
++		char p[512];
++		recording_path(p, sizeof(p), "", "../usb0/games/NES/Gun.Smoke (USA) (Co-op).nes");
++		CHECK(!strcmp(p, "netplay/Gun.Smoke (USA) (Co-op).npr"));
++		recording_path(p, sizeof(p), nullptr, "games/NES/v1.2.nes");      // only the last dot
++		CHECK(!strcmp(p, "netplay/v1.2.npr"));
++		recording_path(p, sizeof(p), "", "noext");
++		CHECK(!strcmp(p, "netplay/noext.npr"));
++		recording_path(p, sizeof(p), "", "");
++		CHECK(!strcmp(p, "netplay/rec.npr"));
++		recording_path(p, sizeof(p), "netplay/mine.npr", "games/NES/x.nes"); // file= wins
++		CHECK(!strcmp(p, "netplay/mine.npr"));
++	}
+ 	s.sys_type = 4; CHECK(check_local(s, 0, 3) == REJ_SYSTEM);
+ 	s.sys_type = 0; CHECK(check_local(s, 2, 3) == REJ_SYSTEM);
+ 	s.sys_type = 2; CHECK(check_local(s, 2, 3) == REJ_OK);      // forced PAL is fine
+-- 
+2.43.0
+

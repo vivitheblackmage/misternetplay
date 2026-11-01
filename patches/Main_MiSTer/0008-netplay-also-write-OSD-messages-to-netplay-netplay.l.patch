@@ -1,0 +1,36 @@
+From 9c764544450e08ed4b3623e853d82a6906761b1e Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 31 Oct 2026 22:14:52 +0100
+Subject: [PATCH] netplay: also write OSD messages to netplay/netplay.log
+
+So a test run (replay OK / DESYNC) can be checked over SSH without looking
+at the screen.
+---
+ support/netplay/netplay.cpp | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 2f6b739..6112a96 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -471,5 +471,17 @@ void netplay_poll(void)
+ 	{
+ 		printf("%s\n", text);
+ 		Info(text, 3000);
++		// Same text in a file, so a test run can be checked without looking at the TV.
++		std::string log = getFullPath("netplay");
++		mkdir(log.c_str(), 0777);
++		log += "/netplay.log";
++		if (FILE *f = fopen(log.c_str(), "a"))
++		{
++			time_t t = time(nullptr);
++			char ts[32];
++			strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&t));
++			fprintf(f, "%s %s\n", ts, text);
++			fclose(f);
++		}
+ 	}
+ }
+-- 
+2.43.0
+

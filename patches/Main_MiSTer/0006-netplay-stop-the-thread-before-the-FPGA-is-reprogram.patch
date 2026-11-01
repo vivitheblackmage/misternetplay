@@ -1,0 +1,30 @@
+From 3bb6cab46b3a2c79b1ffa2365d5f6e2179840426 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 31 Oct 2026 21:42:32 +0100
+Subject: [PATCH] netplay: stop the thread before the FPGA is reprogrammed
+
+fpga_load_rbf() reprograms the FPGA before app_restart() runs, so the netplay
+thread kept writing the DDR3 mailbox while the next core was already loaded
+(and may use that memory). Switching from NES_netplay with a session running
+to the GBA core left the MiSTer without a running Main process.
+---
+ fpga_io.cpp | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/fpga_io.cpp b/fpga_io.cpp
+index 2f16770..95d6fb7 100644
+--- a/fpga_io.cpp
++++ b/fpga_io.cpp
+@@ -426,6 +426,9 @@ static int make_env(const char *name, const char *cfg)
+ 
+ int fpga_load_rbf(const char *name, const char *cfg, const char *xml)
+ {
++	// Before the FPGA is reprogrammed: the netplay thread writes the DDR3
++	// mailbox, which the next core may use for its own data.
++	netplay_stop();
+ 	OsdDisable();
+ 	static char path[1024];
+ 	int ret = 0;
+-- 
+2.43.0
+

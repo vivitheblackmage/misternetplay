@@ -1,0 +1,7 @@
+# LF everywhere, also in a Windows checkout (the tools and the MiSTer need LF)
+* text=auto eol=lf
+*.nes binary
+*.chr binary
+*.rbf binary
+*.exe binary
+*.zip binary
