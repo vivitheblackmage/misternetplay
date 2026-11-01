@@ -24,6 +24,17 @@ It comes in three parts:
 This is an unofficial modification. It is not part of, or endorsed by, the
 MiSTer-devel project.
 
+## Tested
+
+- Two MiSTers playing over the internet, both directly (port forwarding) and
+  through the lobby server, with the server running on Windows 10.
+- Games stay in sync: recorded and replayed frame by frame with identical
+  results over 38,000+ frames each on NROM, MMC1, MMC3, MMC5 and UNROM games
+  (Super Mario Bros., The Legend of Zelda, Super Mario Bros. 3, Castlevania III,
+  Gun.Smoke).
+- Automated tests for the core (Verilator testbench) and for the netplay engine,
+  host and join over real UDP, with and without the server.
+
 ## Where the NES core and the Main binary come from
 
 Both are the official MiSTer-devel projects. This repository does not copy
@@ -52,7 +63,7 @@ Everything else here is our own: the lobby server (`server/`), the tools
 | --- | --- |
 | MiSTer | Two MiSTers (DE10-Nano) with SDRAM, a network connection (Ethernet is best) and the current MiSTer Linux. Tested on kernel `6.18.38-MiSTer` (glibc 2.31). `MiSTer_online` needs glibc 2.29 or newer, so a MiSTer kept up to date with the official updater (`update_all` or `downloader`) is fine. Check with `uname -r` over ssh. |
 | Game | The same ROM file on both MiSTers (same md5). NetPong, a free two-player test game, is included. |
-| Server (optional) | Windows 10/11, or Linux on x86-64, ARM64 or ARMv7, such as Raspberry Pi OS (32- or 64-bit), Debian or Ubuntu. The binaries have no dependencies; the installer needs systemd (without it, run the binary by hand). So far tested on Linux x86-64. One forwarded port (7845, UDP and TCP) on the server's router. |
+| Server (optional) | Windows 10/11, or Linux on x86-64, ARM64 or ARMv7, such as Raspberry Pi OS (32- or 64-bit), Debian or Ubuntu. The binaries have no dependencies; the installer needs systemd (without it, run the binary by hand). Tested on Windows 10; Linux x86-64 in the automated tests. One forwarded port (7845, UDP and TCP) on the server's router. |
 | Building (developers) | Linux, tested on Ubuntu 24.04 (also in WSL2 on Windows 10). Docker for Quartus Prime Lite 17.0.2, Verilator 5, g++, Python 3, Go 1.22 (or Docker). See [Building](#building). |
 
 ## Installing on the MiSTer

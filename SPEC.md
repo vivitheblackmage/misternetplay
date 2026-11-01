@@ -2,8 +2,8 @@
 
 Status: v1 against NES_MiSTer `49a0a66` and Main_MiSTer `0827165`. Built in
 Quartus (timing OK) and tested on hardware: replay determinism (T5) and lockstep
-over the internet between two MiSTers. The lobby and hole punching are tested in
-T3 but not yet on hardware.
+over the internet between two MiSTers, directly and through the lobby server
+(server on Windows 10). Hole punching and the relay fallback are also covered in T3.
 This document is the definition of "done". Code that differs from the spec is a
 bug in the code or in the spec — never change one without the other.
 
