@@ -1,4 +1,4 @@
-// netplay-server: a private lobby and relay for MiSTer NES netplay.
+// netplay-server: a private lobby and relay for MiSTer NES and SNES netplay.
 //
 // Both MiSTers connect out to this server (UDP), so only the machine running
 // it needs a forwarded port. A host opens a room with a game; the others see
@@ -38,7 +38,7 @@ import (
 	"time"
 )
 
-const maxRomSize = 4 << 20
+const maxRomSize = 16 << 20
 
 type config struct {
 	Port    int
@@ -113,6 +113,7 @@ type romInfo struct {
 	name, md5 string
 	size      int64
 	mod       time.Time
+	path      string // full path
 }
 
 type library struct {
@@ -121,13 +122,42 @@ type library struct {
 	cache map[string]romInfo
 }
 
-func (l *library) list() []romInfo {
-	entries, err := os.ReadDir(l.dir)
+// coreDirs: where a core's games are. roms/<core>/; for NES (and a client that
+// names no core, as before SNES) also the games directly in roms/.
+func (l *library) coreDirs(core string) []string {
+	clean := strings.Map(func(c rune) rune {
+		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' {
+			return c
+		}
+		return -1
+	}, core)
+	if clean == "" || strings.EqualFold(clean, "NES") {
+		return []string{l.dir, filepath.Join(l.dir, "NES")}
+	}
+	return []string{filepath.Join(l.dir, clean), filepath.Join(l.dir, strings.ToUpper(clean))}
+}
+
+func (l *library) list(core string) []romInfo {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var out []romInfo
+	seen := map[string]bool{}
+	for _, dir := range l.coreDirs(core) {
+		if seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		out = append(out, l.listDir(dir)...)
+	}
+	sort.Slice(out, func(i, j int) bool { return strings.ToLower(out[i].name) < strings.ToLower(out[j].name) })
+	return out
+}
+
+func (l *library) listDir(dir string) []romInfo {
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
 	var out []romInfo
 	for _, e := range entries {
 		if !e.Type().IsRegular() || strings.HasPrefix(e.Name(), ".") || strings.ContainsAny(e.Name(), "\r\n") {
@@ -137,19 +167,19 @@ func (l *library) list() []romInfo {
 		if err != nil || fi.Size() > maxRomSize {
 			continue
 		}
-		ri, ok := l.cache[e.Name()]
+		path := filepath.Join(dir, e.Name())
+		ri, ok := l.cache[path]
 		if !ok || ri.size != fi.Size() || !ri.mod.Equal(fi.ModTime()) {
-			data, err := os.ReadFile(filepath.Join(l.dir, e.Name()))
+			data, err := os.ReadFile(path)
 			if err != nil {
 				continue
 			}
 			sum := md5.Sum(data)
-			ri = romInfo{e.Name(), hex.EncodeToString(sum[:]), fi.Size(), fi.ModTime()}
-			l.cache[e.Name()] = ri
+			ri = romInfo{e.Name(), hex.EncodeToString(sum[:]), fi.Size(), fi.ModTime(), path}
+			l.cache[path] = ri
 		}
 		out = append(out, ri)
 	}
-	sort.Slice(out, func(i, j int) bool { return strings.ToLower(out[i].name) < strings.ToLower(out[j].name) })
 	return out
 }
 
@@ -178,7 +208,7 @@ func readCatalog(path string) []romInfo {
 func makeCatalog(dir string) {
 	l := &library{dir: dir, cache: map[string]romInfo{}}
 	fmt.Printf("# catalog.txt from %s\n", dir)
-	for _, r := range l.list() {
+	for _, r := range append(l.list("NES"), l.list("SNES")...) {
 		fmt.Printf("%s %s\n", r.md5, r.name)
 	}
 }
@@ -198,11 +228,12 @@ func (l *library) serve(key, catalog string, r *relay) http.Handler {
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		roms := l.list()
+		core := q.URL.Query().Get("core")
+		roms := l.list(core)
 		for _, r := range roms {
 			fmt.Fprintf(w, "%s %d %s\n", r.md5, r.size, r.name)
 		}
-		log.Printf("http %s: game list (%d)", q.RemoteAddr, len(roms))
+		log.Printf("http %s: game list %s(%d)", q.RemoteAddr, core, len(roms))
 	})
 	mux.HandleFunc("/rooms", func(w http.ResponseWriter, q *http.Request) {
 		if !ok(w, q) {
@@ -222,6 +253,7 @@ func (l *library) serve(key, catalog string, r *relay) http.Handler {
 			fmt.Fprintf(w, "%s %s\n", r.md5, r.name)
 		}
 	})
+	mux.HandleFunc("/logo.png", serveLogo)
 	mux.HandleFunc("/", func(w http.ResponseWriter, q *http.Request) {
 		if q.URL.Path != "/" || !ok(w, q) {
 			if q.URL.Path != "/" {
@@ -229,39 +261,16 @@ func (l *library) serve(key, catalog string, r *relay) http.Handler {
 			}
 			return
 		}
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		fmt.Fprint(w, `<!doctype html><meta charset="utf-8"><title>netplay-server</title>
-<style>body{font:15px system-ui,sans-serif;margin:2em;max-width:60em}td{padding:.2em .8em}code{font-size:13px}</style>
-<h1>netplay-server</h1><h2>Rooms</h2><p>On the MiSTer: folder <b>_Netplay/Rooms</b>.</p><table>`)
-		rooms := r.list("")
-		if len(rooms) == 0 {
-			fmt.Fprint(w, "<tr><td>no open rooms</td></tr>")
-		}
-		for _, ri := range rooms {
-			who := htmlEscape(ri.host)
-			if ri.join != "" {
-				who += " vs " + htmlEscape(ri.join)
-			}
-			fmt.Fprintf(w, "<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>", who, htmlEscape(ri.game), htmlEscape(ri.core), ri.state)
-		}
-		fmt.Fprint(w, `</table><h2>Games from the server</h2><p>On the MiSTer: NES_netplay, folder <b>_Netplay/Server games</b>.</p><table>`)
-		for _, r := range l.list() {
-			fmt.Fprintf(w, "<tr><td>%s</td><td>%d bytes</td><td><code>%s</code></td></tr>", htmlEscape(r.name), r.size, r.md5)
-		}
-		fmt.Fprint(w, `</table><h2>Bring your own copy</h2><p>Your file must have exactly this md5.</p><table>`)
-		for _, r := range readCatalog(catalog) {
-			fmt.Fprintf(w, "<tr><td>%s</td><td><code>%s</code></td></tr>", htmlEscape(r.name), r.md5)
-		}
-		fmt.Fprint(w, `</table>`)
+		writePage(w, l, catalog, r)
 	})
 	mux.HandleFunc("/rom", func(w http.ResponseWriter, q *http.Request) {
 		if !ok(w, q) {
 			return
 		}
 		name := q.URL.Query().Get("name")
-		for _, r := range l.list() {
+		for _, r := range l.list(q.URL.Query().Get("core")) {
 			if r.name == name {
-				f, err := os.Open(filepath.Join(l.dir, r.name))
+				f, err := os.Open(r.path)
 				if err != nil {
 					break
 				}
@@ -335,7 +344,7 @@ func main() {
 	go r.sweep()
 
 	log.Printf("netplay-server on port %d (UDP + TCP), %d games in %s, %d in %s",
-		c.Port, len(lib.list()), c.Roms, len(readCatalog(c.Catalog)), c.Catalog)
+		c.Port, len(lib.list("NES"))+len(lib.list("SNES")), c.Roms, len(readCatalog(c.Catalog)), c.Catalog)
 	log.Printf("game lists in a browser: http://localhost:%d/?key=%s", c.Port, c.Key)
 	log.Printf("MiSTer netplay.ini:  server=<this address>:%d   key=%s   name=<player>", c.Port, c.Key)
 	r.run()

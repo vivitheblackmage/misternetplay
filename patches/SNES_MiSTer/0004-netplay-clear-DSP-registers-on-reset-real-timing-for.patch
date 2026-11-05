@@ -1,0 +1,352 @@
+From 55c58d120e42ece92ee07ece031ec3b1ae1716df Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Thu, 5 Nov 2026 17:35:54 +0100
+Subject: [PATCH] netplay: clear DSP registers on reset; real timing for the
+ SDRAM bypass
+
+A ROM reload resets the core but left the DSP register RAM from the last
+game. The SPC driver reads it, so the sound program took another path and
+CPU/SMP timing drifted apart between a MiSTer that had run other games and
+one freshly loaded: Contra III desynced at frame ~96. The DSP now writes
+zero to all 128 registers while RST_N is low (not during a savestate load).
+
+The multicycle from rbuf to din was wrong: DMA from ROM to WRAM takes the
+dout0 bypass and lands in din[1] on the next clk_mem edge. It is removed;
+the fitter gets 1 ns extra on that path instead (fit only), seed 9.
+Savestate DDR registers on the way in need no hold.
+
+sim: --dirty ROM2 N runs another game first, DIRTY_COMPARE=N compares a
+dirty against a fresh machine in lockstep from RESET_N, SNAP_FILE dumps a
+VCD at RESET_N.
+---
+ SNES.qsf         |   4 +-
+ SNES.sdc         |  17 +++---
+ rtl/DSP.vhd      |  16 ++++++
+ sim/sim_top.sv   |   2 +
+ sim/snes_sim.cpp | 133 +++++++++++++++++++++++++++++++++++++++++------
+ 5 files changed, 148 insertions(+), 24 deletions(-)
+
+diff --git a/SNES.qsf b/SNES.qsf
+index bb897b3..7a8c1fd 100644
+--- a/SNES.qsf
++++ b/SNES.qsf
+@@ -51,7 +51,7 @@ set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
+ set_global_assignment -name ALM_REGISTER_PACKING_EFFORT LOW
+ set_global_assignment -name OPTIMIZE_POWER_DURING_SYNTHESIS OFF
+ set_global_assignment -name ROUTER_REGISTER_DUPLICATION ON
+-set_global_assignment -name SEED 1
++set_global_assignment -name SEED 9
+ 
+ #use only 1MB per frame for scaler to free more DDR3 RAM
+ set_global_assignment -name VERILOG_MACRO "MISTER_SMALL_VBUF=1"
+@@ -62,4 +62,4 @@ source files.qip
+ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top
+ 
+ # Netplay: the fitter seed that meets timing with the clock gate (SPEC.md 10.1)
+-set_global_assignment -name SEED 2
++set_global_assignment -name SEED 9
+diff --git a/SNES.sdc b/SNES.sdc
+index 24b7b47..5a4f2b3 100644
+--- a/SNES.sdc
++++ b/SNES.sdc
+@@ -52,10 +52,15 @@ set_multicycle_path -setup -end 4 -from [get_registers { emu|ss_ddr_addr_r[*] em
+ set_multicycle_path -hold  -end 3 -from [get_registers { emu|ss_ddr_addr_r[*] emu|ss_ddr_din_r[*] emu|ss_ddr_be_r[*] emu|ss_ddr_we_r }] -to [get_registers { emu|ddram|* }]
+ set_multicycle_path -setup -end 2 -from [get_registers { emu|ddram|ram_q[*] }] -to [get_registers { emu|ss_ddr_dout_r[*] }]
+ set_multicycle_path -hold  -end 1 -from [get_registers { emu|ddram|ram_q[*] }] -to [get_registers { emu|ss_ddr_dout_r[*] }]
++# The same registers on the way in: savestates changes ddr_do/addr/be/we only
++# with or after a new req, and ss_ddr_req_r takes two clocks, so the old value
++# is never used on the edge where they change (hold is not needed).
++set_false_path -hold -from [get_registers { emu|main|ss|ddr_do[*] emu|main|ss|ss_ddr_addr[*] emu|main|ss|ddr_be[*] emu|main|ss|ddr_we }] -to [get_registers { emu|ss_ddr_din_r[*] emu|ss_ddr_addr_r[*] emu|ss_ddr_be_r[*] emu|ss_ddr_we_r }]
+ 
+-# Read data through main into the SDRAM's write data: din[] is only taken on a
+-# write request, which comes on a CPU clock enable long after the read data
+-# settled. Upstream has the same path; the netplay clock gate moves main's
+-# placement enough to make its single clk_mem cycle fail.
+-set_multicycle_path -setup -end 2 -from [get_registers { emu|sdram|rbuf[*] }] -to [get_registers { emu|sdram|din[*][*]* }]
+-set_multicycle_path -hold  -end 1 -from [get_registers { emu|sdram|rbuf[*] }] -to [get_registers { emu|sdram|din[*][*]* }]
++# SDRAM read data straight into the SDRAM write data (DMA ROM -> WRAM through
++# the dout0 bypass) is a real single clk_mem path. rbuf sits in the IO cell, so
++# only the logic after it can move: ask the fitter (not the timing check) for
++# about 1 ns more, so it keeps main's data mux next to the SDRAM pins.
++if {$::quartus(nameofexecutable) eq "quartus_fit"} {
++	set_max_delay -from [get_registers { emu|sdram|rbuf[*] }] -to [get_registers { emu|sdram|din[*][*]* }] 10.6
++}
+diff --git a/rtl/DSP.vhd b/rtl/DSP.vhd
+index 11e86c0..f4e3de4 100644
+--- a/rtl/DSP.vhd
++++ b/rtl/DSP.vhd
+@@ -65,6 +65,10 @@ architecture rtl of DSP is
+ 	signal REGS_DI 		: std_logic_vector(7 downto 0);
+ 	signal REGS_DO 		: std_logic_vector(7 downto 0);
+ 	signal REGS_WE 		: std_logic;
++	-- netplay: the registers are cleared during reset, so a ROM reload starts
++	-- like a freshly loaded core (a game may read a register it never wrote)
++	signal REGS_CLR_ADDR	: unsigned(6 downto 0) := (others => '0');
++	signal REGS_CLR		: std_logic;
+ 
+ 	signal SMP_EN_R_INT 	: std_logic;
+ 	signal SMP_EN_F_INT 	: std_logic;
+@@ -278,13 +282,24 @@ begin
+ 	SUBSTEP <= to_integer(SUBSTEP_CNT);
+ 	
+ 	
++	REGS_CLR <= not RST_N and not SS_REGS_SEL;
++
++	process(CLK)
++	begin
++		if rising_edge(CLK) then
++			REGS_CLR_ADDR <= REGS_CLR_ADDR + 1;
++		end if;
++	end process;
++
+ 	REGS_ADDR_WR <= SS_ADDR(6 downto 0) when SS_REGS_SEL = '1' else
++					std_logic_vector(REGS_CLR_ADDR) when REGS_CLR = '1' else
+ 					IO_ADDR(6 downto 1)&IO_REG_WR(1) when IO_REG_WR /= "00" else
+ 						 REGN_WR;
+ 
+ 	REGS_ADDR_RD <= SS_ADDR(6 downto 0) when SS_REGS_SEL = '1' else REGN_RD;
+ 
+ 	REGS_DI <= SS_DI when SS_REGS_SEL = '1' else
++				  x"00"        when REGS_CLR = '1' else
+ 				  IO_REG_DAT   when IO_REG_WR /= "00" else
+ 				  SMP_DO 	   when SUBSTEP = 3 else
+ 				  ENVX_OUT     when REGN_WR(3 downto 0) = x"8" else 
+@@ -292,6 +307,7 @@ begin
+ 				  SMP_DO;
+ 						
+ 	REGS_WE <= '1' when SS_REGS_WR = '1' and SS_ADDR(8 downto 7) = "00" else
++				  '1' when REGS_CLR = '1' else
+ 				  '1' when IO_REG_WR /= "00" and IO_ADDR(16 downto 7) = "0"&x"01"&"0" else
+ 				  '1' when SMP_WE = '0' and SMP_A = x"00F3" and SUBSTEP = 3 and CE = '1' else
+ 				  '1' when REGN_WR(3 downto 1) = "100" and SUBSTEP = 0 and CE = '1' else
+diff --git a/sim/sim_top.sv b/sim/sim_top.sv
+index c1b17d0..a3c0903 100644
+--- a/sim/sim_top.sv
++++ b/sim/sim_top.sv
+@@ -8,6 +8,7 @@ module sim_top (
+ 	input         reset,          // like SNES.sv's reset: RESET_N is released at HVCNT_ATZERO
+ 	input         freeze,         // SPEC 10.1: stops the emulated machine's clock
+ 	output        emu_clk_en,     // the gate's state: 1 = the next rising edge reaches the machine
++	output        reset_n_out,    // the machine's RESET_N (snes_sim SNAP_FILE)
+ 
+ 	input   [7:0] rom_type,
+ 	input  [23:0] rom_mask,
+@@ -100,6 +101,7 @@ wire clk_emu = clk_sys & en_l;
+ assign emu_clk_en = en_l;
+ 
+ reg RESET_N = 0;
++assign reset_n_out = RESET_N;
+ wire HVCNT_ATZERO;
+ wire np_hold_reset;
+ always @(posedge clk_sys) begin
+diff --git a/sim/snes_sim.cpp b/sim/snes_sim.cpp
+index 900bba6..9cf69bd 100644
+--- a/sim/snes_sim.cpp
++++ b/sim/snes_sim.cpp
+@@ -2,7 +2,7 @@
+ //
+ //   snes_sim <rom> [--frames N] [--ppm DIR --shot F,F,...] [--freeze SEED]
+ //            [--pad FILE] [--dump FRAME wram.bin] [--compare SEED] [--freeze-at FRAME CYCLES]
+-//            [--netplay SEED [--delay D] [--latency CYCLES]]
++//            [--netplay SEED [--delay D] [--latency CYCLES]] [--dirty ROM2 FRAMES]
+ //
+ // Prints one line per frame: "frame <n> video <h> audio <h> wram <h> vram <h> aram <h>".
+ // Two runs of the same ROM and inputs must print the same lines; with --freeze
+@@ -214,6 +214,19 @@ struct Machine {
+ 	X(aram_d) X(aram_ce_n) X(aram_we_n) X(r) X(g) X(b) X(dotclk) X(hblank_n) X(vblank_n) X(hsync) X(vsync) X(field) \
+ 	X(interlace) X(high_res) X(audio_l) X(audio_r)
+ 
++// what the game can see: CPU-side buses and memory writes (not the DSP's reads, the picture or the sound)
++static const char *first_diff_game(const Vsim_top *a, const Vsim_top *b, uint64_t *va, uint64_t *vb)
++{
++#define CMP(n) if ((uint64_t)a->n != (uint64_t)b->n) { *va = a->n; *vb = b->n; return #n; }
++	CMP(rom_addr) CMP(rom_oe_n) CMP(rom_we_n) CMP(wram_addr) CMP(wram_d) CMP(wram_ce_n) CMP(wram_we_n)
++	CMP(bsram_addr) CMP(bsram_we_n) CMP(vram1_we_n) CMP(vram2_we_n) CMP(aram_we_n)
++	if (!a->vram1_we_n) { CMP(vram1_addr) CMP(vram1_d) }
++	if (!a->vram2_we_n) { CMP(vram2_addr) CMP(vram2_d) }
++	if (!a->aram_we_n && !a->aram_ce_n) { CMP(aram_addr) CMP(aram_d) }
++#undef CMP
++	return nullptr;
++}
++
+ static const char *first_diff(const Vsim_top *a, const Vsim_top *b, uint64_t *va, uint64_t *vb)
+ {
+ #define CMP(n) if ((uint64_t)a->n != (uint64_t)b->n) { *va = a->n; *vb = b->n; return #n; }
+@@ -223,6 +236,10 @@ static const char *first_diff(const Vsim_top *a, const Vsim_top *b, uint64_t *va
+ }
+ 
+ // ---------------------------------------------------------------------------
++// --dirty: the machine first runs ROM2 for FRAMES frames, then loads rom the way
++// a ROM reload in a running core does (SNES.sv: cart download): new ROM in SDRAM,
++// WRAM, ARAM and BSRAM filled, everything else as ROM2 left it. Its lines must be
++// the same as a run without --dirty (netplay reloads the ROM; SPEC 10).
+ // --netplay: two machines (host and join) with the netplay module, a fake HPS
+ // for each (SPEC.md 4 and 10.3: session start, combining LOCAL into INPUT) and
+ // a network with random latency between them. Passes when both post the same
+@@ -308,9 +325,44 @@ struct FakeHps {
+ 	}
+ };
+ 
+-static int run_netplay(const std::vector<uint8_t> &rom, const Cart &cart, int frames, long seed, int delay, int max_lat)
++// --dirty: run what m was built with for n frames, then reload rom into it
++static void make_dirty(Machine &m, int dirty_frames, const std::vector<uint8_t> &rom, const Cart &cart)
+ {
+-	Machine h(rom, cart), j(rom, cart);
++	for (int i = 0; i < 2000; i++) m.step();
++	m.top->reset = 0;
++	bool lv = true;
++	uint32_t rs = 12345;
++	for (int f = 0; f < dirty_frames && m.cycle < (uint64_t)(dirty_frames + 4) * 450000ULL;) {
++		m.step();
++		bool v = !m.top->vblank_n;
++		if (v && !lv && ++f % 8 == 0) {     // some random buttons, so ROM2 gets past its title
++			rs = rs * 1103515245u + 12345u;
++			m.top->joy0 = (rs >> 8) & 0xfff; m.top->eval();
++		}
++		lv = v;
++	}
++	// the reload: SNES.sv holds reset during the cart download and fills WRAM,
++	// ARAM and BSRAM (clearing_ram); VRAM and the core's own RAMs are kept
++	m.top->reset = 1; m.top->joy0 = 0;
++	m.top->rom_type = cart.rom_type;
++	m.top->rom_mask = (1024u << cart.rom_size) - 1;
++	m.top->ram_mask = cart.ram_size ? (1024u << cart.ram_size) - 1 : 0;
++	m.top->ram_size = cart.ram_size;
++	m.top->pal = cart.pal;
++	m.top->eval();
++	std::fill(m.sdram.begin(), m.sdram.end(), 0);
++	memcpy(m.sdram.data(), rom.data(), std::min(rom.size(), m.sdram.size()));
++	std::fill(m.wram.begin(), m.wram.end(), 0x00);
++	std::fill(m.aram.begin(), m.aram.end(), 0);
++	std::fill(m.bsram.begin(), m.bsram.end(), 0xFF);
++	fprintf(stderr, "dirty: %d frames of another ROM, then reload\n", dirty_frames);
++	}
++
++static int run_netplay(const std::vector<uint8_t> &rom, const Cart &cart, int frames, long seed, int delay, int max_lat,
++                       const std::vector<uint8_t> *rom2, const Cart *cart2, int dirty_frames)
++{
++	Machine h(rom, cart), j(rom2 ? *rom2 : rom, cart2 ? *cart2 : cart);
++	if (rom2) make_dirty(j, dirty_frames, rom, cart);     // the join ran another game first
+ 	h.rng = 0x1234567 + seed * 7; j.rng = 0x7654321 + seed * 13;
+ 	for (Machine *m : { &h, &j }) { m->top->np_enable = 1; m->top->eval(); }
+ 	FakeHps hh(h, true, delay, 0x5A), hj(j, false, delay, 0x5A);
+@@ -374,6 +426,8 @@ int main(int argc, char **argv)
+ 		return 2;
+ 	}
+ 	const char *rom_path = argv[1];
++	const char *dirty_path = nullptr;
++	int dirty_frames = 0;
+ 	int frames = 60;
+ 	std::string ppm_dir;
+ 	std::set<int> shots;
+@@ -398,24 +452,28 @@ int main(int argc, char **argv)
+ 		else if (!strcmp(argv[i], "--latency") && i + 1 < argc) np_lat = atoi(argv[++i]);
+ 		else if (!strcmp(argv[i], "--freeze-at") && i + 2 < argc) { at_frame = atoi(argv[++i]); at_len = atol(argv[++i]); }
+ 		else if (!strcmp(argv[i], "--dump") && i + 2 < argc) { dump_frame = atoi(argv[++i]); dump_path = argv[++i]; }
++		else if (!strcmp(argv[i], "--dirty") && i + 2 < argc) { dirty_path = argv[++i]; dirty_frames = atoi(argv[++i]); }
+ 	}
+ 
+ 	// ROM into "SDRAM" at 0, as the cart download does (copier header skipped)
+-	std::vector<uint8_t> file;
+-	{
+-		FILE *f = fopen(rom_path, "rb");
+-		if (!f) { perror(rom_path); return 2; }
++	auto read_rom = [](const char *path, std::vector<uint8_t> &rom, Cart &cart) {
++		std::vector<uint8_t> file;
++		FILE *f = fopen(path, "rb");
++		if (!f) { perror(path); return false; }
+ 		uint8_t buf[65536]; size_t n;
+ 		while ((n = fread(buf, 1, sizeof buf, f)) > 0) file.insert(file.end(), buf, buf + n);
+ 		fclose(f);
+-	}
+-	size_t skip = (file.size() & 512) ? 512 : 0;
+-	std::vector<uint8_t> rom(file.begin() + skip, file.end());
+-	Cart cart = detect(rom.data(), (uint32_t)rom.size());
+-	fprintf(stderr, "%s: %s, rom_type %02x, rom %u, ram %u, %s\n", rom_path, cart.kind, cart.rom_type,
+-	        cart.rom_size, cart.ram_size, cart.pal ? "PAL" : "NTSC");
++		size_t skip = (file.size() & 512) ? 512 : 0;
++		rom.assign(file.begin() + skip, file.end());
++		cart = detect(rom.data(), (uint32_t)rom.size());
++		fprintf(stderr, "%s: %s, rom_type %02x, rom %u, ram %u, %s\n", path, cart.kind, cart.rom_type,
++		        cart.rom_size, cart.ram_size, cart.pal ? "PAL" : "NTSC");
++		return true;
++	};
++	std::vector<uint8_t> rom;
++	Cart cart;
++	if (!read_rom(rom_path, rom, cart)) return 2;
+ 
+-	if (np_seed >= 0) return run_netplay(rom, cart, frames, np_seed, np_delay, np_lat);
+ 
+ 	// optional input script: lines "frame joy0 joy1" (hex joys), applied from that frame on
+ 	std::vector<std::pair<int, std::pair<int, int>>> pad;
+@@ -432,7 +490,42 @@ int main(int argc, char **argv)
+ 	uint64_t tr_from = getenv("TRACE_FROM") ? strtoull(getenv("TRACE_FROM"), 0, 10) : 0;
+ 	uint64_t tr_to = getenv("TRACE_TO") ? strtoull(getenv("TRACE_TO"), 0, 10) : 0;
+ #endif
+-	Machine m(rom, cart);                       // the machine that is reported (B in --compare)
++	std::vector<uint8_t> rom2;
++	Cart cart2;
++	if (dirty_path && !read_rom(dirty_path, rom2, cart2)) return 2;
++	if (np_seed >= 0)
++		return run_netplay(rom, cart, frames, np_seed, np_delay, np_lat, dirty_path ? &rom2 : nullptr,
++		                   dirty_path ? &cart2 : nullptr, dirty_frames);
++	Machine m(dirty_path ? rom2 : rom, dirty_path ? cart2 : cart);   // the machine that is reported (B in --compare)
++	if (dirty_path) make_dirty(m, dirty_frames, rom, cart);
++	if (dirty_path && getenv("DIRTY_COMPARE")) {
++		// a fresh machine and the dirty one, in step from the cycle RESET_N rises:
++		// the first core output that differs is where the leftover state shows
++		Machine a(rom, cart);
++		for (int i = 0; i < 2000; i++) { a.step(); m.step(); }
++		a.top->reset = 0; m.top->reset = 0;
++		while (!a.top->reset_n_out) a.step();
++		while (!m.top->reset_n_out) m.step();
++		int fr = 0; bool lv = true;
++		uint64_t settle = strtoull(getenv("DIRTY_COMPARE"), 0, 10);
++		for (uint64_t c = 0; c < (uint64_t)frames * 360000ULL; c++) {
++			a.step(); m.step();
++			bool v = !a.top->vblank_n;
++			if (v && !lv) fr++;
++			lv = v;
++			uint64_t va, vb;
++			const char *d = c >= settle ? first_diff_game(a.top.get(), m.top.get(), &va, &vb) : nullptr;
++			if (d) {
++				printf("first difference %llu cycles after RESET_N (frame %d): %s fresh=%llx dirty=%llx\n",
++				       (unsigned long long)c, fr, d, (unsigned long long)va, (unsigned long long)vb);
++				printf("fresh: rom_addr %06x wram_addr %05x aram_addr %04x  dirty: rom_addr %06x wram_addr %05x aram_addr %04x\n",
++				       a.top->rom_addr, a.top->wram_addr, a.top->aram_addr, m.top->rom_addr, m.top->wram_addr, m.top->aram_addr);
++				return 1;
++			}
++		}
++		printf("no difference in %d frames\n", frames);
++		return 0;
++	}
+ 	std::unique_ptr<Machine> ref;               // A in --compare: never frozen
+ 	if (compare) ref.reset(new Machine(rom, cart));
+ 
+@@ -451,7 +544,7 @@ int main(int argc, char **argv)
+ 	size_t pad_i = 0;
+ 	long freeze_left = 0, freezes = 0;
+ 	uint64_t frozen_cycles = 0, common = 0;
+-	uint64_t max_cycles = (uint64_t)(frames + 4) * 450000ULL;
++	uint64_t max_cycles = m.cycle + (uint64_t)(frames + 4) * 450000ULL;   // m.cycle: after --dirty
+ 
+ 	while (frame < frames && m.cycle < max_cycles + frozen_cycles) {
+ 		Vsim_top *t = m.top.get();
+@@ -470,6 +563,14 @@ int main(int argc, char **argv)
+ 		m.step();
+ #ifdef TRACE
+ 		m.vcd = saved;
++		// SNAP_FILE: every signal once, when RESET_N rises (compare a fresh and a --dirty run)
++		static bool snapped = false;
++		if (!snapped && getenv("SNAP_FILE") && m.top->reset_n_out) {
++			VerilatedVcdC snap; m.top->trace(&snap, 99); snap.open(getenv("SNAP_FILE"));
++			snap.dump(0); snap.close(); snapped = true;
++			fprintf(stderr, "snapshot at RESET_N, cycle %llu\n", (unsigned long long)m.cycle);
++			return 0;
++		}
+ #endif
+ 		if (was_frozen) {
+ 			frozen_cycles++;
+-- 
+2.43.0
+

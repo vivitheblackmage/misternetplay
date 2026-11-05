@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Packs a release folder into one ready-to-use zip:
 #
-#   tools/make_bundle.sh releases/v0.1   ->  releases/v0.1/nes-netplay-v0.1.zip
+#   tools/make_bundle.sh releases/v0.1   ->  releases/v0.1/mister-netplay-v0.1.zip
 #
-#   nes-netplay-v0.1/
+#   mister-netplay-v0.1/
 #     README.txt        quick start
 #     SD card/          copy onto the MiSTer's SD card (root, where _Console is)
 #     Server/           netplay-server for Windows, Linux, Raspberry Pi
@@ -14,7 +14,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 rel="$(cd "${1:?usage: $0 releases/<version>}" && pwd)"
 ver="$(basename "$rel")"
-name="nes-netplay-$ver"
+name="mister-netplay-$ver"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 b="$work/$name"
@@ -25,12 +25,14 @@ chmod +x "$b/SD card/MiSTer_online" "$b/SD card"/Scripts/*.sh
 cp "$rel"/server/* "$b/Server/"
 chmod +x "$b"/Server/netplay-server-linux-* "$b/Server/install-linux.sh"
 cp "$rel/SOURCE.txt" "$b/"
+[ -f "$rel/RELEASE_NOTES.md" ] && cp "$rel/RELEASE_NOTES.md" "$b/"
 
 cat > "$b/README.txt" <<EOF
-NES NETPLAY $ver - EVERYTHING IN ONE
+NES AND SNES NETPLAY $ver - EVERYTHING IN ONE
 
-Two MiSTers play NES together over the network. SOURCE.txt says where the code
-comes from (MiSTer-devel's NES core and Main_MiSTer, plus our patches).
+Two MiSTers play NES or SNES together over the network. SOURCE.txt says where
+the code comes from (MiSTer-devel's NES and SNES cores and Main_MiSTer, plus
+our patches). RELEASE_NOTES.md says what is new.
 
 1. THE MISTER (do this on both)
    Copy the contents of the folder "SD card" to the root of the SD card (where
@@ -38,7 +40,8 @@ comes from (MiSTer-devel's NES core and Main_MiSTer, plus our patches).
    More in "SD card/README-netplay.txt".
 
 2a. WITHOUT A SERVER (one player forwards a port in the router)
-   Host: forward UDP 7845 in the router. OSD in NES_netplay: Netplay -> Host.
+   Host: forward UDP 7845 in the router. OSD in NES_netplay or SNES_netplay:
+   Netplay -> Host.
    Join: put the host's address in /media/fat/netplay.ini, peer=..., and
    Netplay -> Join. Load the same game (NetPong is included).
 
@@ -56,6 +59,10 @@ comes from (MiSTer-devel's NES core and Main_MiSTer, plus our patches).
    One player: Netplay -> Host and load a game. The other: the file browser,
    folder _Netplay/Rooms, open the room and pick the game in it.
    More in Server/README.md.
+
+Switching between NES_netplay and SNES_netplay: reboot from the MiSTer's menu
+first (or pick the other core after a reboot). Jumping straight from one core
+to the other can leave netplay without the ROM reload at the start.
 
 Check: md5sums.txt. Always pass on the zip file, not loose files (FTP in ASCII
 mode breaks the binaries).

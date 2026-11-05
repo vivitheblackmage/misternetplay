@@ -26,21 +26,23 @@ done
 if [ -n "$server" ] && [ -z "$key" ]; then echo "--server needs --key"; exit 1; fi
 kit="$root/dist/netplay-kit"
 rbf="$root/NES_MiSTer/output_files/NES.rbf"
+srbf="$root/SNES_MiSTer/output_files/SNES.rbf"
 bin="$root/Main_MiSTer/bin/MiSTer"
 rom="$root/netpong/netpong.nes"
 
-for f in "$rbf" "$bin" "$rom"; do [ -f "$f" ] || { echo "missing $f"; exit 1; }; done
+for f in "$rbf" "$srbf" "$bin" "$rom"; do [ -f "$f" ] || { echo "missing $f"; exit 1; }; done
 
 rm -rf "$kit" "$root/dist/netplay-kit.zip"
 mkdir -p "$kit/_Console" "$kit/Scripts" "$kit/games/NES/NetPong"
 cp "$rbf" "$kit/_Console/NES_netplay.rbf"
+cp "$srbf" "$kit/_Console/SNES_netplay.rbf"
 cp "$bin" "$kit/MiSTer_online"
 cp "$root"/tools/mister-scripts/netplay_on.sh "$root"/tools/mister-scripts/netplay_off.sh "$kit/Scripts/"
 cp "$rom" "$kit/games/NES/NetPong/NetPong.nes"
 chmod +x "$kit/MiSTer_online" "$kit"/Scripts/*.sh
 
 cat > "$kit/netplay.ini" <<EOF
-; NES netplay. The NES_netplay core's OSD option "Netplay" picks Off/Host/Join;
+; NES and SNES netplay. The NES_netplay/SNES_netplay OSD option "Netplay" picks Off/Host/Join;
 ; this file gives the address, port and delay.
 
 [netplay]
@@ -55,11 +57,11 @@ file=               ; record/replay: empty = one file per game
 EOF
 
 cat > "$kit/README-netplay.txt" <<'EOF'
-NES NETPLAY - GETTING STARTED
+NES AND SNES NETPLAY - GETTING STARTED
 
 1. Unzip everything into the root of the SD card (where the _Console folder is).
-   None of your own files is overwritten: the core is NES_netplay.rbf, the
-   binary MiSTer_online, NetPong goes to games/NES/NetPong/.
+   None of your own files is overwritten: the cores are NES_netplay.rbf and
+   SNES_netplay.rbf, the binary MiSTer_online, NetPong goes to games/NES/NetPong/.
    If you already have a netplay.ini, keep yours and change peer= or server= in it.
 
 2. Scripts menu -> netplay_on. The MiSTer restarts with the netplay binary.
@@ -69,6 +71,16 @@ NES NETPLAY - GETTING STARTED
      Advanced -> RAM Clear -> $00
      Netplay  -> Host on one MiSTer, Join on the other
      Save settings (at the bottom of the menu), or RAM Clear is lost at restart.
+
+SNES: start SNES_netplay (under Console). OSD Netplay -> Host or Join, the
+   same as NES; no other settings needed (both must have the same OSD settings).
+   Games come from your own games/SNES folder (both need the same file) or from
+   the server. Not supported: MSU-1, BS-X/Satellaview, games with a clock
+   (S-RTC, SPC7110 RTC) and SPC music files.
+
+SWITCHING CORES: to go from NES_netplay to SNES_netplay (or back), reboot from
+   the MiSTer's menu first and then start the other core. Jumping straight from
+   one core to the other can leave netplay without the ROM reload at the start.
 
 WITHOUT A SERVER (server= is empty in netplay.ini)
 4. The host forwards UDP port 7845 in its router to the MiSTer.
@@ -94,7 +106,7 @@ WITH A SERVER (server= and key= are set in netplay.ini)
    "... (missing game)" in Rooms        you do not have that game (same md5)
 
 Check: the files must have the md5 sums in md5sums.txt. Over ssh on the MiSTer:
-  cd /media/fat && md5sum MiSTer_online _Console/NES_netplay.rbf
+  cd /media/fat && md5sum MiSTer_online _Console/NES_netplay.rbf _Console/SNES_netplay.rbf
 Always pass on the zip file, not loose files: some transfers (FTP in ASCII
 mode, git) change line endings in binaries, and MiSTer_online then does not
 start (black screen). To recover, put the SD card in a computer: delete
@@ -102,8 +114,11 @@ MiSTer, rename MiSTer_offline to MiSTer.
 
 OSD errors:
   "Different ROM file"       you do not have the same game file
-  "Different NES core build" you have different NES_netplay.rbf files
-  "Set RAM Clear to $00..."  step 3
+  "Different core build"     you have different NES_netplay/SNES_netplay.rbf files
+  "Different core settings"  set the same OSD options on both MiSTers
+  "Set RAM Clear to $00..."  step 3 (NES)
+  "Game chip not supported"  SNES: MSU-1, BS-X or a game with a clock
+  "...runs another console"  one of you is in NES, the other in SNES
   no connection              the host's router must forward UDP 7845
 EOF
 

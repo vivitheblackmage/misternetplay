@@ -49,7 +49,8 @@ Without systemd, or just to try it: run `./netplay-server-linux-arm64` directly.
 ```ini
 port=7845          ; UDP + TCP
 key=3f9c...        ; the same key in the players' netplay.ini
-roms=roms          ; games the server hands out (in RAM only on the MiSTers)
+roms=roms          ; games the server hands out (in RAM only on the MiSTers):
+                   ; roms/NES (or roms itself) and roms/SNES
 catalog=catalog.txt ; "md5 name" per line: versions everyone brings themselves
 ```
 
@@ -60,6 +61,10 @@ DuckDNS.
 Rooms and games show in a web browser: `http://<server>:7845/?key=<key>`.
 `netplay-server -make-catalog <folder>` prints catalog lines for the files in a
 folder.
+
+Each core gets the games of its own folder: NES the files in `roms/NES` and
+directly in `roms`, SNES the files in `roms/SNES` (`.sfc`/`.smc`, up to 8 MB).
+Rooms are per core too: an SNES room only shows on MiSTers running the SNES core.
 
 Only put games in `roms` that you are allowed to share, such as your own games
 and homebrew.

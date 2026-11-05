@@ -1,0 +1,421 @@
+From 2a3ff5c49f79055fb856da95e686e5c77f296d5e Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Wed, 4 Nov 2026 00:40:27 +0100
+Subject: [PATCH] netplay: fixes from review, timing with the clock gate
+
+Ticks count only after RESET_N rises (the core leaves reset at the PPU's
+next HVCNT_ATZERO, up to two frames after PRIME), so frame 0 starts at
+the same emulated moment on both sides; snes_sim --netplay starts the
+two sides apart and fails without it. SNI and Load Backup RAM are off
+during netplay, any download counts as a reload, ERROR does not freeze
+while a ROM loads. SDRAM refresh while frozen is a separate request in
+sdram.sv, kept out of the address-to-command path.
+
+Timing: clk_emu comes from its own PLL output (a copy of clk_sys's);
+the savestate channel crosses through clk_sys registers with req/ack a
+clock later than the data; SNES.sdc gives those data paths and the
+rbuf -> din path more than one clock; SEED 2.
+---
+ SNES.qsf           |  5 +++-
+ SNES.sdc           | 15 ++++++++++++
+ SNES.sv            | 60 +++++++++++++++++++++++++++++++++-------------
+ rtl/netplay.sv     | 11 +++++++--
+ rtl/pll.v          |  2 ++
+ rtl/pll/pll_0002.v | 15 +++++++-----
+ rtl/sdram.sv       | 11 +++++++++
+ sim/sim_top.sv     |  1 +
+ sim/snes_sim.cpp   |  7 +++++-
+ 9 files changed, 100 insertions(+), 27 deletions(-)
+
+diff --git a/SNES.qsf b/SNES.qsf
+index a6110a1..bb897b3 100644
+--- a/SNES.qsf
++++ b/SNES.qsf
+@@ -13,7 +13,7 @@ set_global_assignment -name PARTITION_NETLIST_TYPE SOURCE -section_id Top
+ set_global_assignment -name PARTITION_FITTER_PRESERVATION_LEVEL PLACEMENT_AND_ROUTING -section_id Top
+ set_global_assignment -name PARTITION_COLOR 16764057 -section_id Top
+ 
+-set_global_assignment -name LAST_QUARTUS_VERSION "17.0.2 Standard Edition"
++set_global_assignment -name LAST_QUARTUS_VERSION "17.0.2 Lite Edition"
+ 
+ set_global_assignment -name GENERATE_RBF_FILE ON
+ set_global_assignment -name PROJECT_OUTPUT_DIRECTORY output_files
+@@ -60,3 +60,6 @@ source sys/sys.tcl
+ source sys/sys_analog.tcl
+ source files.qip
+ set_instance_assignment -name PARTITION_HIERARCHY root_partition -to | -section_id Top
++
++# Netplay: the fitter seed that meets timing with the clock gate (SPEC.md 10.1)
++set_global_assignment -name SEED 2
+diff --git a/SNES.sdc b/SNES.sdc
+index 56af2f0..24b7b47 100644
+--- a/SNES.sdc
++++ b/SNES.sdc
+@@ -44,3 +44,18 @@ set_false_path -from [get_registers { emu|sdram_download_* }] -to [get_registers
+ #set_false_path -to [get_registers { emu|sdram|word[*] }]
+ 
+ set_false_path -from {emu|en216p}
++
++# Netplay (SPEC.md 10.1): the savestate channel crosses through registers on
++# clk_sys (SNES.sv); its req and ack take a clk_sys more than the data, so the
++# data has more than one clock to settle.
++set_multicycle_path -setup -end 4 -from [get_registers { emu|ss_ddr_addr_r[*] emu|ss_ddr_din_r[*] emu|ss_ddr_be_r[*] emu|ss_ddr_we_r }] -to [get_registers { emu|ddram|* }]
++set_multicycle_path -hold  -end 3 -from [get_registers { emu|ss_ddr_addr_r[*] emu|ss_ddr_din_r[*] emu|ss_ddr_be_r[*] emu|ss_ddr_we_r }] -to [get_registers { emu|ddram|* }]
++set_multicycle_path -setup -end 2 -from [get_registers { emu|ddram|ram_q[*] }] -to [get_registers { emu|ss_ddr_dout_r[*] }]
++set_multicycle_path -hold  -end 1 -from [get_registers { emu|ddram|ram_q[*] }] -to [get_registers { emu|ss_ddr_dout_r[*] }]
++
++# Read data through main into the SDRAM's write data: din[] is only taken on a
++# write request, which comes on a CPU clock enable long after the read data
++# settled. Upstream has the same path; the netplay clock gate moves main's
++# placement enough to make its single clk_mem cycle fail.
++set_multicycle_path -setup -end 2 -from [get_registers { emu|sdram|rbuf[*] }] -to [get_registers { emu|sdram|din[*][*]* }]
++set_multicycle_path -hold  -end 1 -from [get_registers { emu|sdram|rbuf[*] }] -to [get_registers { emu|sdram|din[*][*]* }]
+diff --git a/SNES.sv b/SNES.sv
+index afe81f9..9e3e634 100644
+--- a/SNES.sv
++++ b/SNES.sv
+@@ -67,6 +67,7 @@ video_freak video_freak
+ wire clock_locked;
+ wire clk_mem;
+ wire clk_sys;
++wire clk_emu_pll;
+ 
+ // Netplay (SPEC.md 10, rtl/netplay.sv); declared here because they are used early.
+ wire        np_active, np_hold_reset, np_freeze_req;
+@@ -84,12 +85,15 @@ pll pll
+ 	.outclk_0(clk_mem),
+ 	.outclk_1(CLK_VIDEO),
+ 	.outclk_2(clk_sys),
++	.outclk_3(clk_emu_pll),   // the same clock, for the netplay gate
+ 	.reconfig_to_pll(reconfig_to_pll),
+ 	.reconfig_from_pll(reconfig_from_pll),
+ 	.locked(clock_locked)
+ );
+ 
+-// clk_emu: clk_sys through Cyclone V's glitch-free clock gate (ena is latched on
++// clk_emu: clk_sys (from its own, identical PLL output, so the gate gets the
++// same short path from the PLL as clk_sys's buffer and the two clock trees
++// line up) through Cyclone V's glitch-free clock gate (ena is latched on
+ // the falling edge). Everything of the emulated machine runs on it: main, the
+ // joypad ports, the block RAMs, READ_PULSE and VRAM_OE_N_DELAYED. Netplay stops
+ // it to freeze the machine bit-exactly (SPEC.md 10.1).
+@@ -99,7 +103,7 @@ cyclonev_clkena #(
+ 	.ena_register_mode("falling edge")
+ ) emu_clkena
+ (
+-	.inclk(clk_sys),
++	.inclk(clk_emu_pll),
+ 	.ena(~np_freeze),
+ 	.enaout(emu_en),
+ 	.outclk(clk_emu)
+@@ -476,6 +480,26 @@ wire [63:0] ss_ddr_dout, ss_ddr_din;
+ wire [21:3] ss_ddr_addr;
+ wire [ 7:0] ss_ddr_be;
+ 
++// The savestate channel crosses between main (clk_emu) and ddram (clk_mem)
++// through registers on clk_sys. req and ack take one clk_sys more than the
++// data, so the data is stable before the other side sees the toggle; SNES.sdc
++// gives the data paths more than one clock.
++wire        ss_ddr_ack_d, ss_ddr_req_e, ss_ddr_we_e;
++wire [63:0] ss_ddr_dout_d, ss_ddr_din_e;
++wire [21:3] ss_ddr_addr_e;
++wire [ 7:0] ss_ddr_be_e;
++reg         ss_ddr_ack_r, ss_ddr_req_r, ss_ddr_we_r, ss_ddr_ack_r1, ss_ddr_req_r1;
++reg  [63:0] ss_ddr_dout_r, ss_ddr_din_r;
++reg  [21:3] ss_ddr_addr_r;
++reg  [ 7:0] ss_ddr_be_r;
++always @(posedge clk_sys) begin
++	{ss_ddr_addr_r, ss_ddr_din_r, ss_ddr_be_r, ss_ddr_we_r, ss_ddr_req_r1} <= {ss_ddr_addr_e, ss_ddr_din_e, ss_ddr_be_e, ss_ddr_we_e, ss_ddr_req_e};
++	ss_ddr_req_r <= ss_ddr_req_r1;
++	ss_ddr_dout_r <= ss_ddr_dout_d;
++	{ss_ddr_ack_r, ss_ddr_ack_r1} <= {ss_ddr_ack_r1, ss_ddr_ack_d};
++end
++assign {ss_ddr_addr, ss_ddr_din, ss_ddr_be, ss_ddr_we, ss_ddr_req} = {ss_ddr_addr_r, ss_ddr_din_r, ss_ddr_be_r, ss_ddr_we_r, ss_ddr_req_r};
++
+ reg [15:0] main_audio_l;
+ reg [15:0] main_audio_r;
+ 
+@@ -620,13 +644,13 @@ main main
+ 	.SS_SLOT(ss_slot),
+ 	.SS_AVAIL(ss_avail),
+ 
+-	.SS_DDR_DI(ss_ddr_dout),
+-	.SS_DDR_ACK(ss_ddr_ack),
+-	.SS_DDR_DO(ss_ddr_din),
+-	.SS_DDR_ADDR(ss_ddr_addr),
+-	.SS_DDR_WE(ss_ddr_we),
+-	.SS_DDR_BE(ss_ddr_be),
+-	.SS_DDR_REQ(ss_ddr_req),
++	.SS_DDR_DI(ss_ddr_dout_r),
++	.SS_DDR_ACK(ss_ddr_ack_r),
++	.SS_DDR_DO(ss_ddr_din_e),
++	.SS_DDR_ADDR(ss_ddr_addr_e),
++	.SS_DDR_WE(ss_ddr_we_e),
++	.SS_DDR_BE(ss_ddr_be_e),
++	.SS_DDR_REQ(ss_ddr_req_e),
+ 
+ 	.AUDIO_L(main_audio_l),
+ 	.AUDIO_R(main_audio_r)
+@@ -790,7 +814,8 @@ sdram sdram
+ 	.din0(sdram_download_en ? sdram_download_data : ROM_D),
+ 	.dout0(ROM_Q),
+ 
+-	.rd0(sdram_download_en ? 1'b0 : (!RESET_N | np_refresh) ? RESET_REFRESH : ~ROM_OE_N),
++	.rd0(sdram_download_en ? 1'b0 : !RESET_N ? RESET_REFRESH : ~ROM_OE_N),
++	.rfs_req(np_refresh & RESET_REFRESH),   // netplay freeze: refresh only (rd0 stays still)
+ 	.wr0(sdram_download_en ? sdram_download_wr : ~ROM_WE_N),
+ 	.word0(sdram_download_en | ROM_WORD),
+ 
+@@ -801,7 +826,7 @@ sdram sdram
+ 
+ 	.rd1(clearing_ram ? 1'b0 : ~WRAM_CE_N & ~WRAM_OE_N & READ_PULSE),
+ 	.wr1(clearing_ram ? mem_fill_we : ~WRAM_CE_N & ~WRAM_WE_N & SNES_SYSCLKF_CE),
+-	.rfs1(clearing_ram ? 1'b0 : (!RESET_N | np_refresh) ? RESET_REFRESH : SNES_REFRESH),
++	.rfs1(clearing_ram ? 1'b0 : !RESET_N ? RESET_REFRESH : SNES_REFRESH),
+ 	.word1(0),
+ 
+ 	.sni_addr(SDRAM_SNI_ADDR),
+@@ -883,7 +908,7 @@ wire  [7:0] BSRAM_Q, BSRAM_D;
+ wire [19:0] BSRAM_SNI_ADDR;
+ wire        BSRAM_SNI_RD, BSRAM_SNI_WR;
+ wire [7:0]  BSRAM_SNI_D;
+-wire        BSRAM_SNI_READY = (BSRAM_SNI_RD | BSRAM_SNI_WR) & (BSRAM_CE_N | (BSRAM_OE_N & BSRAM_WE_N));
++wire        BSRAM_SNI_READY = (BSRAM_SNI_RD | BSRAM_SNI_WR) & (BSRAM_CE_N | (BSRAM_OE_N & BSRAM_WE_N)) & ~np_active;
+ 
+ // port a belongs to the machine (clk_emu), port b to the SD card (clk_sys)
+ dpram_difclk #(BSRAM_BITS,8,BSRAM_BITS-1,16) bsram 
+@@ -989,7 +1014,8 @@ netplay netplay
+ (
+ 	.clk         (clk_sys),
+ 	.reset       (~clock_locked),
+-	.downloading (cart_download),
++	.downloading (cart_download | spc_download | msu_data_download | ssbin_download),
++	.machine_run (RESET_N),
+ 	.emu_en      (emu_en),
+ 	.vblank_emu  (~VBlank_out),
+ 	.dotclk_emu  (DOTCLK_out),
+@@ -1081,7 +1107,7 @@ miraclepiano miracle(
+ wire [63:0] SNI_JOY;
+ sni sni(
+ 	.clk(clk_sys),
+-	.reset(reset || uart_mode != 6),
++	.reset(reset || uart_mode != 6 || np_active),   // SNI writes memory on one side only
+ 	.vblank(VBlank),
+ 
+ 	.sdram_addr(SDRAM_SNI_ADDR),
+@@ -1276,7 +1302,7 @@ always @(posedge clk_sys) begin
+ 	if(cart_download && img_mounted && !img_readonly) bk_ena <= |ram_mask;
+ end
+ 
+-wire bk_load    = status[12];
++wire bk_load    = status[12] & ~np_active;   // one side only: not during netplay
+ wire bk_save    = status[13] | (bk_pending & OSD_STATUS && status[23]);
+ reg  bk_loading = 0;
+ reg  bk_state   = 0;
+@@ -1491,12 +1517,12 @@ ddram ddram
+ 	.cache_rst(~RESET_N),
+ 
+ 	.rdaddr({11'b0011_1111_10, ss_ddr_addr[21:3]}), // Save states at $3F80.0000
+-	.dout(ss_ddr_dout),
++	.dout(ss_ddr_dout_d),
+ 	.rom_din(ss_ddr_din),
+ 	.rom_be(ss_ddr_be),
+ 	.rom_we(ss_ddr_we),
+ 	.rom_req(ss_ddr_req),
+-	.rom_ack(ss_ddr_ack),
++	.rom_ack(ss_ddr_ack_d),
+ 
+ 	.rdaddr2(msu_ram_addr), // MSU is at $2060.0000-3F7F.FFFF
+ 	.dout2(msu_ram_dout),
+diff --git a/rtl/netplay.sv b/rtl/netplay.sv
+index 08fb055..e57f55b 100644
+--- a/rtl/netplay.sv
++++ b/rtl/netplay.sv
+@@ -30,6 +30,7 @@ module netplay #(
+ 
+ 	// the emulated machine
+ 	input             emu_en,         // 1: this rising edge of clk is also one of clk_emu
++	input             machine_run,    // the machine is out of reset (SNES.sv RESET_N)
+ 	input             vblank_emu,     // the PPU's VBlank (main's VBLANKn inverted)
+ 	input             dotclk_emu,     // the PPU's DOTCLK
+ 	input      [14:0] color_emu,      // {B[7:3], G[7:3], R[7:3]} of the current dot
+@@ -119,11 +120,17 @@ logic [31:0] crc;
+ 
+ // Emulated-time registers (they change only when emu_en is 1)
+ logic        vbl_prev, dot_prev;
+-wire         tick = vblank_emu && !vbl_prev;          // a frame tick is pending
++// Ticks count only once the machine runs: after PRIME the core leaves reset at
++// the PPU's next HVCNT_ATZERO, up to two frames later, while the PPU's counters
++// (and VBlank) keep running. RESET_N rises on that emulated event, so frame 0
++// starts at the same emulated moment on both sides.
++wire         tick = vblank_emu && !vbl_prev && machine_run;   // a frame tick is pending
+ wire         dot  = dotclk_emu ^ dot_prev;            // a dot edge is pending
+ 
+ wire         run_tick = (state == S_RUN) && tick;
+-assign freeze     = (run_tick && !have0) || (state == S_ERROR);
++// In ERROR the machine stays frozen, except while a new ROM loads (the load
++// clears the machine's RAMs, which needs clk_emu).
++assign freeze     = (run_tick && !have0) || (state == S_ERROR && !downloading);
+ wire         consume  = run_tick && have0 && emu_en;  // frame k starts on this edge
+ 
+ assign active     = (state != S_IDLE);
+diff --git a/rtl/pll.v b/rtl/pll.v
+index efe1b2a..26aa59b 100644
+--- a/rtl/pll.v
++++ b/rtl/pll.v
+@@ -11,6 +11,7 @@ module pll (
+ 		output wire        outclk_0,          //           outclk0.clk
+ 		output wire        outclk_1,          //           outclk1.clk
+ 		output wire        outclk_2,          //           outclk2.clk
++		output wire        outclk_3,          //           outclk3.clk (netplay: clk_emu)
+ 		output wire        locked,            //            locked.export
+ 		input  wire [63:0] reconfig_to_pll,   //   reconfig_to_pll.reconfig_to_pll
+ 		output wire [63:0] reconfig_from_pll  // reconfig_from_pll.reconfig_from_pll
+@@ -22,6 +23,7 @@ module pll (
+ 		.outclk_0          (outclk_0),          //           outclk0.clk
+ 		.outclk_1          (outclk_1),          //           outclk1.clk
+ 		.outclk_2          (outclk_2),          //           outclk2.clk
++		.outclk_3          (outclk_3),          //           outclk3.clk
+ 		.locked            (locked),            //            locked.export
+ 		.reconfig_to_pll   (reconfig_to_pll),   //   reconfig_to_pll.reconfig_to_pll
+ 		.reconfig_from_pll (reconfig_from_pll)  // reconfig_from_pll.reconfig_from_pll
+diff --git a/rtl/pll/pll_0002.v b/rtl/pll/pll_0002.v
+index 2a4ea36..cb252fc 100644
+--- a/rtl/pll/pll_0002.v
++++ b/rtl/pll/pll_0002.v
+@@ -16,6 +16,9 @@ module  pll_0002(
+ 	// interface 'outclk2'
+ 	output wire outclk_2,
+ 
++	// interface 'outclk3': a copy of outclk2 for the gated clk_emu (netplay)
++	output wire outclk_3,
++
+ 	// interface 'locked'
+ 	output wire locked,
+ 
+@@ -32,7 +35,7 @@ module  pll_0002(
+ 		.pll_fractional_cout(32),
+ 		.pll_dsm_out_sel("1st_order"),
+ 		.operation_mode("direct"),
+-		.number_of_clocks(3),
++		.number_of_clocks(4),
+ 		.output_clock_frequency0("85.909080 MHz"),
+ 		.phase_shift0("0 ps"),
+ 		.duty_cycle0(50),
+@@ -42,7 +45,7 @@ module  pll_0002(
+ 		.output_clock_frequency2("21.477270 MHz"),
+ 		.phase_shift2("0 ps"),
+ 		.duty_cycle2(50),
+-		.output_clock_frequency3("0 MHz"),
++		.output_clock_frequency3("21.477270 MHz"),
+ 		.phase_shift3("0 ps"),
+ 		.duty_cycle3(50),
+ 		.output_clock_frequency4("0 MHz"),
+@@ -118,12 +121,12 @@ module  pll_0002(
+ 		.c_cnt_in_src2("ph_mux_clk"),
+ 		.c_cnt_bypass_en2("false"),
+ 		.c_cnt_odd_div_duty_en2("false"),
+-		.c_cnt_hi_div3(1),
+-		.c_cnt_lo_div3(1),
++		.c_cnt_hi_div3(10),
++		.c_cnt_lo_div3(10),
+ 		.c_cnt_prst3(1),
+ 		.c_cnt_ph_mux_prst3(0),
+ 		.c_cnt_in_src3("ph_mux_clk"),
+-		.c_cnt_bypass_en3("true"),
++		.c_cnt_bypass_en3("false"),
+ 		.c_cnt_odd_div_duty_en3("false"),
+ 		.c_cnt_hi_div4(1),
+ 		.c_cnt_lo_div4(1),
+@@ -235,7 +238,7 @@ module  pll_0002(
+ 		.pll_slf_rst("true")
+ 	) altera_pll_i (
+ 		.rst	(rst),
+-		.outclk	({outclk_2, outclk_1, outclk_0}),
++		.outclk	({outclk_3, outclk_2, outclk_1, outclk_0}),
+ 		.locked	(locked),
+ 		.reconfig_to_pll	(reconfig_to_pll),
+ 		.fboutclk	( ),
+diff --git a/rtl/sdram.sv b/rtl/sdram.sv
+index 009c735..3a9a25a 100644
+--- a/rtl/sdram.sv
++++ b/rtl/sdram.sv
+@@ -22,6 +22,7 @@ module sdram
+ 	input             wr0,
+ 	input             rd0,
+ 	input             word0,
++	input             rfs_req,      // netplay freeze: a rising edge asks for one refresh (SPEC.md 10.1)
+ 	
+ 	input     [23: 0] addr1,
+ 	input     [15: 0] din1,
+@@ -165,6 +166,7 @@ module sdram
+ 		can_start_sni;
+ 
+ 	reg old_rd0, old_rd1, old_wr0, old_wr1, old_sni_rd, old_sni_wr;
++	reg old_rfs_req;
+ 	always @(posedge clk) begin
+ 		if (!init_done) begin
+ 			st_num <= 4'd8;
+@@ -253,6 +255,15 @@ module sdram
+ 				st_num <= 1;
+ 			end
+ 
++			// Netplay freeze: a refresh without an rd0 edge, so no read is issued
++			// and the latched address stays. Only while idle; the machine is
++			// frozen, so no regular request comes in meanwhile.
++			old_rfs_req <= rfs_req;
++			if (rfs_req && !old_rfs_req && st_num == 4'd8 && !read[0] && !read[1] && !write[0] && !write[1]) begin
++				rfs <= 1;
++				st_num <= 1;
++			end
++
+ 			// Handle regular requests. If we started a conflicting SNI request, preempt it.
+ 			if (wr0 && !old_wr0) begin
+ 				if (sni_read_ch1) begin
+diff --git a/sim/sim_top.sv b/sim/sim_top.sv
+index 8491f25..c1b17d0 100644
+--- a/sim/sim_top.sv
++++ b/sim/sim_top.sv
+@@ -123,6 +123,7 @@ netplay #(.POLL_INTERVAL(64), .CTRL_INTERVAL(512)) netplay
+ 	.clk         (clk_sys),
+ 	.reset       (~np_enable_d),
+ 	.downloading (1'b0),
++	.machine_run (RESET_N),
+ 	.emu_en      (en_l),
+ 	.vblank_emu  (~VBLANKn_o),
+ 	.dotclk_emu  (DOTCLK_o),
+diff --git a/sim/snes_sim.cpp b/sim/snes_sim.cpp
+index c2c5eda..900bba6 100644
+--- a/sim/snes_sim.cpp
++++ b/sim/snes_sim.cpp
+@@ -241,6 +241,7 @@ struct FakeHps {
+ 	uint8_t sess;
+ 	int phase = 0;                      // 0 wait MAGIC, 1 armed, 2 running
+ 	uint64_t t_armed = 0;
++	uint64_t load_cycles = 20000;      // how long "the ROM load" takes on this side
+ 	uint32_t next_local = 0;            // next LOCAL frame to collect
+ 	std::map<uint32_t, uint16_t> mine, peer;   // LOCAL by frame
+ 	uint32_t next_input;                // next INPUT frame to write
+@@ -271,7 +272,7 @@ struct FakeHps {
+ 			return;
+ 		}
+ 		if (phase == 1) {
+-			if (now - t_armed < 20000) return;            // "the ROM load"
++			if (now - t_armed < load_cycles) return;      // "the ROM load"
+ 			for (int f = 0; f < delay; f++) wr(OFF_INPUT + (f & 0xFF) * 8, input_word(f, 0, 0));
+ 			wr(OFF_CTRL, (CTRL_MAGIC << 32) | ((uint64_t)sess << 8) | 3);
+ 			phase = 2;
+@@ -313,6 +314,10 @@ static int run_netplay(const std::vector<uint8_t> &rom, const Cart &cart, int fr
+ 	h.rng = 0x1234567 + seed * 7; j.rng = 0x7654321 + seed * 13;
+ 	for (Machine *m : { &h, &j }) { m->top->np_enable = 1; m->top->eval(); }
+ 	FakeHps hh(h, true, delay, 0x5A), hj(j, false, delay, 0x5A);
++	// the two sides leave PRIME at unrelated moments (SPEC.md 10.2): up to 2.5
++	// frames apart, so the core's wait for HVCNT_ATZERO differs between them
++	hj.load_cycles += (uint64_t)(seed * 2654435761ULL % 900000);
++	printf("join starts %llu cycles after the host\n", (unsigned long long)(hj.load_cycles - hh.load_cycles));
+ 	struct Pkt { uint64_t at; uint32_t f; uint16_t joy; };
+ 	std::deque<Pkt> to_j, to_h;
+ 	srand48(seed);
+-- 
+2.43.0
+

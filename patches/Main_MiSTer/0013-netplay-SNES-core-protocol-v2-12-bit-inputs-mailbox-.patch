@@ -1,0 +1,1286 @@
+From aec67f3698340cab9cb9474514ae92477ff4d816 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 3 Nov 2026 19:54:36 +0100
+Subject: [PATCH] netplay: SNES core (protocol v2, 12-bit inputs, mailbox at
+ 0x3FC00000)
+
+The SNES core is recognised by name. Its mailbox, magic and 12-bit
+entry format follow SPEC.md 10.3; HELLO carries a system byte and INPUT
+16-bit samples (version 2). NES stays version 1 byte for byte. SNES
+settings go into HELLO; WRAM/ARAM must be 00FF or FF; MSU-1, BS-X,
+real-time clocks and the competition carts are refused. Recordings
+NPR3 with 16-bit samples. The lobby looks for .sfc/.smc and asks the
+server for this core's games. Tests: SNES engine tests and NP_SYSTEM=snes
+UDP runs, directly and through a server.
+---
+ support/netplay/netplay.cpp           | 137 ++++++++++++++++++++------
+ support/netplay/netplay_proto.cpp     |  56 +++++++++--
+ support/netplay/netplay_proto.h       |  67 +++++++++++--
+ support/netplay/netplay_session.cpp   |  48 +++++----
+ support/netplay/netplay_session.h     |  20 ++--
+ support/netplay/test/Makefile         |   7 +-
+ support/netplay/test/fake_fpga.h      |  36 ++++---
+ support/netplay/test/run_udp_test.sh  |  10 +-
+ support/netplay/test/test_netplay.cpp | 114 +++++++++++++++++++--
+ support/netplay/test/udp_harness.cpp  |  50 +++++++---
+ 10 files changed, 425 insertions(+), 120 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index db40342..d2b9d3f 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -1,4 +1,4 @@
+-// netplay.cpp — NES lockstep netplay, Main_MiSTer integration (SPEC.md 7)
++// netplay.cpp — NES and SNES lockstep netplay, Main_MiSTer integration (SPEC.md 7, 10)
+ //
+ // Threading: everything that touches SPI or the OSD (status bits, ROM reload,
+ // Info boxes) runs on the main thread in netplay_poll()/netplay_note_file().
+@@ -37,6 +37,7 @@
+ #include "../../file_io.h"
+ #include "../../menu.h"
+ #include "md5.h"
++#include "../snes/snes.h"
+ 
+ #include "netplay.h"
+ #include "netplay_proto.h"
+@@ -556,7 +557,8 @@ private:
+ };
+ 
+ // ---------------------------------------------------------------------------
+-// Recordings (.npr): "NPR2", rom md5[16], u8 delay, u32 frames, joy[frames], u32 crcs, crc[crcs]
++// Recordings (.npr): "NPR2", rom md5[16], u8 delay, u32 frames, joy[frames], u32 crcs, crc[crcs]   (NES)
++//                   "NPR3", rom md5[16], u8 delay, u8 system, u32 frames, u16 joy[frames], u32 crcs, crc[crcs]
+ 
+ static bool save_recording(const char *path, const Recording &r, const uint8_t *md5)
+ {
+@@ -568,8 +570,13 @@ static bool save_recording(const char *path, const Recording &r, const uint8_t *
+ 	FILE *f = fopen(path, "wb");
+ 	if (!f) return false;
+ 	uint32_t n = (uint32_t)r.joy.size(), m = (uint32_t)r.crc.size();
+-	bool ok = fwrite("NPR2", 4, 1, f) == 1 && fwrite(md5, 16, 1, f) == 1
+-	       && fwrite(&r.delay, 1, 1, f) == 1 && fwrite(&n, 4, 1, f) == 1 && (!n || fwrite(r.joy.data(), n, 1, f) == 1)
++	bool wide = r.system == SYS_SNES;
++	uint8_t sys = r.system;
++	std::vector<uint8_t> narrow;
++	if (!wide) for (uint16_t j : r.joy) narrow.push_back((uint8_t)j);
++	bool ok = fwrite(wide ? "NPR3" : "NPR2", 4, 1, f) == 1 && fwrite(md5, 16, 1, f) == 1
++	       && fwrite(&r.delay, 1, 1, f) == 1 && (!wide || fwrite(&sys, 1, 1, f) == 1) && fwrite(&n, 4, 1, f) == 1
++	       && (!n || (wide ? fwrite(r.joy.data(), 2 * n, 1, f) : fwrite(narrow.data(), n, 1, f)) == 1)
+ 	       && fwrite(&m, 4, 1, f) == 1 && (!m || fwrite(r.crc.data(), 4 * m, 1, f) == 1);
+ 	fclose(f);
+ 	return ok;
+@@ -581,10 +588,21 @@ static bool load_recording(const char *path, Recording *r, uint8_t *md5)
+ 	if (!f) return false;
+ 	char magic[4];
+ 	uint32_t n = 0, m = 0;
+-	bool ok = fread(magic, 4, 1, f) == 1 && !memcmp(magic, "NPR2", 4) && fread(md5, 16, 1, f) == 1
++	uint8_t sys = SYS_NES;
++	bool ok = fread(magic, 4, 1, f) == 1 && (!memcmp(magic, "NPR2", 4) || !memcmp(magic, "NPR3", 4));
++	bool wide = ok && magic[3] == '3';
++	ok = ok && fread(md5, 16, 1, f) == 1
+ 	       && fread(&r->delay, 1, 1, f) == 1 && r->delay >= 2 && r->delay <= 15
++	       && (!wide || (fread(&sys, 1, 1, f) == 1 && sys == SYS_SNES))
+ 	       && fread(&n, 4, 1, f) == 1 && n < 10000000;
+-	if (ok) { r->joy.resize(n); ok = !n || fread(r->joy.data(), n, 1, f) == 1; }
++	r->system = (System)sys;
++	if (ok && wide) { r->joy.resize(n); ok = !n || fread(r->joy.data(), 2 * n, 1, f) == 1; }
++	else if (ok)
++	{
++		std::vector<uint8_t> narrow(n);
++		ok = !n || fread(narrow.data(), n, 1, f) == 1;
++		r->joy.assign(narrow.begin(), narrow.end());
++	}
+ 	if (ok) ok = fread(&m, 4, 1, f) == 1 && m < 10000000;
+ 	if (ok) { r->crc.resize(m); ok = !m || fread(r->crc.data(), 4 * m, 1, f) == 1; }
+ 	fclose(f);
+@@ -604,9 +622,17 @@ static std::string        index_path;         // netplay/index-<core>.txt (full
+ static Config            cfg;
+ static pthread_t         thread;
+ static bool              thread_running = false;
+-static bool              nes_armed = false;  // an NES core is loaded; the thread starts with the first netplay ROM
++static bool              core_armed = false; // a netplay core is loaded; the thread starts with the first netplay ROM
++static System            core_sys = SYS_NES; // which one (set at core load)
+ static std::atomic<bool> quit { false };
+ 
++// The core's game files
++static bool is_game_ext(const char *ext)
++{
++	if (core_sys == SYS_SNES) return !strcasecmp(ext, ".sfc") || !strcasecmp(ext, ".smc");
++	return !strcasecmp(ext, ".nes");
++}
++
+ static std::mutex        info_mtx;          // guards the fields below
+ static LocalInfo         rom_info;
+ static std::string       rom_path;
+@@ -667,7 +693,7 @@ static void game_name(const std::string &path, char *out, size_t cap)
+ 
+ static void *netplay_thread(void *)
+ {
+-	volatile uint8_t *mem = (volatile uint8_t *)shmem_map(MB_PHYS, MB_SIZE);
++	volatile uint8_t *mem = (volatile uint8_t *)shmem_map(mailbox_phys(core_sys), MB_SIZE);
+ 	if (!mem) { post_message("Netplay: cannot map DDR3 mailbox"); return nullptr; }
+ 	Mailbox mb { mem };
+ 
+@@ -704,6 +730,7 @@ static void *netplay_thread(void *)
+ 			delete udp; udp = nullptr;      // leaves the server's room
+ 			lobby_host("");
+ 			rec = Recording();
++			rec.system = core_sys;
+ 			saved = false;
+ 			left = false;
+ 			reload_req = false;
+@@ -1019,8 +1046,8 @@ static void index_dir(const std::string &dir, int depth, std::map<std::string, I
+ 		if (stat(p.c_str(), &st)) continue;
+ 		if (S_ISDIR(st.st_mode)) { index_dir(p, depth + 1, cache, now); continue; }
+ 		size_t dot = n.rfind('.');
+-		if (!S_ISREG(st.st_mode) || dot == std::string::npos || strcasecmp(n.c_str() + dot, ".nes")) continue;
+-		if (st.st_size < 16 || st.st_size > (4 << 20)) continue;
++		if (!S_ISREG(st.st_mode) || dot == std::string::npos || !is_game_ext(n.c_str() + dot)) continue;
++		if (st.st_size < 16 || st.st_size > (core_sys == SYS_SNES ? (16 << 20) : (4 << 20))) continue;
+ 		auto c = cache.find(p);
+ 		if (c != cache.end() && c->second.size == (long long)st.st_size && c->second.mtime == (long long)st.st_mtime)
+ 		{
+@@ -1081,7 +1108,7 @@ static void *index_thread(void *)
+ // ---------------------------------------------------------------------------
+ // The lobby: <games>/_Netplay is a RAM folder (tmpfs) with "Server games" (the
+ // server's roms folder, md5-checked) and "Rooms": one folder per waiting room,
+-// "<name> - <game>/<game>.nes" (SPEC.md 7, "Server and lobby").
++// "<name> - <game>/<game>.nes" (.sfc for SNES; SPEC.md 7, "Server and lobby").
+ // The OSD file browser re-reads a folder each time it is opened. Loading a
+ // file from Rooms joins that room. Nothing is written to the SD card.
+ 
+@@ -1104,10 +1131,14 @@ static void download_games(const std::string &key)
+ {
+ 	int got = 0, offered = 0;
+ 	std::string list;
+-	if (srv_mounted && http_get("/roms?" + key, &list, 1 << 20))
++	// the server's games for this core: roms/<core>/ (NES also roms/ itself)
++	std::string core_q = "&core=" + url_enc(core_name.c_str());
++	unsigned long max_size = core_sys == SYS_SNES ? (8u << 20) : (4u << 20);
++	if (srv_mounted && http_get("/roms?" + key + core_q, &list, 1 << 20))
+ 	{
+ 		size_t total = 0;                                  // keep room in the 48 MB for room copies
+-		struct Ctx { int *got, *offered; const std::string *key; size_t *total; } ctx { &got, &offered, &key, &total };
++		std::string kq = key + core_q;
++		struct Ctx { int *got, *offered; const std::string *key; size_t *total; unsigned long max; } ctx { &got, &offered, &kq, &total, max_size };
+ 		for_lines(list, [](const std::string &md5, const std::string &rest, void *a) {
+ 			Ctx *c = (Ctx *)a;
+ 			if (dl_quit || !is_hex(md5, 32)) return;
+@@ -1115,11 +1146,11 @@ static void download_games(const std::string &key)
+ 			if (sp == std::string::npos) return;
+ 			std::string name = rest.substr(sp + 1);
+ 			unsigned long size = strtoul(rest.c_str(), nullptr, 10);
+-			if (clean_file(name, 120) != name || name.empty() || size > (4u << 20)) return;
++			if (clean_file(name, 120) != name || name.empty() || size > c->max) return;
+ 			(*c->offered)++;
+ 			if (*c->total + size > (32u << 20)) return;
+ 			std::string data;
+-			if (!http_get("/rom?" + *c->key + "&name=" + url_enc(name.c_str()), &data, 4u << 20)) return;
++			if (!http_get("/rom?" + *c->key + "&name=" + url_enc(name.c_str()), &data, c->max)) return;
+ 			MD5Context m;
+ 			uint8_t d[16];
+ 			MD5Init(&m);
+@@ -1222,7 +1253,7 @@ static void update_rooms(const std::string &list)
+ 		}
+ 		if (!src.empty() && copy_failed.count(f[3])) src.clear();
+ 		// The room is a folder with the game under the host's file name, so the
+-		// core's .sav is saves/NES/<game>.sav on both sides.
++		// core's .sav is saves/<core>/<game>.sav on both sides.
+ 		std::string entry;
+ 		for (int n = 1; n < 10; n++)
+ 		{
+@@ -1230,7 +1261,10 @@ static void update_rooms(const std::string &list)
+ 			entry = src.empty() ? b + " (missing game)" : b;
+ 			if (!want.count(entry)) break;
+ 		}
+-		want[entry] = Want { RoomFile { f[0], f[3] }, src, game + ".nes" };
++		size_t sdot = src.rfind('.');
++		std::string ext = (sdot != std::string::npos && is_game_ext(src.c_str() + sdot)) ? src.substr(sdot)
++		                : (core_sys == SYS_SNES ? ".sfc" : ".nes");
++		want[entry] = Want { RoomFile { f[0], f[3] }, src, game + ext };
+ 	}
+ 
+ 	// remove what is no longer wanted (or no longer the same room)
+@@ -1378,9 +1412,38 @@ static bool room_of(const std::string &full, uint32_t seq, RoomFile *out)
+ 	return true;
+ }
+ 
+-static bool is_nes_core()
++// The loaded core: SYS_NES, SYS_SNES, or -1 for one without netplay
++static int netplay_system()
+ {
+-	return !strcasecmp(user_io_get_core_name(), "NES");
++	const char *n = user_io_get_core_name();
++	if (!strcasecmp(n, "NES")) return SYS_NES;
++	if (!strcasecmp(n, "SNES")) return SYS_SNES;
++	return -1;
++}
++
++// SNES (SPEC.md 10.2): 1 if the cartridge needs something that cannot be the
++// same on both sides: MSU-1 (streamed from the SD card), BS-X, a real-time
++// clock (S-RTC, SPC7110 with RTC), or the competition carts' timers.
++static uint8_t snes_refused(const char *name)
++{
++	const char *dot = strrchr(name, '.');
++	if (dot && !strcasecmp(dot, ".bs")) return 1;
++	std::string msu = name;
++	size_t d = msu.rfind('.');
++	if (d != std::string::npos) msu.resize(d);
++	msu += ".msu";
++	if (FileExists(msu.c_str())) return 1;
++	fileTYPE f = {};
++	if (!FileOpen(&f, name, 1)) return 1;
++	uint8_t t = snes_get_header(&f)[1];     // ROM type as the core gets it
++	FileClose(&f);
++	uint8_t chip = t >> 4, map = t & 0x0F;
++	if (t == 0x30) return 1;                          // BS-X BIOS
++	if (chip == 0x0 && (map & 0x08)) return 1;        // S-RTC
++	if (chip == 0x0 && map == 3) return 1;            // LoROM with a BS-X slot
++	if (chip == 0xD && (map & 0x08)) return 1;        // SPC7110 with RTC
++	if (chip == 0xE || chip == 0xF) return 1;         // Campus Challenge '92, PowerFest '94
++	return 0;
+ }
+ 
+ static void core_build(uint8_t out[16])
+@@ -1417,14 +1480,14 @@ static void start_thread();
+ 
+ void netplay_note_file(const char *name, unsigned char index, char opensave)
+ {
+-	if (!nes_armed || own_reload || !is_nes_core()) return;
+-	// Only the game slot ("FS,NESFDSNSF", OSD index 1) starts a session. Index 0
+-	// is boot0.rom, 2 the FDS BIOS, 3 a custom palette.
++	if (!core_armed || own_reload || netplay_system() != core_sys) return;
++	// Only the game slot (OSD index 1) starts a session. NES: index 0 is
++	// boot0.rom, 2 the FDS BIOS, 3 a custom palette. SNES: 4 is an SPC file.
+ 	if ((index & 0x3F) != 1) return;
+ 
+-	// OSD "Netplay" [89:88]: 0 netplay.ini, 1 Off, 2 Host, 3 Join
++	// OSD "Netplay" (NES [89:88], SNES [59:58]): 0 netplay.ini, 1 Off, 2 Host, 3 Join
+ 	static const Mode osd_modes[4] = { M_OFF, M_OFF, M_HOST, M_JOIN };
+-	uint32_t osd = user_io_status_get("[89:88]");
++	uint32_t osd = user_io_status_get(core_sys == SYS_SNES ? "[59:58]" : "[89:88]");
+ 	Mode mode = osd ? osd_modes[osd & 3] : cfg.mode;
+ 	std::string room;
+ 	if (cfg.server[0])
+@@ -1448,6 +1511,7 @@ void netplay_note_file(const char *name, unsigned char index, char opensave)
+ 	if (mode == M_OFF && !thread_running) return;   // nothing to stop, nothing to start
+ 
+ 	LocalInfo li {};
++	li.system = core_sys;
+ 	uint8_t hdr[16] = {};
+ 	if (!md5_file(name, li.rom_md5, hdr, sizeof(hdr))) return;
+ 	if (cfg.server[0])
+@@ -1457,17 +1521,28 @@ void netplay_note_file(const char *name, unsigned char index, char opensave)
+ 			post_message("Netplay: not the server's version of this game");
+ 	}
+ 	const char *dot = strrchr(name, '.');
+-	li.rom_region = rom_region_from_header(hdr, sizeof(hdr), dot ? dot + 1 : "");
++	li.rom_region = core_sys == SYS_SNES ? snes_refused(name) : rom_region_from_header(hdr, sizeof(hdr), dot ? dot + 1 : "");
+ 	core_build(li.core_build);
+ 
+ 	// .sav next to the other saves, same base name
+ 	const char *base = strrchr(name, '/');
+-	std::string sav = std::string("saves/NES/") + (base ? base + 1 : name);
++	std::string sav = std::string("saves/") + core_name + "/" + (base ? base + 1 : name);
+ 	size_t d = sav.rfind('.');
+ 	if (d != std::string::npos) sav.resize(d);
+ 	sav += ".sav";
+ 	if (!md5_file(sav.c_str(), li.sav_md5, nullptr, 0)) memset(li.sav_md5, 0, 16);
+ 
++	if (core_sys == SYS_SNES)
++	{
++		li.snes.region      = (uint8_t)user_io_status_get("[15:14]");
++		li.snes.header      = (uint8_t)user_io_status_get("[3:1]");
++		li.snes.blend_off   = (uint8_t)user_io_status_get("[16]");
++		li.snes.aclk        = (uint8_t)user_io_status_get("[30]");
++		li.snes.wram        = (uint8_t)user_io_status_get("[22:21]");
++		li.snes.aram        = (uint8_t)user_io_status_get("[45:44]");
++		li.snes.gsu_slowrom = (uint8_t)user_io_status_get("[46]");
++		li.snes.sufami_swap = (uint8_t)user_io_status_get("[31]");
++	}
+ 	li.settings.sys_type   = (uint8_t)user_io_status_get("[72:70]");
+ 	li.settings.ram_clear  = (uint8_t)user_io_status_get("[66:65]");
+ 	li.settings.ppu_reset  = (uint8_t)user_io_status_get("[64]");
+@@ -1506,17 +1581,19 @@ static void start_thread()
+ // option can still host (port 7845, delay 2); Join needs its peer=.
+ void netplay_start(void)
+ {
+-	if (thread_running || !is_nes_core()) return;
++	int sys = netplay_system();
++	if (thread_running || sys < 0) return;
++	core_sys = (System)sys;
+ 	cfg = Config();
+ 	load_config(&cfg);
+ 	core_name = user_io_get_core_name();
+-	nes_armed = true;
++	core_armed = true;
+ 	if (cfg.server[0]) server_games_start();
+ }
+ 
+ void netplay_stop(void)
+ {
+-	nes_armed = false;
++	core_armed = false;
+ 	server_games_stop();
+ 	if (!thread_running) return;
+ 	quit = true;
+@@ -1526,7 +1603,7 @@ void netplay_stop(void)
+ 
+ void netplay_poll(void)
+ {
+-	if (!thread_running && !nes_armed) return;   // lobby messages come before any session
++	if (!thread_running && !core_armed) return;   // lobby messages come before any session
+ 
+ 	if (reload_req)
+ 	{
+diff --git a/support/netplay/netplay_proto.cpp b/support/netplay/netplay_proto.cpp
+index 18363a4..695214a 100644
+--- a/support/netplay/netplay_proto.cpp
++++ b/support/netplay/netplay_proto.cpp
+@@ -10,13 +10,21 @@ namespace netplay {
+ // ---------------------------------------------------------------------------
+ // Mailbox
+ 
+-bool decode_local(uint64_t w, uint32_t frame, uint8_t session, uint8_t *joy)
++bool decode_local(System s, uint64_t w, uint32_t frame, uint8_t session, uint16_t *joy)
+ {
+ 	uint32_t hi = (uint32_t)(w >> 32), lo = (uint32_t)w;
+-	uint32_t tag = (frame & 0xFFFF) << 16 | (uint32_t)session << 8;
+-	if ((hi & 0xFFFFFF00) != tag || (lo & 0xFFFFFF00) != tag) return false;
+-	if ((hi & 0xFF) != (lo & 0xFF)) return false;
+-	*joy = (uint8_t)lo;
++	uint32_t tag = entry_tag(s, frame, session), m = joy_mask(s);
++	if ((hi & ~m) != tag || (lo & ~m) != tag) return false;
++	if ((hi & m) != (lo & m)) return false;
++	*joy = (uint16_t)(lo & m);
++	return true;
++}
++
++bool decode_local(uint64_t w, uint32_t frame, uint8_t session, uint8_t *joy)
++{
++	uint16_t j;
++	if (!decode_local(SYS_NES, w, frame, session, &j)) return false;
++	*joy = (uint8_t)j;
+ 	return true;
+ }
+ 
+@@ -53,6 +61,18 @@ uint32_t pack_settings(const Settings &s)
+ 	     | (uint32_t)(s.debug_dots & 1) << 12;
+ }
+ 
++uint32_t pack_settings(const SnesSettings &s)
++{
++	return (uint32_t)(s.region & 3)
++	     | (uint32_t)(s.header & 7) << 2
++	     | (uint32_t)(s.blend_off & 1) << 5
++	     | (uint32_t)(s.aclk & 1) << 6
++	     | (uint32_t)(s.wram & 3) << 7
++	     | (uint32_t)(s.aram & 3) << 9
++	     | (uint32_t)(s.gsu_slowrom & 1) << 11
++	     | (uint32_t)(s.sufami_swap & 1) << 12;
++}
++
+ const char *reject_text(uint8_t r)
+ {
+ 	switch (r)
+@@ -68,6 +88,8 @@ const char *reject_text(uint8_t r)
+ 	case REJ_SYSTEM:    return "Only NTSC/PAL cartridges";
+ 	case REJ_DELAY:     return "Delay must be 2-15";
+ 	case REJ_BUSY:      return "Host is busy";
++	case REJ_CHIP:      return "Game chip not supported in netplay";
++	case REJ_OTHER_SYSTEM: return "The other player runs another console";
+ 	default:          return "Rejected";
+ 	}
+ }
+@@ -82,6 +104,16 @@ uint8_t check_local(const Settings &s, uint8_t rom_region, uint8_t delay)
+ 	return REJ_OK;
+ }
+ 
++uint8_t check_local(const SnesSettings &s, uint8_t rom_ok, uint8_t delay)
++{
++	if (delay < 2 || delay > 15) return REJ_DELAY;
++	// Initial WRAM / ARAM: 0 9966, 1 00FF, 2 55, 3 FF. The patterns are fixed, but
++	// SPEC.md 10.4 allows only the two that are the same on every console.
++	if ((s.wram != 1 && s.wram != 3) || (s.aram != 1 && s.aram != 3)) return REJ_RAM_CLEAR;
++	if (rom_ok) return REJ_CHIP;
++	return REJ_OK;
++}
++
+ uint8_t rom_region_from_header(const uint8_t *hdr, size_t len, const char *ext)
+ {
+ 	if (ext && (!strcasecmp(ext, "fds") || !strcasecmp(ext, "nsf"))) return 3;
+@@ -136,7 +168,7 @@ struct Reader
+ 
+ } // namespace
+ 
+-size_t encode(const Packet &p, uint8_t *buf, size_t cap)
++size_t encode(const Packet &p, uint8_t *buf, size_t cap, bool wide)
+ {
+ 	Writer w{buf, cap, 0, true};
+ 	w.u32(PKT_MAGIC);
+@@ -148,6 +180,7 @@ size_t encode(const Packet &p, uint8_t *buf, size_t cap)
+ 	case P_HELLO:
+ 	case P_HELLO_ACK:
+ 		w.u8(p.hello.version);
++		if (p.hello.version >= 2) w.u8(p.hello.system);
+ 		w.raw(p.hello.core_build, 16);
+ 		w.raw(p.hello.rom_md5, 16);
+ 		w.raw(p.hello.sav_md5, 16);
+@@ -167,7 +200,11 @@ size_t encode(const Packet &p, uint8_t *buf, size_t cap)
+ 		if (p.input.count == 0 || p.input.count > MAX_HISTORY) return 0;
+ 		w.u32(p.input.first_frame);
+ 		w.u8(p.input.count);
+-		w.raw(p.input.joy, p.input.count);
++		for (int i = 0; i < p.input.count; i++)
++		{
++			if (wide) w.u16(p.input.joy[i]);
++			else w.u8((uint8_t)p.input.joy[i]);
++		}
+ 		break;
+ 
+ 	case P_CRC:
+@@ -186,7 +223,7 @@ size_t encode(const Packet &p, uint8_t *buf, size_t cap)
+ 	return w.ok ? w.n : 0;
+ }
+ 
+-bool decode(const uint8_t *buf, size_t len, Packet *p)
++bool decode(const uint8_t *buf, size_t len, Packet *p, bool wide)
+ {
+ 	Reader r{buf, len, 0, true};
+ 	memset(p, 0, sizeof(*p));
+@@ -199,6 +236,7 @@ bool decode(const uint8_t *buf, size_t len, Packet *p)
+ 	case P_HELLO:
+ 	case P_HELLO_ACK:
+ 		p->hello.version = r.u8();
++		p->hello.system = p->hello.version >= 2 ? r.u8() : (uint8_t)SYS_NES;
+ 		r.raw(p->hello.core_build, 16);
+ 		r.raw(p->hello.rom_md5, 16);
+ 		r.raw(p->hello.sav_md5, 16);
+@@ -218,7 +256,7 @@ bool decode(const uint8_t *buf, size_t len, Packet *p)
+ 		p->input.first_frame = r.u32();
+ 		p->input.count = r.u8();
+ 		if (!r.ok || p->input.count == 0 || p->input.count > MAX_HISTORY) return false;
+-		r.raw(p->input.joy, p->input.count);
++		for (int i = 0; i < p->input.count; i++) p->input.joy[i] = wide ? r.u16() : r.u8();
+ 		break;
+ 
+ 	case P_CRC:
+diff --git a/support/netplay/netplay_proto.h b/support/netplay/netplay_proto.h
+index 4b60e45..84beb41 100644
+--- a/support/netplay/netplay_proto.h
++++ b/support/netplay/netplay_proto.h
+@@ -1,4 +1,4 @@
+-// netplay_proto.h — NES netplay: wire format and mailbox layout (SPEC.md 4, 7)
++// netplay_proto.h — NES and SNES netplay: wire format and mailbox layout (SPEC.md 4, 7, 10)
+ //
+ // Pure data handling with no I/O, so it builds and is unit tested on x86.
+ 
+@@ -11,9 +11,16 @@
+ namespace netplay {
+ 
+ // ---------------------------------------------------------------------------
+-// DDR3 mailbox, shared with rtl/netplay.sv
++// The two systems. NES keeps protocol version 1 byte for byte (Mesen speaks it);
++// SNES is version 2: a system byte in HELLO and 16-bit input samples.
+ 
+-constexpr uint32_t MB_PHYS       = 0x3C000000;
++enum System : uint8_t { SYS_NES = 0, SYS_SNES = 1 };
++
++// ---------------------------------------------------------------------------
++// DDR3 mailbox, shared with rtl/netplay.sv of each core
++
++constexpr uint32_t MB_PHYS       = 0x3C000000;   // NES
++constexpr uint32_t MB_PHYS_SNES  = 0x3FC00000;   // SNES (SPEC.md 10.3)
+ constexpr uint32_t MB_SIZE       = 0x4000;
+ 
+ constexpr uint32_t MB_MAGIC      = 0x0000;
+@@ -25,6 +32,10 @@ constexpr uint32_t MB_INPUT      = 0x2000;
+ constexpr uint32_t MB_RING       = 256;
+ 
+ constexpr uint64_t MAGIC_VALUE   = 0x313030504E53454EULL;   // "NESNP001"
++constexpr uint64_t MAGIC_SNES    = 0x3130504E53454E53ULL;   // "SNESNP01"
++
++inline uint32_t mailbox_phys(System s) { return s == SYS_SNES ? MB_PHYS_SNES : MB_PHYS; }
++inline uint64_t mailbox_magic(System s) { return s == SYS_SNES ? MAGIC_SNES : MAGIC_VALUE; }
+ 
+ enum FpgaState : uint8_t { FS_IDLE = 0, FS_ARMED = 1, FS_PRIME = 2, FS_RUN = 3, FS_ERROR = 4 };
+ enum FpgaError : uint8_t { FE_UNDERRUN = 1, FE_CTRL_DROP = 2, FE_RELOAD = 4 };
+@@ -51,16 +62,29 @@ inline uint64_t ctrl_word(bool enable, bool run, uint8_t session)
+ 
+ // INPUT[f]: both 32-bit halves carry the frame tag and session, so a torn
+ // 64-bit store is never mistaken for a valid entry.
++//   NES:  {f[15:0], sess[7:0], joy[7:0]}     SNES: {f[11:0], sess[7:0], joy[11:0]}
++inline uint32_t entry_tag(System s, uint32_t frame, uint8_t session)
++{
++	return s == SYS_SNES ? (frame & 0xFFF) << 20 | (uint32_t)session << 12
++	                     : (frame & 0xFFFF) << 16 | (uint32_t)session << 8;
++}
++inline uint32_t joy_mask(System s) { return s == SYS_SNES ? 0xFFF : 0xFF; }
++
++inline uint64_t input_word(System s, uint32_t frame, uint8_t session, uint16_t p1, uint16_t p2)
++{
++	uint32_t tag = entry_tag(s, frame, session);
++	return (uint64_t)(tag | (p2 & joy_mask(s))) << 32 | (tag | (p1 & joy_mask(s)));
++}
+ inline uint64_t input_word(uint32_t frame, uint8_t session, uint8_t p1, uint8_t p2)
+ {
+-	uint32_t tag = (uint32_t)(frame & 0xFFFF) << 16 | (uint32_t)session << 8;
+-	return (uint64_t)(tag | p2) << 32 | (tag | p1);
++	return input_word(SYS_NES, frame, session, p1, p2);
+ }
+ 
+ // Words that can never decode as valid: tags in the two halves differ.
+ constexpr uint64_t INVALID_WORD  = 0xFFFF000000000000ULL;
+ 
+-bool decode_local(uint64_t w, uint32_t frame, uint8_t session, uint8_t *joy);
++bool decode_local(System s, uint64_t w, uint32_t frame, uint8_t session, uint16_t *joy);
++bool decode_local(uint64_t w, uint32_t frame, uint8_t session, uint8_t *joy);   // NES
+ bool decode_crc(uint64_t w, uint32_t frame, uint32_t *crc);
+ Status decode_status(uint64_t w);
+ 
+@@ -82,6 +106,21 @@ struct Settings
+ 
+ uint32_t pack_settings(const Settings &s);
+ 
++// The SNES core's settings that change emulation (SPEC.md 10.4)
++struct SnesSettings
++{
++	uint8_t region;        // status [15:14] Video Region: 0 Auto, 1 NTSC, 2 PAL
++	uint8_t header;        // status [3:1] ROM Header
++	uint8_t blend_off;     // status [16] Pseudo Transparency (changes the picture)
++	uint8_t aclk;          // status [30] Audio Clock
++	uint8_t wram;          // status [22:21] Initial WRAM: 1 00FF, 3 FF allowed
++	uint8_t aram;          // status [45:44] Initial ARAM: 1 00FF, 3 FF allowed
++	uint8_t gsu_slowrom;   // status [46] SuperFX FastROM, 1 = No
++	uint8_t sufami_swap;   // status [31]
++};
++
++uint32_t pack_settings(const SnesSettings &s);
++
+ // Why a session cannot start, or 0 if it can. Same codes go into HELLO_ACK.
+ enum Reject : uint8_t
+ {
+@@ -96,12 +135,16 @@ enum Reject : uint8_t
+ 	REJ_SYSTEM,        // Dendy, Vs. System, FDS and NSF are not supported in v1
+ 	REJ_DELAY,         // delay outside 2..15
+ 	REJ_BUSY,          // host already has a peer
++	REJ_CHIP,          // SNES: MSU-1, BS-X, a real-time clock or the SPC player
++	REJ_OTHER_SYSTEM,  // the peer runs the other console
+ };
+ 
+ const char *reject_text(uint8_t r);
+ 
+ // Checks one side can take part at all (independent of the peer).
+ uint8_t check_local(const Settings &s, uint8_t rom_region, uint8_t delay);
++// SNES: rom_ok 0 = supported, 1 = refused chip (REJ_CHIP)
++uint8_t check_local(const SnesSettings &s, uint8_t rom_ok, uint8_t delay);
+ 
+ // rom_region from the iNES header: 0 NTSC, 1 PAL, 2 Dendy/multi, 3 Vs. or not iNES.
+ uint8_t rom_region_from_header(const uint8_t *hdr, size_t len, const char *ext);
+@@ -114,7 +157,9 @@ void recording_path(char *out, size_t cap, const char *file, const char *rom);
+ // UDP packets (all little endian)
+ 
+ constexpr uint32_t PKT_MAGIC     = 0x31504E4E;   // "NNP1"
+-constexpr uint8_t  PROTO_VERSION = 1;
++constexpr uint8_t  PROTO_VERSION = 1;            // NES
++constexpr uint8_t  PROTO_VERSION_SNES = 2;       // SNES: HELLO carries the system, inputs are u16
++inline uint8_t proto_version(System s) { return s == SYS_SNES ? PROTO_VERSION_SNES : PROTO_VERSION; }
+ constexpr int      MAX_HISTORY   = 16;            // inputs per INPUT packet
+ constexpr int      MAX_PACKET    = 128;
+ 
+@@ -123,6 +168,7 @@ enum PacketType : uint8_t { P_HELLO = 1, P_HELLO_ACK = 2, P_START = 3, P_INPUT =
+ struct Hello
+ {
+ 	uint8_t  version;
++	uint8_t  system;       // version >= 2 only (otherwise SYS_NES)
+ 	uint8_t  core_build[16];
+ 	uint8_t  rom_md5[16];
+ 	uint8_t  sav_md5[16];
+@@ -136,7 +182,7 @@ struct InputRun
+ {
+ 	uint32_t first_frame;
+ 	uint8_t  count;
+-	uint8_t  joy[MAX_HISTORY];
++	uint16_t joy[MAX_HISTORY];   // u8 on the wire for NES, u16 for SNES
+ };
+ 
+ struct CrcReport
+@@ -159,10 +205,11 @@ struct Packet
+ };
+ 
+ // Returns the encoded length, or 0 if the packet does not fit.
+-size_t encode(const Packet &p, uint8_t *buf, size_t cap);
++// wide: 16-bit input samples (SNES); NES packets are unchanged.
++size_t encode(const Packet &p, uint8_t *buf, size_t cap, bool wide = false);
+ 
+ // Returns false for anything malformed; never reads past len.
+-bool decode(const uint8_t *buf, size_t len, Packet *p);
++bool decode(const uint8_t *buf, size_t len, Packet *p, bool wide = false);
+ 
+ } // namespace netplay
+ 
+diff --git a/support/netplay/netplay_session.cpp b/support/netplay/netplay_session.cpp
+index 8c8363d..f281afe 100644
+--- a/support/netplay/netplay_session.cpp
++++ b/support/netplay/netplay_session.cpp
+@@ -14,8 +14,8 @@ Session::Session(Mode mode, uint8_t delay, Mailbox mb, Transport *net, Recording
+ 	// A replay must use the delay it was recorded with, or every input shifts.
+ 	if (mode_ == M_REPLAY && rec_ && rec_->delay) delay_ = rec_->delay;
+ 	if (mode_ == M_RECORD && rec_) rec_->delay = delay_;
+-	local_.assign(WIN, Slot8{0, 0, false});
+-	remote_.assign(WIN, Slot8{0, 0, false});
++	local_.assign(WIN, Slot16{0, 0, false});
++	remote_.assign(WIN, Slot16{0, 0, false});
+ 	my_crc_.assign(WIN, Slot32{0, 0, false});
+ 	peer_crc_.assign(WIN, Slot32{0, 0, false});
+ }
+@@ -82,7 +82,7 @@ void Session::stop(uint64_t now, const char *why)
+ void Session::send(const Packet &p)
+ {
+ 	uint8_t buf[MAX_PACKET];
+-	size_t n = encode(p, buf, sizeof(buf));
++	size_t n = encode(p, buf, sizeof(buf), wide());
+ 	if (n && net_) net_->send(buf, n);
+ }
+ 
+@@ -91,24 +91,33 @@ void Session::send_hello(uint8_t type, uint8_t accept, uint8_t reason)
+ 	Packet p {};
+ 	p.type = type;
+ 	p.session = sess_;
+-	p.hello.version = PROTO_VERSION;
++	p.hello.version = proto_version(sys());
++	p.hello.system = sys();
+ 	memcpy(p.hello.core_build, info_.core_build, 16);
+ 	memcpy(p.hello.rom_md5, info_.rom_md5, 16);
+ 	memcpy(p.hello.sav_md5, info_.sav_md5, 16);
+-	p.hello.settings = pack_settings(info_.settings);
++	p.hello.settings = packed_settings();
+ 	p.hello.delay = delay_;
+ 	p.hello.accept = accept;
+ 	p.hello.reason = reason;
+ 	send(p);
+ }
+ 
++uint32_t Session::packed_settings() const
++{
++	return sys() == SYS_SNES ? pack_settings(info_.snes) : pack_settings(info_.settings);
++}
++
+ uint8_t Session::compare_peer(const Hello &h) const
+ {
+-	if (h.version != PROTO_VERSION) return REJ_PROTOCOL;
++	if (h.version != PROTO_VERSION && h.version != PROTO_VERSION_SNES) return REJ_PROTOCOL;
++	uint8_t peer_sys = h.version >= 2 ? h.system : (uint8_t)SYS_NES;
++	if (peer_sys != sys()) return REJ_OTHER_SYSTEM;
++	if (h.version != proto_version(sys())) return REJ_PROTOCOL;
+ 	if (memcmp(h.core_build, info_.core_build, 16)) return REJ_CORE;
+ 	if (memcmp(h.rom_md5, info_.rom_md5, 16)) return REJ_ROM;
+ 	if (memcmp(h.sav_md5, info_.sav_md5, 16)) return REJ_SAV;
+-	if (h.settings != pack_settings(info_.settings)) return REJ_SETTINGS;
++	if (h.settings != packed_settings()) return REJ_SETTINGS;
+ 	return REJ_OK;
+ }
+ 
+@@ -123,13 +132,13 @@ void Session::step(uint64_t now)
+ 		Packet p;
+ 		int n;
+ 		while (phase_ != PH_DONE && (n = net_->recv(buf, sizeof(buf))) >= 0)
+-			if (decode(buf, (size_t)n, &p)) handle_packet(now, p);
++			if (decode(buf, (size_t)n, &p, wide())) handle_packet(now, p);
+ 	}
+ 
+ 	switch (phase_)
+ 	{
+ 	case PH_WAIT_CORE:
+-		if (!have_info_ || mb_.rd(MB_MAGIC) != MAGIC_VALUE) break;
++		if (!have_info_ || mb_.rd(MB_MAGIC) != mailbox_magic(sys())) break;
+ 		// A previous session may have just written CTRL=0: wait until the core
+ 		// has seen it, or a fast re-arm would land before it ever went IDLE.
+ 		if (decode_status(mb_.rd(MB_STATUS)).state != FS_IDLE)
+@@ -138,7 +147,8 @@ void Session::step(uint64_t now)
+ 			break;
+ 		}
+ 		{
+-			uint8_t r = check_local(info_.settings, info_.rom_region, delay_);
++			uint8_t r = sys() == SYS_SNES ? check_local(info_.snes, info_.rom_region, delay_)
++			                              : check_local(info_.settings, info_.rom_region, delay_);
+ 			if (r != REJ_OK)
+ 			{
+ 				// nothing armed yet: no BYE, no CTRL write
+@@ -190,7 +200,7 @@ void Session::step(uint64_t now)
+ 	case PH_SETTLE:
+ 		if (now - t_phase_ < t_.settle_ms) break;
+ 		for (uint32_t f = 0; f < delay_; f++)
+-			mb_.wr(ring_off(MB_INPUT, f), input_word(f, sess_, 0, 0));
++			mb_.wr(ring_off(MB_INPUT, f), input_word(sys(), f, sess_, 0, 0));
+ 		input_next_ = delay_;
+ 		if (mode_ == M_HOST || mode_ == M_JOIN)
+ 		{
+@@ -288,7 +298,7 @@ void Session::handle_packet(uint64_t now, const Packet &p)
+ 			uint32_t f = p.input.first_frame + i;
+ 			if (f < p.input.first_frame) break;       // wrapped: malformed
+ 			if (f < remote_next_ || f >= remote_next_ + WIN) continue;
+-			Slot8 &s = remote_[f % WIN];
++			Slot16 &s = remote_[f % WIN];
+ 			s.f = f; s.v = p.input.joy[i]; s.ok = true;
+ 		}
+ 		while (remote_[remote_next_ % WIN].ok && remote_[remote_next_ % WIN].f == remote_next_)
+@@ -369,10 +379,10 @@ void Session::run(uint64_t now)
+ 
+ 	// LOCAL[] from the FPGA
+ 	bool fresh = false;
+-	uint8_t joy;
+-	while (decode_local(mb_.rd(ring_off(MB_LOCAL, local_next_)), local_next_, sess_, &joy))
++	uint16_t joy;
++	while (decode_local(sys(), mb_.rd(ring_off(MB_LOCAL, local_next_)), local_next_, sess_, &joy))
+ 	{
+-		Slot8 &s = local_[local_next_ % WIN];
++		Slot16 &s = local_[local_next_ % WIN];
+ 		s.f = local_next_; s.v = joy; s.ok = true;
+ 		if (mode_ == M_RECORD && rec_) rec_->joy.push_back(joy);
+ 		local_next_++;
+@@ -410,7 +420,7 @@ void Session::run(uint64_t now)
+ 		// core has posted LOCAL[k-D], so the 256-entry ring can never overrun.
+ 		uint32_t src = input_next_ - delay_;
+ 		if (src >= local_next_) break;
+-		uint8_t me, other = 0;
++		uint16_t me, other = 0;
+ 
+ 		if (mode_ == M_REPLAY)
+ 		{
+@@ -425,9 +435,9 @@ void Session::run(uint64_t now)
+ 			other = remote_[src % WIN].v;
+ 		}
+ 
+-		uint8_t p1 = (mode_ == M_JOIN) ? other : me;
+-		uint8_t p2 = (mode_ == M_JOIN) ? me : other;
+-		mb_.wr(ring_off(MB_INPUT, input_next_), input_word(input_next_, sess_, p1, p2));
++		uint16_t p1 = (mode_ == M_JOIN) ? other : me;
++		uint16_t p2 = (mode_ == M_JOIN) ? me : other;
++		mb_.wr(ring_off(MB_INPUT, input_next_), input_word(sys(), input_next_, sess_, p1, p2));
+ 		input_next_++;
+ 	}
+ 
+diff --git a/support/netplay/netplay_session.h b/support/netplay/netplay_session.h
+index 27ca995..a638fdb 100644
+--- a/support/netplay/netplay_session.h
++++ b/support/netplay/netplay_session.h
+@@ -1,4 +1,4 @@
+-// netplay_session.h — NES netplay session engine (SPEC.md 3, 4, 7)
++// netplay_session.h — NES and SNES netplay session engine (SPEC.md 3, 4, 7, 10)
+ //
+ // Single-threaded and free of OS calls: the mailbox is a plain pointer and
+ // the network sits behind Transport, so the whole engine runs in the x86
+@@ -46,18 +46,21 @@ enum Phase : uint8_t
+ 
+ struct LocalInfo
+ {
++	System   system = SYS_NES;
+ 	uint8_t  core_build[16];
+ 	uint8_t  rom_md5[16];
+ 	uint8_t  sav_md5[16];
+-	Settings settings;
+-	uint8_t  rom_region;
++	Settings settings;          // NES
++	SnesSettings snes;          // SNES
++	uint8_t  rom_region;        // NES: see rom_region_from_header(); SNES: 0 supported, 1 refused chip
+ };
+ 
+-// Record/replay data: one controller byte and one CRC per frame.
++// Record/replay data: one controller sample and one CRC per frame.
+ struct Recording
+ {
+ 	uint8_t               delay = 0;   // input delay the recording was made with
+-	std::vector<uint8_t>  joy;
++	System                system = SYS_NES;
++	std::vector<uint16_t> joy;
+ 	std::vector<uint32_t> crc;
+ };
+ 
+@@ -101,7 +104,7 @@ public:
+ private:
+ 	static constexpr uint32_t WIN = 1024;   // frames of history kept per stream
+ 
+-	struct Slot8  { uint32_t f; uint8_t  v; bool ok; };
++	struct Slot16 { uint32_t f; uint16_t v; bool ok; };
+ 	struct Slot32 { uint32_t f; uint32_t v; bool ok; };
+ 
+ 	void say(const char *fmt, ...);
+@@ -115,6 +118,9 @@ private:
+ 	void start_run(uint64_t now);
+ 	void run(uint64_t now);
+ 	void put_crc(Slot32 *ring, uint32_t f, uint32_t v, uint64_t now);
++	System sys() const { return info_.system; }
++	bool   wide() const { return info_.system == SYS_SNES; }
++	uint32_t packed_settings() const;
+ 
+ 	Mode       mode_;
+ 	uint8_t    delay_;
+@@ -143,7 +149,7 @@ private:
+ 	uint32_t   crc_checked_ = 0;
+ 	uint16_t   stalls_ = 0;
+ 
+-	std::vector<Slot8>  local_, remote_;
++	std::vector<Slot16> local_, remote_;
+ 	std::vector<Slot32> my_crc_, peer_crc_;
+ };
+ 
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index ac4149a..daf16eb 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -12,12 +12,17 @@ test: test_netplay udp_harness
+ 	./test_netplay
+ 	./run_udp_test.sh
+ 	NP_OSD=1 ./run_udp_test.sh
++	NP_SYSTEM=snes ./run_udp_test.sh
++	NP_SYSTEM=snes NP_OSD=1 ./run_udp_test.sh
+ 	@srv=../../../../server/build/netplay-server-linux-amd64; \
+ 	if [ -x $$srv ]; then srv=$$(cd $$(dirname $$srv) && pwd)/$$(basename $$srv); \
+ 	  NP_SERVER_BIN=$$srv ./run_udp_test.sh && \
+ 	  NP_SERVER_BIN=$$srv NP_DIRECT=no ./run_udp_test.sh && \
+ 	  NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
+-	  NP_SERVER_BIN=$$srv NP_SAV=1 ./run_udp_test.sh; \
++	  NP_SERVER_BIN=$$srv NP_SAV=1 ./run_udp_test.sh && \
++	  NP_SYSTEM=snes NP_SERVER_BIN=$$srv ./run_udp_test.sh && \
++	  NP_SYSTEM=snes NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
++	  NP_SYSTEM=snes NP_SERVER_BIN=$$srv NP_SAV=1 ./run_udp_test.sh; \
+ 	else echo "SKIP udp (server): build it with server/build.sh"; fi
+ 
+ test_netplay: $(ENGINE) test_netplay.cpp $(HDRS)
+diff --git a/support/netplay/test/fake_fpga.h b/support/netplay/test/fake_fpga.h
+index 00bd8ce..87983bd 100644
+--- a/support/netplay/test/fake_fpga.h
++++ b/support/netplay/test/fake_fpga.h
+@@ -22,42 +22,44 @@ struct FakeFpga
+ 	Mailbox mb { own };
+ 
+ 	int      id;
++	System   sys = SYS_NES;
+ 	uint32_t frame_ms = 16;
+ 	uint8_t  state = FS_IDLE, error = 0, sess = 0;
+ 	uint32_t frame = 0;
+ 	uint16_t stalls = 0;
+ 	bool     have0 = false, have1 = false;
+-	uint8_t  a1 = 0, a2 = 0, b1 = 0, b2 = 0, cur1 = 0, cur2 = 0;
++	uint16_t a1 = 0, a2 = 0, b1 = 0, b2 = 0, cur1 = 0, cur2 = 0;
+ 	uint64_t next_tick = 0;
+ 	uint32_t game = 0x12345678;
+ 	int      corrupt_crc_at = -1;
+ 	bool     stalled = false;
+-	std::vector<std::pair<uint8_t, uint8_t>> seen;   // inputs per frame
+-	std::vector<uint8_t> posted;                     // LOCAL[] per frame
+-	std::function<uint8_t(uint64_t)> pad;
++	std::vector<std::pair<uint16_t, uint16_t>> seen; // inputs per frame
++	std::vector<uint16_t> posted;                    // LOCAL[] per frame
++	std::function<uint16_t(uint64_t)> pad;
+ 
+-	explicit FakeFpga(int i) : id(i)
++	explicit FakeFpga(int i, System s = SYS_NES) : id(i), sys(s)
+ 	{
+-		mb.wr(MB_MAGIC, MAGIC_VALUE);
+-		pad = [i](uint64_t now) { return (uint8_t)((now / (37 + 11 * i)) * (i ? 0x5B : 0x3D)); };
++		mb.wr(MB_MAGIC, mailbox_magic(sys));
++		uint16_t m = (uint16_t)joy_mask(sys);
++		pad = [i, m](uint64_t now) { return (uint16_t)(((now / (37 + 11 * i)) * (i ? 0x5B5 : 0x3D3)) & m); };
+ 	}
+ 
+ 	void status() { mb.wr(MB_STATUS, (uint64_t)frame << 32 | (uint64_t)state << 24 | (uint64_t)error << 16 | stalls); }
+ 
+-	bool fetch(uint32_t f, uint8_t *p1, uint8_t *p2)
++	bool fetch(uint32_t f, uint16_t *p1, uint16_t *p2)
+ 	{
+ 		uint64_t w = mb.rd(ring_off(MB_INPUT, f));
+ 		uint32_t hi = (uint32_t)(w >> 32), lo = (uint32_t)w;
+-		uint32_t tag = (f & 0xFFFF) << 16 | (uint32_t)sess << 8;
+-		if ((hi & 0xFFFFFF00) != tag || (lo & 0xFFFFFF00) != tag) return false;
+-		*p1 = (uint8_t)lo; *p2 = (uint8_t)hi;
++		uint32_t tag = entry_tag(sys, f, sess), m = joy_mask(sys);
++		if ((hi & ~m) != tag || (lo & ~m) != tag) return false;
++		*p1 = (uint16_t)(lo & m); *p2 = (uint16_t)(hi & m);
+ 		return true;
+ 	}
+ 
+-	void post_local(uint32_t f, uint8_t j)
++	void post_local(uint32_t f, uint16_t j)
+ 	{
+ 		if (posted.size() == f) posted.push_back(j);
+-		uint32_t half = (f & 0xFFFF) << 16 | (uint32_t)sess << 8 | j;
++		uint32_t half = entry_tag(sys, f, sess) | (j & joy_mask(sys));
+ 		mb.wr(ring_off(MB_LOCAL, f), (uint64_t)half << 32 | half);
+ 	}
+ 
+@@ -67,10 +69,10 @@ struct FakeFpga
+ 		mb.wr(ring_off(MB_CRC, f), w);
+ 	}
+ 
+-	void apply(uint8_t p1, uint8_t p2)
++	void apply(uint16_t p1, uint16_t p2)
+ 	{
+ 		cur1 = p1; cur2 = p2;
+-		game = game * 31 + (uint32_t)(p1 | p2 << 8) + 1;
++		game = game * 31 + (uint32_t)(p1 | p2 << 16) + 1;
+ 		seen.push_back({p1, p2});
+ 	}
+ 
+@@ -111,7 +113,9 @@ struct FakeFpga
+ 			{
+ 				if (!have0)
+ 				{
+-					// real core pauses in vblank and resumes a whole frame later
++					// NES: the core pauses in vblank and resumes a whole frame later.
++					// SNES: the core freezes at the tick until the input is there;
++					// modelled the same way here (only the time lost differs).
+ 					if (!stalled) { stalls++; stalled = true; }
+ 					next_tick = now + frame_ms;
+ 					break;
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+index ed1c088..8292903 100755
+--- a/support/netplay/test/run_udp_test.sh
++++ b/support/netplay/test/run_udp_test.sh
+@@ -6,11 +6,13 @@ bin="$here/udp_harness"
+ frames="${1:-600}"
+ tmp="$(mktemp -d)"
+ mkdir -p "$tmp/host" "$tmp/join"
++# NP_SYSTEM=snes: the SNES core (game in roms/SNES on the server, .sfc)
++if [ "${NP_SYSTEM:-}" = snes ]; then sysdir=SNES; ext=sfc; else sysdir=; ext=nes; fi
+ 
+ # NP_SERVER_BIN: meet through a real netplay-server, which also hands out the game
+ if [ -n "${NP_SERVER_BIN:-}" ]; then
+-	mkdir -p "$tmp/srv/roms"
+-	"$bin" makerom "$tmp/srv/roms/game.nes"
++	mkdir -p "$tmp/srv/roms/$sysdir"
++	"$bin" makerom "$tmp/srv/roms/$sysdir/game.$ext"
+ 	printf 'port=47846\nkey=testkey\nroms=roms\n' > "$tmp/srv/netplay-server.ini"
+ 	"$NP_SERVER_BIN" -config "$tmp/srv/netplay-server.ini" > "$tmp/server.log" 2>&1 &
+ 	sp=$!
+@@ -31,7 +33,7 @@ h=$(grep RESULT "$tmp/host.log"); j=$(grep RESULT "$tmp/join.log")
+ echo "host: $h"
+ echo "join: $j"
+ hd=${h##*digest=}; jd=${j##*digest=}
+-label="udp${NP_OSD:+ (OSD mode)}${NP_SERVER_BIN:+ (server${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}"
++label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_OSD:+ (OSD mode)}${NP_SERVER_BIN:+ (server${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}"
+ ok=0
+ [ $hr -eq 0 ] && [ $jr -eq 0 ] && [ -n "$hd" ] && [ "$hd" = "$jd" ] && ok=1
+ # through a server: the path the session took, and the names
+@@ -47,7 +49,7 @@ if [ $ok -eq 1 ] && [ -n "${NP_SERVER_BIN:-}" ]; then
+ 	grep -q "playing with Joinor" "$tmp/host.log" || { echo "host: name of join missing"; ok=0; }
+ 	grep -q "playing with Par..Host" "$tmp/join.log" || { echo "join: name of host missing"; ok=0; }
+ 	if [ -z "${NP_AUTOJOIN:-}" ]; then
+-		grep -q "room file: Par..Host - game/game.nes" "$tmp/join.log" || { echo "join: room file name"; ok=0; }
++		grep -q "room file: Par..Host - game/game.$ext" "$tmp/join.log" || { echo "join: room file name"; ok=0; }
+ 	fi
+ fi
+ if [ $ok -eq 1 ]; then
+diff --git a/support/netplay/test/test_netplay.cpp b/support/netplay/test/test_netplay.cpp
+index 852c5f3..4bdf0bc 100644
+--- a/support/netplay/test/test_netplay.cpp
++++ b/support/netplay/test/test_netplay.cpp
+@@ -70,10 +70,13 @@ struct End : Transport
+ 	void lock_peer() override {}
+ };
+ 
+-static LocalInfo make_info()
++static LocalInfo make_info(System sys = SYS_NES)
+ {
+ 	LocalInfo li {};
+-	memcpy(li.core_build, "NES_20261030____", 16);
++	li.system = sys;
++	li.snes.wram = 1;
++	li.snes.aram = 3;
++	memcpy(li.core_build, sys == SYS_SNES ? "SNES_20261103___" : "NES_20261030____", 16);
+ 	memset(li.rom_md5, 0xAB, 16);
+ 	li.settings.ram_clear = 1;
+ 	li.settings.cheats_off = 1;
+@@ -87,16 +90,17 @@ struct Pair
+ {
+ 	Net net;
+ 	End ea { &net, 0 }, eb { &net, 1 };
+-	FakeFpga fa { 0 }, fb { 1 };
++	FakeFpga fa, fb;
+ 	Session a, b;
+ 	uint64_t now = 0;
+ 
+-	Pair(uint8_t delay = 3, Timing t = Timing())
+-		: a(M_HOST, delay, fa.mb, &ea, nullptr, 0x42, t),
++	Pair(uint8_t delay = 3, Timing t = Timing(), System sa = SYS_NES, System sb = SYS_NES)
++		: fa(0, sa), fb(1, sb),
++		  a(M_HOST, delay, fa.mb, &ea, nullptr, 0x42, t),
+ 		  b(M_JOIN, 2, fb.mb, &eb, nullptr, 0, t)
+ 	{
+-		a.set_local(make_info());
+-		b.set_local(make_info());
++		a.set_local(make_info(sa));
++		b.set_local(make_info(sb));
+ 	}
+ 
+ 	void step()
+@@ -237,7 +241,7 @@ static void check_same_inputs(Pair &P, uint8_t delay)
+ 	int bad = 0;
+ 	for (size_t f = 0; f < n; f++) if (P.fa.seen[f] != P.fb.seen[f]) bad++;
+ 	CHECKM(bad == 0, "%d of %zu frames saw different inputs", bad, n);
+-	CHECK(P.fa.seen[0] == std::make_pair((uint8_t)0, (uint8_t)0));
++	CHECK(P.fa.seen[0] == std::make_pair((uint16_t)0, (uint16_t)0));
+ 	CHECK(P.fa.seen.size() > delay);
+ 	(void)delay;
+ }
+@@ -489,6 +493,95 @@ static void test_bad_local_settings()
+ 	CHECK(f.mb.rd(MB_CTRL) == 0);
+ }
+ 
++// ---------------------------------------------------------------------------
++// SNES (SPEC.md 10)
++
++static void test_snes_words()
++{
++	printf("snes: mailbox words\n");
++	uint64_t w = input_word(SYS_SNES, 0x12345, 0x5A, 0xABC, 0x123);
++	CHECK((uint32_t)w == ((0x345u << 20) | (0x5Au << 12) | 0xABC));
++	CHECK((uint32_t)(w >> 32) == ((0x345u << 20) | (0x5Au << 12) | 0x123));
++	CHECK(input_word(SYS_NES, 7, 0x5A, 0x81, 0x42) == input_word(7, 0x5A, 0x81, 0x42));   // NES unchanged
++
++	uint16_t j;
++	uint32_t half = (7u << 20) | (0x5Au << 12) | 0xFED;
++	CHECK(decode_local(SYS_SNES, (uint64_t)half << 32 | half, 7, 0x5A, &j) && j == 0xFED);
++	CHECK(!decode_local(SYS_SNES, (uint64_t)half << 32 | half, 8, 0x5A, &j));
++	CHECK(!decode_local(SYS_SNES, (uint64_t)half << 32 | half, 7, 0x5B, &j));
++	CHECK(!decode_local(SYS_SNES, (uint64_t)half << 32 | (half ^ 1), 7, 0x5A, &j));   // torn
++	CHECK(decode_local(SYS_SNES, (uint64_t)half << 32 | half, 7 + 4096, 0x5A, &j));   // 12-bit tag: 4096 frames apart look the same (the ring has 256)
++	CHECK(!decode_local(SYS_SNES, INVALID_WORD, 0, 0, &j));
++	CHECK(!decode_local(SYS_SNES, INVALID_WORD, 0xFFF, 0, &j));
++	CHECK(mailbox_phys(SYS_SNES) == 0x3FC00000 && mailbox_phys(SYS_NES) == 0x3C000000);
++	CHECK(mailbox_magic(SYS_SNES) == 0x3130504E53454E53ULL);
++}
++
++static void test_snes_packets()
++{
++	printf("snes: packets\n");
++	uint8_t buf[MAX_PACKET];
++	Packet p {}, q;
++	p.type = P_INPUT; p.session = 7; p.input.first_frame = 9; p.input.count = 3;
++	p.input.joy[0] = 0xFFF; p.input.joy[1] = 0x800; p.input.joy[2] = 0x001;
++	size_t n = encode(p, buf, sizeof(buf), true);
++	CHECK(n == 4 + 2 + 4 + 1 + 2 * 3);
++	CHECK(decode(buf, n, &q, true) && q.input.count == 3 && q.input.joy[0] == 0xFFF && q.input.joy[1] == 0x800);
++	CHECK(!decode(buf, n, &q, false));            // a NES peer never reads it as narrow
++	size_t nn = encode(p, buf, sizeof(buf), false);
++	CHECK(nn == 4 + 2 + 4 + 1 + 3 && buf[11] == 0xFF);   // NES keeps one byte per sample
++
++	Packet h {}; h.type = P_HELLO; h.hello.version = 1; h.hello.delay = 3;
++	CHECK(encode(h, buf, sizeof(buf)) == 4 + 2 + 1 + 48 + 4 + 1);    // NES HELLO: unchanged length
++	h.hello.version = PROTO_VERSION_SNES; h.hello.system = SYS_SNES;
++	n = encode(h, buf, sizeof(buf));
++	CHECK(n == 4 + 2 + 1 + 1 + 48 + 4 + 1 && buf[7] == SYS_SNES);
++	CHECK(decode(buf, n, &q) && q.hello.version == 2 && q.hello.system == SYS_SNES && q.hello.delay == 3);
++}
++
++static void test_snes_session()
++{
++	printf("snes: session over a lossy link\n");
++	Pair P(3, Timing(), SYS_SNES, SYS_SNES);
++	rng_state = 4242;
++	P.net.loss_pct = 5; P.net.delay_ms = 30; P.net.jitter_ms = 10;
++	bool ok = P.run_until([&] { return P.fa.frame >= 2000 && P.fb.frame >= 2000; }, 120000);
++	CHECKM(ok, "did not reach 2000 frames: A %s / B %s", P.a.message(), P.b.message());
++	CHECK(P.a.phase() == PH_RUN && P.b.phase() == PH_RUN);
++	check_same_inputs(P, 3);
++	int wrong = 0, wide = 0;
++	for (size_t f = 3; f < 1900; f++)
++	{
++		if (P.fa.seen[f].first != P.fa.posted[f - 3] || P.fa.seen[f].second != P.fb.posted[f - 3]) wrong++;
++		if (P.fa.seen[f].first > 0xFF || P.fa.seen[f].second > 0xFF) wide++;
++	}
++	CHECKM(wrong == 0, "%d frames with wrong port or delay", wrong);
++	CHECKM(wide > 500, "only %d frames used buttons above bit 7", wide);   // all 12 bits get across
++}
++
++static void test_snes_vs_nes()
++{
++	printf("snes: host SNES, join NES\n");
++	Pair P(3, Timing(), SYS_SNES, SYS_NES);
++	P.run_until([&] { return P.a.failed() && P.b.failed(); }, 20000);
++	CHECKM(P.b.failed() && strstr(P.b.message(), "another console"), "join: %s", P.b.message());
++	CHECK(P.fa.frame == 0 && P.fb.frame == 0);
++}
++
++static void test_snes_settings()
++{
++	printf("snes: settings\n");
++	SnesSettings s {}; s.wram = 1; s.aram = 3;
++	CHECK(check_local(s, 0, 3) == REJ_OK);
++	s.wram = 0; CHECK(check_local(s, 0, 3) == REJ_RAM_CLEAR);    // 9966 is not the same everywhere
++	s.wram = 3; s.aram = 2; CHECK(check_local(s, 0, 3) == REJ_RAM_CLEAR);
++	s.aram = 1; CHECK(check_local(s, 1, 3) == REJ_CHIP);
++	CHECK(check_local(s, 0, 1) == REJ_DELAY);
++	SnesSettings x {}, y {}; y.aclk = 1;
++	CHECK(pack_settings(x) != pack_settings(y));
++	y = x; y.region = 2; CHECK(pack_settings(x) != pack_settings(y));
++}
++
+ int main()
+ {
+ 	test_packets();
+@@ -508,6 +601,11 @@ int main()
+ 	test_replay_uses_recorded_delay();
+ 	test_core_without_netplay();
+ 	test_bad_local_settings();
++	test_snes_words();
++	test_snes_packets();
++	test_snes_session();
++	test_snes_vs_nes();
++	test_snes_settings();
+ 
+ 	if (g_fail) { printf("FAIL: %d of %d checks\n", g_fail, g_checks); return 1; }
+ 	printf("PASS: %d checks\n", g_checks);
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index 6f6bc3d..faeb1f8 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -17,6 +17,7 @@
+ #include <string>
+ 
+ #include "../netplay.h"
++#include "../../../file_io.h"
+ #include "fake_fpga.h"
+ 
+ using namespace netplay;
+@@ -24,11 +25,13 @@ using namespace netplay;
+ static FakeFpga   *fpga;
+ static std::string workdir;
+ static int         reloads = 0;
++// NP_SYSTEM=snes: the SNES core (SPEC.md 10), else NES
++static bool        snes = false;
+ 
+ // --- stubs for the MiSTer functions netplay.cpp uses ------------------------
+ 
+-char *user_io_get_core_name(int) { static char n[] = "NES"; return n; }
+-char *user_io_get_core_path(const char *, int) { static char p[] = "games/NES"; return p; }
++char *user_io_get_core_name(int) { static char n[] = "NES", sn[] = "SNES"; return snes ? sn : n; }
++char *user_io_get_core_path(const char *, int) { static char p[] = "games/NES", sp[] = "games/SNES"; return snes ? sp : p; }
+ 
+ // The RAM folder for server games is a plain folder here (no root needed).
+ extern "C" int mount(const char *, const char *, const char *, unsigned long, const void *) { return 0; }
+@@ -36,15 +39,16 @@ extern "C" int umount2(const char *, int) { return 0; }
+ 
+ char *user_io_get_confstr(int index)
+ {
+-	static char a[] = "NES", b[] = "V,v261030";
+-	return index == 0 ? a : index == 1 ? b : nullptr;
++	static char a[] = "NES", sa[] = "SNES", b[] = "V,v261030";
++	return index == 0 ? (snes ? sa : a) : index == 1 ? b : nullptr;
+ }
+ 
+-static uint32_t osd_netplay = 0;            // [89:88]: 0 = netplay.ini, 2 Host, 3 Join
++static uint32_t osd_netplay = 0;            // NES [89:88], SNES [59:58]: 0 = netplay.ini, 2 Host, 3 Join
+ 
+ uint32_t user_io_status_get(const char *opt, int)
+ {
+-	if (!strcmp(opt, "[89:88]")) return osd_netplay;
++	if (!strcmp(opt, snes ? "[59:58]" : "[89:88]")) return osd_netplay;
++	if (snes && (!strcmp(opt, "[22:21]") || !strcmp(opt, "[45:44]"))) return 1;   // WRAM/ARAM 00FF
+ 	if (!strcmp(opt, "[66:65]")) return 1;   // RAM Clear $00
+ 	if (!strcmp(opt, "[20]")) return 1;      // cheats off
+ 	return 0;
+@@ -68,7 +72,19 @@ const char *getFullPath(const char *name)
+ 
+ void Info(const char *message, int, int, int, int) { printf("[osd] %s\n", message); fflush(stdout); }
+ 
+-void *shmem_map(uint32_t, uint32_t) { return fpga->own; }
++void *shmem_map(uint32_t phys, uint32_t)
++{
++	if (phys != mailbox_phys(snes ? SYS_SNES : SYS_NES)) { printf("[harness] wrong mailbox address %08x\n", phys); return nullptr; }
++	return fpga->own;
++}
++
++// file_io and the SNES header, as far as netplay.cpp uses them
++fileTYPE::fileTYPE() {}
++fileTYPE::~fileTYPE() {}
++int FileExists(const char *name, int) { struct stat st; return !stat(getFullPath(name), &st); }
++int FileOpen(fileTYPE *, const char *name, char) { struct stat st; return !stat(getFullPath(name), &st); }
++int FileClose(fileTYPE *) { return 1; }
++uint8_t *snes_get_header(fileTYPE *) { static uint8_t hdr[512]; return hdr; }   // LoROM, no chip
+ int shmem_unmap(void *, uint32_t) { return 1; }
+ 
+ // -----------------------------------------------------------------------------
+@@ -84,13 +100,15 @@ static void make_rom(const char *path)            // same bytes on both sides
+ {
+ 	FILE *f = fopen(path, "wb");
+ 	uint8_t hdr[16] = {'N', 'E', 'S', 0x1A, 2, 1};
+-	fwrite(hdr, 16, 1, f);
++	if (!snes) fwrite(hdr, 16, 1, f);
+ 	for (int i = 0; i < 40960; i++) fputc((i * 7) & 0xFF, f);
+ 	fclose(f);
+ }
+ 
+ int main(int argc, char **argv)
+ {
++	snes = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "snes");
++	const char *sysdir = snes ? "SNES" : "NES", *ext = snes ? ".sfc" : ".nes";
+ 	if (argc == 3 && !strcmp(argv[1], "makerom")) { make_rom(argv[2]); return 0; }
+ 	if (argc != 4) { fprintf(stderr, "usage: udp_harness <host|join> <workdir> <frames>\n"); return 2; }
+ 	bool host = !strcmp(argv[1], "host");
+@@ -117,21 +135,21 @@ int main(int argc, char **argv)
+ 		        host ? "P\xc3\xa4r/../Host" : "Join\tor", getenv("NP_DIRECT") ? getenv("NP_DIRECT") : "yes");
+ 	fclose(f);
+ 
+-	std::string game = "game.nes";
++	std::string game = std::string("game") + ext;
+ 	if (server)
+ 	{
+ 		std::string d = getFullPath("games");
+ 		mkdir(d.c_str(), 0755);
+-		d += "/NES";
++		d += std::string("/") + sysdir;
+ 		mkdir(d.c_str(), 0755);
+-		game = "games/NES/_Netplay/Server games/game.nes";
++		game = std::string("games/") + sysdir + "/_Netplay/Server games/game" + ext;
+ 		// NP_SAV: the same battery save on both sides, under the game's name. A
+ 		// join from Rooms must look for it there too, or the host refuses it.
+ 		if (getenv("NP_SAV"))
+ 		{
+ 			std::string sv = getFullPath("saves");
+ 			mkdir(sv.c_str(), 0755);
+-			sv += "/NES";
++			sv += std::string("/") + sysdir;
+ 			mkdir(sv.c_str(), 0755);
+ 			FILE *s = fopen((sv + "/game.sav").c_str(), "wb");
+ 			for (int i = 0; i < 8192; i++) fputc((i * 13) & 0xFF, s);
+@@ -140,7 +158,7 @@ int main(int argc, char **argv)
+ 	}
+ 	else make_rom(getFullPath(game.c_str()));
+ 
+-	fpga = new FakeFpga(host ? 0 : 1);
++	fpga = new FakeFpga(host ? 0 : 1, snes ? SYS_SNES : SYS_NES);
+ 	netplay_start();
+ 	if (server)                                // wait for the download
+ 	{
+@@ -152,7 +170,7 @@ int main(int argc, char **argv)
+ 	}
+ 	if (server && !host && !autojoin)          // pick the host's room
+ 	{
+-		std::string rooms = std::string(getFullPath("games/NES/_Netplay/Rooms"));
++		std::string rooms = std::string(getFullPath((std::string("games/") + sysdir + "/_Netplay/Rooms").c_str()));
+ 		std::string pick;
+ 		for (uint64_t t = now_ms(); pick.empty() && now_ms() - t < 15000; usleep(10000))
+ 		{
+@@ -169,7 +187,7 @@ int main(int argc, char **argv)
+ 						while (dirent *x = readdir(g))
+ 						{
+ 							size_t l = strlen(x->d_name);
+-							if (l > 4 && !strcmp(x->d_name + l - 4, ".nes")) pick = std::string(e->d_name) + "/" + x->d_name;
++							if (l > 4 && !strcmp(x->d_name + l - 4, ext)) pick = std::string(e->d_name) + "/" + x->d_name;
+ 						}
+ 						closedir(g);
+ 					}
+@@ -179,7 +197,7 @@ int main(int argc, char **argv)
+ 		}
+ 		if (pick.empty()) { printf("[harness] no room in the lobby\n"); return 1; }
+ 		printf("[harness] room file: %s\n", pick.c_str());
+-		game = "games/NES/_Netplay/Rooms/" + pick;
++		game = std::string("games/") + sysdir + "/_Netplay/Rooms/" + pick;
+ 	}
+ 	netplay_note_file("palette.pal", 3, 0);    // a custom palette must not start a session
+ 	netplay_note_file(game.c_str(), 1, 1);
+-- 
+2.43.0
+

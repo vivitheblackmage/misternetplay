@@ -1,0 +1,25 @@
+From 431be812b987c8ebdf6c83428c8a1a18b358cf7c Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 3 Nov 2026 23:03:38 +0100
+Subject: [PATCH] netplay tests: NP_NAME sets the player name in udp_harness
+---
+ support/netplay/test/udp_harness.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index faeb1f8..9f2735c 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -132,7 +132,8 @@ int main(int argc, char **argv)
+ 	        mode, host || server ? "" : "127.0.0.1");
+ 	if (server)
+ 		fprintf(f, "server=%s\nkey=%s\nname=%s\ndirect=%s\n", server, key ? key : "",
+-		        host ? "P\xc3\xa4r/../Host" : "Join\tor", getenv("NP_DIRECT") ? getenv("NP_DIRECT") : "yes");
++		        getenv("NP_NAME") ? getenv("NP_NAME") : host ? "P\xc3\xa4r/../Host" : "Join\tor",
++		        getenv("NP_DIRECT") ? getenv("NP_DIRECT") : "yes");
+ 	fclose(f);
+ 
+ 	std::string game = std::string("game") + ext;
+-- 
+2.43.0
+

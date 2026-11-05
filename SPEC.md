@@ -46,7 +46,8 @@ RetroAchievements fork uses for NES.
   (`scanline_ppu`, not the paused video copy) enters the VBlank start line
   (241 for NTSC/PAL). Detected as an edge on the emulated scanline, which is
   immune to `pausecore` because the counter stands still during a pause.
-- **Frame 0** starts when the netplay module releases reset. **Frame k** (k ≥ 1)
+- **Frame 0** starts when the netplay module releases reset (SNES: when `RESET_N`
+  rises, at the PPU's next `HVCNT_ATZERO`, see 10.2). **Frame k** (k ≥ 1)
   starts at tick number k.
 - **Input for frame k**, `INPUT[k] = {p1, p2}`, applies from the start of frame k
   to the start of frame k+1. The game reads the controller through the normal
@@ -210,7 +211,7 @@ Rules:
 - `fpga_io.cpp`: `netplay_stop()` first in `fpga_load_rbf()`, before the FPGA is
   reprogrammed (the next core may use the DDR3 where the mailbox is), and first
   in `app_restart()`, before the process exits. It is the stop that saves a recording.
-- `user_io.cpp`: `netplay_start()` when a core named `NES` starts,
+- `user_io.cpp`: `netplay_start()` when a core named `NES` or `SNES` starts,
   `netplay_stop()` on a core change, `netplay_poll()` in the main loop and
   `netplay_note_file(name, index, opensave)` in `user_io_file_tx`. Only OSD index
   1 (the game slot) starts a session; BIOS (0, 2) and palette (3) are ignored.
@@ -387,3 +388,171 @@ cheats and the OSD pause while netplay is active.
 | T5 | Replay determinism | 1 MiSTer | `mode=record` ≥ 36000 frames, then `mode=replay`: the OSD shows "replay OK", on NROM, MMC1, MMC3 and MMC5 games. `tools/npr.py diff` compares two recordings |
 | T6 | LAN lockstep | 2 MiSTers | 30 min without a CRC mismatch |
 | T7 | Network faults | 2 MiSTers + netem | 30 min, 2 % loss, 30±10 ms, without a desync; an unplugged peer → error message, no lock-up |
+
+## 10. SNES (v2, released in v0.2)
+
+Status: built (Quartus `TIMING OK`, seed 9) against SNES_MiSTer `4c2b746`, with
+Main_MiSTer patches 0013-0016 and the server's per-core folders. Tested in
+simulation of the whole core (T2s, two machines with `snes_sim --netplay`, a game
+after another one with `--dirty`), in T3, and on hardware: T5s PASS (LoROM, HiROM,
+SA-1, GSU2, DSP-1) and two MiSTers (a DE10-Nano and a MiSTer Pi) over the
+internet through the server. Known: after jumping straight from one netplay core
+to the other (without a reboot from the menu) a session may not reload the ROM;
+the README tells players to reboot first. Not yet investigated.
+Sections 2–9 apply to SNES as well, except where this section says otherwise.
+NES keeps protocol version 1 unchanged (Mesen crossplay depends on it).
+
+### 10.1 Freeze instead of pause
+
+The SNES core has no pause. Netplay **stops the emulated machine's clock**:
+`SNES.sv` feeds `main` (CPU, PPU, DSP, SMP, all coprocessors), the joypad ports,
+the block RAMs and the registers between them (`READ_PULSE`,
+`VRAM_OE_N_DELAYED`) from `clk_emu`, which is `clk_sys` through Cyclone V's
+glitch-free clock gate (`ALTCLKCTRL`, `ena` latched on the falling edge).
+`FREEZE=1` removes rising edges of `clk_emu`; nothing else changes. The SDRAM
+controller, video output, HPS interface and netplay module stay on `clk_sys`.
+
+Clock structure (timing, T4): `clk_emu` comes from its own PLL output
+(`outclk_3`, identical to `clk_sys`'s `outclk_2`), so the gate gets the same
+short path from the PLL as `clk_sys`'s buffer and the two trees line up
+(gating `clk_sys` itself left ~0.9 ns skew and failed setup and hold on the
+crossings to `clk_mem`). The savestate channel crosses between `main` and
+`ddram` through registers on `clk_sys`, with `req`/`ack` one clock later than
+the data; `SNES.sdc` gives those data paths more than one clock and no hold
+on the way in. Upstream's `sdram rbuf -> din` path (SDRAM read data through
+`main` into write data) is a real single `clk_mem` path (DMA from ROM to WRAM
+through the `dout0` bypass), so it keeps its one clock; `rbuf` sits in the IO
+cell, and the fitter alone gets 1 ns less on it so the data mux stays near the
+pins. `SNES.qsf` fixes the fitter `SEED` at 9.
+
+Why not clock enables: the core's own `ENABLE` input (tied to 1) is not
+bit-exact (the CPU's clock enables keep running at the DMA rate, `CPU.vhd`
+~321), and holding only the clock-enable generators is not enough either.
+Many registers update on every clock, for example the NMI flag and
+`P65_NMI_N` (`CPU.vhd` ~598, ~633). During a freeze they take their next value
+early, and the CPU then sees NMI one cycle too soon (found in simulation,
+`sim/`: one byte of WRAM differed). The requirement is that **no register and
+no RAM of the emulated machine changes during a freeze**. Only a stopped
+clock gives that for every coprocessor without patching hundreds of processes.
+
+- **Requirement (normative):** a run with any number of freezes of any length
+  gives bit-identical outputs of the core on every emulated cycle, compared with
+  a run without freezes. Proven in simulation of the whole core (T2s below,
+  `snes_sim --compare`).
+- SDRAM refresh continues during a freeze through a new `sdram.sv` input
+  `rfs_req` (edges of `RESET_REFRESH`, about every 4 `clk_sys`), starting 32
+  `clk_sys` after the freeze begins (a read in flight completes first) and
+  ending 32 `clk_sys` before it ends. It only refreshes, from the controller's
+  idle state, in the clocked logic: `rd0` (= `~ROM_OE_N`, frozen) makes no edge,
+  so no read is issued, the latched address stays, and the first access after
+  the freeze behaves as without one. Kept out of the combinational path from
+  the CPU's address to the SDRAM command, which is timing-critical. (Not
+  modelled in `sim/`, which treats SDRAM as ideal memory.)
+- **Video:** the PPU's sync stops with the clock. `HDMI_FREEZE` is the freeze:
+  the framework's `video_freezer` keeps sync going (learnt from the frames
+  before) and the scaler stops writing its frame buffer, so HDMI shows the last
+  picture. The freeze ends as soon as the input is there, at any raster
+  position, as the framework allows for a pause; a stall costs only the wait.
+  Analog video is black during a freeze.
+- Outside netplay `FREEZE=0` and the core behaves as upstream (shown in
+  simulation: identical per-frame hashes with the gate in place).
+
+### 10.2 Frame tick and input
+
+- **Frame tick** = main's `VBLANKn` falling (the PPU's start of VBlank, after
+  line 224, or 239 with overscan), seen in emulated time: `rtl/netplay.sv` updates
+  its copies of emulated signals only when `emu_en` (the gate's `enaout`) is 1,
+  which makes them behave like `clk_emu` registers. Frame k starts on the first
+  emulated edge after the tick; on that edge INPUT[k] is applied, LOCAL[k] and
+  CRC[k-1] are posted.
+- **Freeze at the tick:** if INPUT[k] is not in hand when the tick is seen,
+  `freeze` goes high in the same `clk_sys` cycle and the gate removes that
+  edge, so the machine waits exactly before frame k. There is no underrun
+  error on SNES. `ERROR` holds the freeze.
+- **Input** is 12 bits per player, `joy0[11:0]` as the framework delivers it
+  (`J1` line of `CONF_STR`): bit 0 Right, 1 Left, 2 Down, 3 Up, 4 A, 5 B, 6 X,
+  7 Y, 8 L, 9 R, 10 Select, 11 Start. Bit 12 (the savestate button) is never
+  sent. Netplay switches
+  the `JOYSTICK1` inputs of `ioport port1/port2` only at the tick and holds them
+  constant until the next one.
+- **Ticks count only after reset:** after PRIME the core leaves reset at the
+  PPU's next `HVCNT_ATZERO`, up to two frames later, while the PPU's counters
+  and VBlank keep running. `rtl/netplay.sv` counts ticks only while `RESET_N`
+  (`machine_run`) is 1; `RESET_N` rises on that emulated event, so frame 0
+  starts at the same emulated moment on both sides. (Found by review; `snes_sim
+  --netplay` starts the two sides up to 2.5 frames apart and fails without it.)
+- While netplay is active: multitap, mouse, lightgun, Miracle piano, SNI (also
+  its SDRAM/BSRAM access), `raw_serial` (SNAC), cheats/Game Genie, savestates,
+  turbo and GSU turbo are off; OSD reset and *Load Backup RAM* are ignored. Any
+  download (game, SPC, MSU data, savestate file) during PRIME/RUN gives `RELOAD`.
+  In `ERROR` the machine stays frozen except while a ROM loads.
+- Refused (non-deterministic, they depend on wall-clock time or HPS streaming):
+  MSU-1, S-RTC, SPC7110 with RTC, BS-X, Satellaview, the competition carts
+  (Campus Challenge '92, PowerFest '94: their timers run on wall-clock time),
+  and the SPC player.
+- The DSP's register RAM is written to zero while `RST_N` is low (a ROM load
+  resets the core): upstream kept the last game's registers, the SPC driver
+  reads them, and CPU/SMP timing then differed between a MiSTer that ran other
+  games and one freshly loaded (Contra III desynced). `snes_sim --dirty` with
+  `DIRTY_COMPARE` checks a game after another one against a fresh machine.
+- Risk, not verified: RAMs inside `main` that the ROM load does not clear
+  (SA-1 I-RAM, GSU cache, DSPn data RAM, OAM) start with whatever the last game
+  left. Both sides load the same ROM after a core load, but a game that reads
+  them before writing could differ after different histories. T5s/T6s on
+  hardware with SA-1/GSU games must cover it.
+
+### 10.3 Mailbox
+
+As section 4, with these differences:
+
+- Base **`0x3FC00000`** (SNES savestates use `0x3F800000`–`0x3FBFFFFF`, MSU-1
+  data up to `0x3F7FFFFF`). Reached through a new channel 3 in `rtl/ddram.sv`:
+  single 64-bit words, toggle handshake (the controller runs on `clk_mem`), no
+  read cache (channels 1 and 2 cache two words, which would hide the HPS's
+  writes), read data taken even when `DDRAM_BUSY` is high in the same cycle.
+- `MAGIC` = `"SNESNP01"`.
+- `LOCAL`: `hi = lo = {f[11:0], sess[7:0], joy[11:0]}`.
+- `INPUT`: `hi = {f[11:0], sess[7:0], p2[11:0]}`, `lo = {f[11:0], sess[7:0], p1[11:0]}`.
+  The 12-bit frame tag is enough: the rings have 256 slots.
+- `CRC`: as NES, a CRC-32 of the frame's pixels (RGB at the emulated dot
+  enable), seeded with the frame's input.
+
+### 10.4 HPS, protocol and server
+
+- One Main_MiSTer for both cores: the core name selects NES or SNES (file
+  extensions `.sfc`/`.smc`, `saves/SNES/`, the SNES OSD bits for `settings`).
+- OSD *Netplay: netplay.ini/Off/Host/Join* is `O[59:58]` in the SNES core.
+  `settings` for HELLO: Video Region `[15:14]`, ROM Header `[3:1]`, Pseudo
+  Transparency `[16]`, Audio Clock `[30]`, Initial WRAM `[22:21]` and ARAM
+  `[45:44]` (any pattern: each is fixed), SuperFX FastROM `[46]`, Sufami swap `[31]`.
+  Turbo, SuperFX turbo, cheats, savestates, multitap, mouse, Super Scope,
+  Miracle piano, SNAC and swapped joysticks are forced off by the core.
+- UDP: for SNES the protocol version is 2: HELLO has a `system u8` (1 = SNES)
+  right after `version`, and every input sample in INPUT is a `u16` (12 bits
+  used). NES packets stay version 1, byte for byte. A peer of the other
+  console is refused with "another console" (`REJ_OTHER_SYSTEM`, 12), sent in the
+  peer's own format so a version 1 peer (an older build, Mesen) can read it (it
+  shows a generic "Rejected" if it does not know code 12); a game that needs MSU-1, BS-X, a real-time clock (S-RTC, SPC7110 with RTC) or the
+  competition carts' timers with `REJ_CHIP` (11). Checked when the ROM is loaded:
+  a `.bs` file, a `<rom>.msu` next to it, the ROM type from `snes_get_header()`.
+- The mailbox is mapped at `0x3FC00000`; `MAGIC` is "SNESNP01".
+- Recordings: `NPR3` = `"NPR3"`, rom md5[16], u8 delay, u8 system (1),
+  u32 frames, u16 joy[frames], u32 crcs, crc[crcs]. NES keeps `NPR2`.
+- Server: one lobby for both systems. `/roms` and `/rom` take `&core=`:
+  `roms/<core>/`, for NES also `roms/` itself (and without `core`, as older
+  clients and Mesen ask). Rooms already carry the core; a MiSTer lists only
+  rooms of the loaded core. SNES games up to 8 MB, the server reads up to 16 MB.
+- Lobby on the MiSTer: game files `.sfc`/`.smc` (up to 16 MB), room files
+  `<game>.sfc` (or the extension of the copy found), `.sav` under
+  `saves/<core>/`.
+
+### 10.5 Tests (SNES)
+
+| # | Test | Passes when |
+| --- | --- | --- |
+| T2s | Whole SNES core in Verilator (VHDL through GHDL, `make -C SNES_MiSTer/sim`), a real ROM; `snes_sim --compare SEED` runs a frozen and an unfrozen machine side by side | no output differs on any emulated cycle for ≥ 200 frames with random freezes, on LoROM, HiROM, SA-1 and GSU games; also identical per-frame hashes (video, audio, WRAM, VRAM, ARAM) with and without the gate |
+| T2n | The SNES netplay module with the real core: `snes_sim ROM --netplay SEED [--delay D] [--latency CYCLES]`, two machines, a fake HPS each, a network with random latency, the sides starting up to 2.5 frames apart | `PASS netplay`: the same CRC for every frame and the same WRAM at the end, also with stalls |
+| T3 | as section 9: engine tests with SNES (words, wide packets, HELLO v2, a lossy SNES session, SNES vs NES refused, settings), and `NP_SYSTEM=snes` UDP runs: direct, OSD, server, server Join same game, server `.sav` | `PASS` |
+| T4 | Quartus build of the SNES core | `TIMING OK` |
+| T5s | Replay on one MiSTer, ≥ 36000 frames | "replay OK" on LoROM, HiROM, SA-1 and GSU games |
+| T6s | Two MiSTers through the lobby | 30 min without a CRC mismatch |

@@ -1,4 +1,4 @@
-# The two patched upstream trees: recreated by ./setup.sh from MiSTer-devel + patches/
+# The patched upstream trees: recreated by ./setup.sh from MiSTer-devel + patches/
 /NES_MiSTer/
 /Main_MiSTer/
 
@@ -12,3 +12,4 @@ __pycache__/
 
 # Left by tools/backup_to_windows.sh in the copy
 .netplay-backup
+/SNES_MiSTer/

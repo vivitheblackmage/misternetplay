@@ -5,7 +5,9 @@
   npr.py diff a.npr b.npr      first frame where input or CRC differs
 
 Format (little endian): "NPR2", rom_md5[16], u8 delay, u32 frames, joy[frames],
-u32 crcs, crc[crcs] (u32 each).
+u32 crcs, crc[crcs] (u32 each). NES.
+SNES: "NPR3", rom_md5[16], u8 delay, u8 system (1), u32 frames, u16 joy[frames],
+u32 crcs, crc[crcs].
 """
 import struct
 import sys
@@ -14,14 +16,22 @@ import sys
 def load(path):
     with open(path, "rb") as f:
         data = f.read()
-    if data[:4] != b"NPR2":
-        sys.exit(f"{path}: not an NPR2 file")
+    if data[:4] not in (b"NPR2", b"NPR3"):
+        sys.exit(f"{path}: not an NPR2/NPR3 file")
+    wide = data[:4] == b"NPR3"
     md5 = data[4:20].hex()
     delay = data[20]
-    (n,) = struct.unpack_from("<I", data, 21)
-    joy = data[25:25 + n]
-    (m,) = struct.unpack_from("<I", data, 25 + n)
-    crc = list(struct.unpack_from(f"<{m}I", data, 29 + n))
+    off = 22 if wide else 21               # NPR3: one system byte after the delay
+    (n,) = struct.unpack_from("<I", data, off)
+    off += 4
+    if wide:
+        joy = list(struct.unpack_from(f"<{n}H", data, off))
+        off += 2 * n
+    else:
+        joy = list(data[off:off + n])
+        off += n
+    (m,) = struct.unpack_from("<I", data, off)
+    crc = list(struct.unpack_from(f"<{m}I", data, off + 4))
     return md5, joy, crc, delay
 
 

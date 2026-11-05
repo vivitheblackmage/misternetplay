@@ -1,0 +1,126 @@
+From f31982a82732222a25d00d59698c5422a38111d2 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 3 Nov 2026 20:12:24 +0100
+Subject: [PATCH] netplay: fixes from review of the SNES support
+
+A refusal goes out in the peer's own HELLO version, so a version 1 peer
+(an older build, Mesen) reads the reason instead of timing out. The core
+build text no longer says NES. The test checks the refusal's layout.
+---
+ support/netplay/netplay_proto.cpp     |  2 +-
+ support/netplay/netplay_session.cpp   |  8 +++++---
+ support/netplay/netplay_session.h     |  2 +-
+ support/netplay/test/test_netplay.cpp | 20 ++++++++++++++++++++
+ user_io.cpp                           |  2 +-
+ 5 files changed, 28 insertions(+), 6 deletions(-)
+
+diff --git a/support/netplay/netplay_proto.cpp b/support/netplay/netplay_proto.cpp
+index 695214a..44008ea 100644
+--- a/support/netplay/netplay_proto.cpp
++++ b/support/netplay/netplay_proto.cpp
+@@ -79,7 +79,7 @@ const char *reject_text(uint8_t r)
+ 	{
+ 	case REJ_OK:        return "OK";
+ 	case REJ_PROTOCOL:  return "Different netplay version";
+-	case REJ_CORE:      return "Different NES core build";
++	case REJ_CORE:      return "Different core build";
+ 	case REJ_ROM:       return "Different ROM file";
+ 	case REJ_SAV:       return "Different save (.sav) file";
+ 	case REJ_SETTINGS:  return "Different core settings";
+diff --git a/support/netplay/netplay_session.cpp b/support/netplay/netplay_session.cpp
+index f281afe..961b184 100644
+--- a/support/netplay/netplay_session.cpp
++++ b/support/netplay/netplay_session.cpp
+@@ -86,12 +86,12 @@ void Session::send(const Packet &p)
+ 	if (n && net_) net_->send(buf, n);
+ }
+ 
+-void Session::send_hello(uint8_t type, uint8_t accept, uint8_t reason)
++void Session::send_hello(uint8_t type, uint8_t accept, uint8_t reason, uint8_t version)
+ {
+ 	Packet p {};
+ 	p.type = type;
+ 	p.session = sess_;
+-	p.hello.version = proto_version(sys());
++	p.hello.version = version ? version : proto_version(sys());
+ 	p.hello.system = sys();
+ 	memcpy(p.hello.core_build, info_.core_build, 16);
+ 	memcpy(p.hello.rom_md5, info_.rom_md5, 16);
+@@ -245,7 +245,9 @@ void Session::handle_packet(uint64_t now, const Packet &p)
+ 			if (r == REJ_OK && (p.hello.delay < 2 || p.hello.delay > 15)) r = REJ_DELAY;
+ 			if (r != REJ_OK)
+ 			{
+-				send_hello(P_HELLO_ACK, 0, r);
++				// in the peer's own format, so a version 1 peer (NES, Mesen)
++				// can read why instead of timing out
++				send_hello(P_HELLO_ACK, 0, r, p.hello.version == PROTO_VERSION ? PROTO_VERSION : 0);
+ 				say("Netplay: player 2 rejected: %s", reject_text(r));
+ 				return;
+ 			}
+diff --git a/support/netplay/netplay_session.h b/support/netplay/netplay_session.h
+index a638fdb..8a26cd1 100644
+--- a/support/netplay/netplay_session.h
++++ b/support/netplay/netplay_session.h
+@@ -111,7 +111,7 @@ private:
+ 	void fail(uint64_t now, uint8_t bye_reason, const char *fmt, ...);
+ 	void finish_ok(uint64_t now, const char *text);
+ 	void send(const Packet &p);
+-	void send_hello(uint8_t type, uint8_t accept, uint8_t reason);
++	void send_hello(uint8_t type, uint8_t accept, uint8_t reason, uint8_t version = 0);
+ 	uint8_t compare_peer(const Hello &h) const;
+ 	void handle_packet(uint64_t now, const Packet &p);
+ 	void arm(uint64_t now);
+diff --git a/support/netplay/test/test_netplay.cpp b/support/netplay/test/test_netplay.cpp
+index 4bdf0bc..fcf15d4 100644
+--- a/support/netplay/test/test_netplay.cpp
++++ b/support/netplay/test/test_netplay.cpp
+@@ -568,6 +568,25 @@ static void test_snes_vs_nes()
+ 	CHECK(P.fa.frame == 0 && P.fb.frame == 0);
+ }
+ 
++static void test_nes_join_snes_host()
++{
++	printf("snes: host SNES, join NES (version 1 HELLO)\n");
++	Pair P(3, Timing(), SYS_SNES, SYS_NES);
++	int acks = 0, v1_acks = 0;
++	P.net.drop_if = [&](int from, const uint8_t *b, size_t n) {
++		if (from == 0 && n > 6 && b[4] == P_HELLO_ACK)
++		{
++			acks++;
++			// exactly the version 1 layout an old NES build or Mesen decodes
++			if (n == 4 + 2 + 1 + 48 + 4 + 1 + 2 && b[6] == PROTO_VERSION && b[n - 1] == REJ_OTHER_SYSTEM) v1_acks++;
++		}
++		return false;
++	};
++	P.run_until([&] { return P.b.failed(); }, 20000);
++	CHECKM(acks > 0 && acks == v1_acks, "%d of %d refusals in version 1 format", v1_acks, acks);
++	CHECKM(P.b.failed() && strstr(P.b.message(), "another console"), "join: %s", P.b.message());
++}
++
+ static void test_snes_settings()
+ {
+ 	printf("snes: settings\n");
+@@ -605,6 +624,7 @@ int main()
+ 	test_snes_packets();
+ 	test_snes_session();
+ 	test_snes_vs_nes();
++	test_nes_join_snes_host();
+ 	test_snes_settings();
+ 
+ 	if (g_fail) { printf("FAIL: %d of %d checks\n", g_fail, g_checks); return 1; }
+diff --git a/user_io.cpp b/user_io.cpp
+index 065b1fd..76dab75 100644
+--- a/user_io.cpp
++++ b/user_io.cpp
+@@ -1648,7 +1648,7 @@ void user_io_init(const char *path, const char *xml)
+ 				if (is_next()) next_enet_start();
+ 				// before the boot ROMs: the Sun-2's ID PROM goes in while it is held in reset
+ 				if (is_sun_family()) sun_enet_start();
+-				netplay_start();   // NES only; reads netplay.ini
++				netplay_start();   // NES and SNES only; reads netplay.ini
+ 				if (is_hp9k_family()) hp9k_enet_start();
+ 				if (is_sgi_family()) sgi_enet_start();
+ 
+-- 
+2.43.0
+

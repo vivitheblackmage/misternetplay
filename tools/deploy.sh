@@ -4,6 +4,8 @@
 #   tools/deploy.sh <mister-ip> [core|main|ini|all] [--no-reboot]
 #
 #   core  NES_MiSTer/output_files/NES.rbf  -> /media/fat/_Console/NES_netplay.rbf
+#         SNES_MiSTer/output_files/SNES.rbf -> /media/fat/_Console/SNES_netplay.rbf
+#         (each when built)
 #   main  Main_MiSTer/bin/MiSTer           -> /media/fat/MiSTer_online, plus
 #         Scripts/netplay_on.sh and netplay_off.sh to switch (your MiSTer is kept)
 #   ini   tools/netplay.ini.example        -> /media/fat/netplay.ini (only if missing)
@@ -28,10 +30,15 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 ssh_opts=(-o StrictHostKeyChecking=accept-new)
 
 if [[ "$what" == core || "$what" == all ]]; then
-	rbf="$root/NES_MiSTer/output_files/NES.rbf"
-	[ -f "$rbf" ] || { echo "no $rbf - build the core in Quartus first"; exit 1; }
-	scp "${ssh_opts[@]}" "$rbf" "root@$host:/media/fat/_Console/NES_netplay.rbf"
-	echo "core -> /media/fat/_Console/NES_netplay.rbf"
+	n=0
+	for c in NES SNES; do
+		rbf="$root/${c}_MiSTer/output_files/$c.rbf"
+		[ -f "$rbf" ] || continue
+		scp "${ssh_opts[@]}" "$rbf" "root@$host:/media/fat/_Console/${c}_netplay.rbf"
+		echo "core -> /media/fat/_Console/${c}_netplay.rbf"
+		n=$((n + 1))
+	done
+	[ $n -gt 0 ] || { echo "no core built - build one in Quartus first"; exit 1; }
 fi
 
 if [[ "$what" == main || "$what" == all ]]; then

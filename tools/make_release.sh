@@ -4,11 +4,11 @@
 #   tools/make_release.sh v0.2
 #
 # Checks first that everything is committed and that the builds are newer than
-# the sources: the core (.rbf; Quartus is not re-run, tools/quartus_build.sh),
+# the sources: the cores (.rbf; Quartus is not re-run, tools/quartus_build.sh),
 # Main_MiSTer (rebuilt here, it is quick) and the server (server/build.sh when
 # Docker runs, else the existing builds must be newer than the Go files).
 # The binaries stay out of git (releases/ is ignored); the tag <version> in this
-# repo and in NES_MiSTer and Main_MiSTer marks their source.
+# repo and in NES_MiSTer, SNES_MiSTer and Main_MiSTer marks their source.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,10 +23,11 @@ fail() { echo "not released: $*"; exit 1; }
 # SOURCE.txt: where the binaries come from (the public repo's tag, the upstreams)
 write_source() {
 	{
-		echo "NES netplay $ver, $(date '+%Y-%m-%d')"
+		echo "NES and SNES netplay $ver, $(date '+%Y-%m-%d')"
 		echo
 		echo "Source code: https://github.com/vivitheblackmage/misternetplay, tag $ver"
 		echo "  NES core:    github.com/MiSTer-devel/NES_MiSTer  $(sed -n 's/^NES_BASE=\(.......\).*/\1/p' setup.sh) + patches/NES_MiSTer ($(ls patches/NES_MiSTer/*.patch | wc -l) patches)"
+		echo "  SNES core:   github.com/MiSTer-devel/SNES_MiSTer $(sed -n 's/^SNES_BASE=\(.......\).*/\1/p' setup.sh) + patches/SNES_MiSTer ($(ls patches/SNES_MiSTer/*.patch | wc -l) patches)"
 		echo "  Main binary: github.com/MiSTer-devel/Main_MiSTer $(sed -n 's/^MAIN_BASE=\(.......\).*/\1/p' setup.sh) + patches/Main_MiSTer ($(ls patches/Main_MiSTer/*.patch | wc -l) patches)"
 		echo "  Server, tools, NetPong: in the repository itself."
 		echo
@@ -40,14 +41,15 @@ clean() {   # $1 repo dir; the miniz ChangeLog shows as modified from line endin
 }
 clean .
 clean NES_MiSTer
+clean SNES_MiSTer
 clean Main_MiSTer
-for r in . NES_MiSTer Main_MiSTer; do
+for r in . NES_MiSTer SNES_MiSTer Main_MiSTer; do
 	git -C "$r" rev-parse -q --verify "refs/tags/$ver" >/dev/null && fail "tag $ver exists in $r"
 done
 
 # patches/ must be what the repos' netplay branches hold
-for r in NES_MiSTer Main_MiSTer; do
-	var=NES_BASE; [ "$r" = Main_MiSTer ] && var=MAIN_BASE
+for r in NES_MiSTer SNES_MiSTer Main_MiSTer; do
+	case $r in NES_MiSTer) var=NES_BASE;; SNES_MiSTer) var=SNES_BASE;; *) var=MAIN_BASE;; esac
 	base=$(sed -n "s/^$var=\(.*\)/\1/p" setup.sh)
 	n_repo=$(git -C "$r" rev-list --count "$base..HEAD")
 	n_patch=$(ls patches/"$r"/*.patch | wc -l)
@@ -56,10 +58,12 @@ done
 
 # core: the .rbf must be newer than every tracked source file (not the ones
 # Quartus itself rewrites at the end of a build: .qsf, .cdf, pin dump)
-rbf=NES_MiSTer/output_files/NES.rbf
-[ -f "$rbf" ] || fail "no $rbf (tools/quartus_build.sh)"
-newest=$(cd NES_MiSTer && git ls-files -z -- . ':!*.md' ':!sim/*' ':!*.qsf' ':!*.cdf' ':!*pin_model_dump.txt' | xargs -0 stat -c '%Y %n' | sort -n | tail -1)
-[ "${newest%% *}" -le "$(stat -c %Y "$rbf")" ] || fail "$rbf is older than ${newest#* } (rebuild with tools/quartus_build.sh)"
+for core in NES SNES; do
+	rbf=${core}_MiSTer/output_files/$core.rbf
+	[ -f "$rbf" ] || fail "no $rbf (CORE=$core tools/quartus_build.sh)"
+	newest=$(cd ${core}_MiSTer && git ls-files -z -- . ':!*.md' ':!sim/*' ':!*.qsf' ':!*.cdf' ':!*pin_model_dump.txt' | xargs -0 stat -c '%Y %n' | sort -n | tail -1)
+	[ "${newest%% *}" -le "$(stat -c %Y "$rbf")" ] || fail "$rbf is older than ${newest#* } (rebuild with CORE=$core tools/quartus_build.sh)"
+done
 
 # Main_MiSTer: rebuild (incremental)
 (cd Main_MiSTer && set +u && source setup_default_toolchain.sh >/dev/null && make -j8 >/dev/null) || fail "Main_MiSTer build"
@@ -76,13 +80,15 @@ done
 tools/make_kit.sh >/dev/null
 
 mkdir -p "$out/server"
-cp "$rbf" "$out/NES_netplay.rbf"
+cp NES_MiSTer/output_files/NES.rbf "$out/NES_netplay.rbf"
+cp SNES_MiSTer/output_files/SNES.rbf "$out/SNES_netplay.rbf"
 cp Main_MiSTer/bin/MiSTer "$out/MiSTer_online"
 cp dist/netplay-kit.zip "$out/"
 cp server/build/netplay-server* server/build/install-linux.sh server/README.md "$out/server/"
 chmod +x "$out/MiSTer_online" "$out"/server/netplay-server-linux-* "$out/server/install-linux.sh"
 write_source "$out/SOURCE.txt"
-tools/make_bundle.sh "$out" >/dev/null       # nes-netplay-<version>.zip: everything ready in one file
+cp RELEASE_NOTES.md "$out/"
+tools/make_bundle.sh "$out" >/dev/null       # mister-netplay-<version>.zip: everything ready in one file
 (cd "$out" && find . -type f ! -name md5sums.txt | sort | xargs md5sum > md5sums.txt)
 
 # Nothing private may be in a release (names, addresses, paths, e-mail)
@@ -90,7 +96,7 @@ if [ -x tools/check_private.sh ]; then
 	tools/check_private.sh "$out" || { rm -rf "$out"; fail "private data in the release (see above)"; }
 fi
 
-for r in . NES_MiSTer Main_MiSTer; do git -C "$r" tag -a "$ver" -m "NES netplay $ver"; done
+for r in . NES_MiSTer SNES_MiSTer Main_MiSTer; do git -C "$r" tag -a "$ver" -m "NES and SNES netplay $ver"; done
 echo "releases/$ver:"
 (cd "$out" && find . -type f | sort | sed 's|^\./|  |')
-echo "Tagged $ver in this repo, NES_MiSTer and Main_MiSTer."
+echo "Tagged $ver in this repo, NES_MiSTer, SNES_MiSTer and Main_MiSTer."

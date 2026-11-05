@@ -1,0 +1,1426 @@
+From 22a5058d58db20c37a4dcda175a62232c943e54e Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 3 Nov 2026 18:47:50 +0100
+Subject: [PATCH] Whole-core simulation for netplay's freeze (sim/)
+
+GHDL (in Docker) translates the VHDL to Verilog, with simulation-only
+models of the Altera RAMs and arithmetic; Verilator builds main.v with
+the joypad ports and a C++ harness that models the memories as SNES.sv
+does. snes_sim prints per-frame hashes (video, audio, WRAM, VRAM, ARAM);
+--compare runs a machine whose clock is gated at random frame ticks
+beside one that never stops and compares every output on every cycle.
+---
+ sim/.gitignore        |   3 +
+ sim/Makefile          |  53 ++++++
+ sim/ghdl_fixes.txt    |   3 +
+ sim/ghdl_prep.py      |  71 ++++++++
+ sim/merge_vlog.py     |  43 +++++
+ sim/sim_top.sv        | 289 ++++++++++++++++++++++++++++++++
+ sim/snes_sim.cpp      | 381 ++++++++++++++++++++++++++++++++++++++++++
+ sim/vhdl/bram_sim.vhd | 241 ++++++++++++++++++++++++++
+ sim/vhdl/chip_sim.vhd | 193 +++++++++++++++++++++
+ sim/vhdl_files.txt    |  52 ++++++
+ 10 files changed, 1329 insertions(+)
+ create mode 100644 sim/.gitignore
+ create mode 100644 sim/Makefile
+ create mode 100644 sim/ghdl_fixes.txt
+ create mode 100644 sim/ghdl_prep.py
+ create mode 100644 sim/merge_vlog.py
+ create mode 100644 sim/sim_top.sv
+ create mode 100644 sim/snes_sim.cpp
+ create mode 100644 sim/vhdl/bram_sim.vhd
+ create mode 100644 sim/vhdl/chip_sim.vhd
+ create mode 100644 sim/vhdl_files.txt
+
+diff --git a/sim/.gitignore b/sim/.gitignore
+new file mode 100644
+index 0000000..cb5632e
+--- /dev/null
++++ b/sim/.gitignore
+@@ -0,0 +1,3 @@
++build/
++obj/
++obj_trace/
+diff --git a/sim/Makefile b/sim/Makefile
+new file mode 100644
+index 0000000..42ec387
+--- /dev/null
++++ b/sim/Makefile
+@@ -0,0 +1,53 @@
++# Whole-core SNES simulation (SPEC 10.5, T2s). Simulation only.
++#
++#   make -C sim            build obj/snes_sim (GHDL in Docker translates the VHDL)
++#   make -C sim run ROM=game.sfc FRAMES=120
++#
++# GHDL runs in the Docker image hdlc/ghdl:yosys; Verilator runs locally.
++
++GHDL_IMAGE ?= hdlc/ghdl:yosys
++BUILD      := build
++TOPS       := SNES DSP_LHRomMap SA1Map SufamiMap
++VLOG_SV    := ../rtl/main.v ../rtl/ioport.sv ../rtl/cheatcodes.sv ../rtl/savestates.sv \
++              ../rtl/savestates_regs.sv ../rtl/savestates_map.sv ../rtl/savestates_sa1.sv
++VHDL_SRC   := $(shell sed 's|^|../|' vhdl_files.txt)
++FRAMES     ?= 60
++VFLAGS     := -O3 --x-assign 0 --x-initial 0 -Wno-fatal -Wno-PROCASSWIRE -Wno-WIDTH \
++              -Wno-PINMISSING -Wno-UNOPTFLAT -Wno-CASEINCOMPLETE -Wno-UNUSED -Wno-LATCH -Wno-UNSIGNED \
++              +1364-2005ext+v +1800-2017ext+sv --top-module sim_top
++DOCKER     := docker run --rm -u $(shell id -u):$(shell id -g)
++
++all: obj/snes_sim
++
++$(BUILD)/analyzed: vhdl_files.txt ghdl_fixes.txt ghdl_prep.py $(VHDL_SRC) $(wildcard vhdl/*.vhd)
++	mkdir -p $(BUILD)
++	cd .. && python3 -I sim/ghdl_prep.py sim/vhdl_files.txt sim/$(BUILD)/vhdl sim/$(BUILD)/ghdl
++	touch $@
++
++$(BUILD)/vlog/vhdl_all.v: $(BUILD)/analyzed merge_vlog.py ../rtl/main.v
++	mkdir -p $(BUILD)/vlog
++	for e in $(TOPS); do \
++		$(DOCKER) -v $(abspath $(BUILD))/vhdl:/out -v $(abspath $(BUILD))/ghdl:/work -w /out $(GHDL_IMAGE) \
++			ghdl synth --std=08 -frelaxed -fsynopsys --latches --workdir=/work --out=verilog $$e \
++			> $(BUILD)/vlog/$$e.v 2> $(BUILD)/vlog/$$e.log || { tail -20 $(BUILD)/vlog/$$e.log; exit 1; }; \
++	done
++	python3 -I merge_vlog.py $@ ../rtl/main.v $(addprefix $(BUILD)/vlog/,$(addsuffix .v,$(TOPS)))
++
++obj/snes_sim: $(BUILD)/vlog/vhdl_all.v sim_top.sv snes_sim.cpp $(VLOG_SV)
++	verilator --cc --exe --build -j 0 $(VFLAGS) -Mdir obj -o snes_sim \
++		sim_top.sv $(VLOG_SV) $(BUILD)/vlog/vhdl_all.v snes_sim.cpp
++
++# Same with VCD tracing (TRACE_FROM/TRACE_TO = common cycles in --compare)
++obj_trace/snes_sim: $(BUILD)/vlog/vhdl_all.v sim_top.sv snes_sim.cpp $(VLOG_SV)
++	verilator --cc --exe --build -j 0 --trace $(VFLAGS) -CFLAGS -DTRACE -Mdir obj_trace -o snes_sim \
++		sim_top.sv $(VLOG_SV) $(BUILD)/vlog/vhdl_all.v snes_sim.cpp
++
++trace: obj_trace/snes_sim
++
++run: obj/snes_sim
++	obj/snes_sim $(ROM) --frames $(FRAMES)
++
++clean:
++	rm -rf $(BUILD) obj obj_trace
++
++.PHONY: all trace run clean
+diff --git a/sim/ghdl_fixes.txt b/sim/ghdl_fixes.txt
+new file mode 100644
+index 0000000..2936d65
+--- /dev/null
++++ b/sim/ghdl_fixes.txt
+@@ -0,0 +1,3 @@
++# Literal replacements applied to the simulation copy before GHDL (file|old|new).
++# Quartus accepts these, GHDL does not. The core's own files are never changed.
++rtl/chip/DSP/DSPn.vhd|DATA_RAM_ADDR_A or x"40";|DATA_RAM_ADDR_A or ("000" & x"40");
+diff --git a/sim/ghdl_prep.py b/sim/ghdl_prep.py
+new file mode 100644
+index 0000000..cccde53
+--- /dev/null
++++ b/sim/ghdl_prep.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++"""Copies the core's VHDL into a build folder for GHDL (simulation only) and
++works around constructs Quartus accepts but GHDL rejects:
++- literal replacements listed in ghdl_fixes.txt,
++- a `case` without `when others` gets `when others => null;`.
++Then analyses every file in order, in one GHDL run (in Docker); on a missing
++choice it fixes that file and starts again.
++usage: ghdl_prep.py <filelist> <outdir> <workdir>   (run from the core's root)"""
++import os, re, shutil, subprocess, sys
++
++flist, out, work = sys.argv[1:4]
++root = os.getcwd()
++uid = f"{os.getuid()}:{os.getgid()}"
++files = [l.strip() for l in open(flist) if l.strip()]
++fixes = {}
++for l in open(os.path.join(os.path.dirname(flist), "ghdl_fixes.txt")):
++    if l.strip() and not l.startswith("#"):
++        f, old, new = l.rstrip("\n").split("|")
++        fixes.setdefault(f, []).append((old, new))
++
++for f in files:
++    dst = os.path.join(out, f)
++    os.makedirs(os.path.dirname(dst), exist_ok=True)
++    shutil.copy(f, dst)
++    if f in fixes:
++        t = open(dst).read()
++        for old, new in fixes[f]:
++            if t.count(old) != 1:
++                sys.exit(f"fix not found exactly once in {f}: {old}")
++            t = t.replace(old, new)
++        open(dst, "w").write(t)
++
++def analyse_all():
++    os.makedirs(work, exist_ok=True)
++    for x in os.listdir(work):
++        os.remove(os.path.join(work, x))
++    script = "set -e\n" + "".join(
++        f"ghdl -a --std=08 -frelaxed -fsynopsys --workdir=/work {f} || {{ echo FAILED {f}; exit 1; }}\n" for f in files)
++    cmd = ["docker", "run", "--rm", "-i", "-u", uid, "-v", f"{os.path.abspath(out)}:/out",
++           "-v", f"{os.path.abspath(work)}:/work", "-w", "/out", "hdlc/ghdl:yosys", "sh"]
++    return subprocess.run(cmd, input=script, capture_output=True, text=True)
++
++for _ in range(100):
++    r = analyse_all()
++    if r.returncode == 0:
++        print("ANALYZED", len(files))
++        sys.exit(0)
++    failed = re.search(r"FAILED (\S+)", r.stdout)
++    m = re.search(r"^(\S+?):(\d+):\d+:error: missing choice", r.stderr, re.M)
++    if not failed or not m:
++        sys.exit(f"GHDL error:\n{r.stdout[-1000:]}\n{r.stderr[:3000]}")
++    f, line = m.group(1), int(m.group(2)) - 1
++    dst = os.path.join(out, f)
++    src = open(dst).read().split("\n")
++    depth, i = 0, line + 1
++    while i < len(src):
++        code = src[i].split("--")[0].lower()
++        if re.search(r"\bend\s+case\b", code):
++            if depth == 0:
++                indent = re.match(r"\s*", src[i]).group(0)
++                src.insert(i, indent + "\twhen others => null; -- sim: GHDL needs others")
++                break
++            depth -= 1
++        elif re.search(r"\bcase\b", code):
++            depth += 1
++        i += 1
++    else:
++        sys.exit(f"no end case after {f}:{line + 1}")
++    open(dst, "w").write("\n".join(src))
++    print(f"fixed: {f}:{line + 1}")
++sys.exit("too many fixes")
+diff --git a/sim/merge_vlog.py b/sim/merge_vlog.py
+new file mode 100644
+index 0000000..c46631b
+--- /dev/null
++++ b/sim/merge_vlog.py
+@@ -0,0 +1,43 @@
++#!/usr/bin/env python3
++"""Merges the Verilog that `ghdl synth` wrote for each top entity into one
++file: submodules shared by several tops appear once (they must be identical).
++Tops that main.v instantiates with a parameter get a dummy parameter (GHDL
++fixes generics at their defaults, which are the values main.v uses).
++VHDL is case-insensitive and Quartus matches main.v's pin names that way;
++Verilator does not, so the ports of each top get main.v's spelling.
++usage: merge_vlog.py out.v main.v in1.v in2.v ..."""
++import re, sys
++
++out, mainv, ins = sys.argv[1], sys.argv[2], sys.argv[3:]
++src = re.sub(r"//.*", "", open(mainv).read())
++pins = {}   # module -> {lower name: spelling in main.v}
++for m in re.finditer(r"^[ \t]*(?!(?:generate|if|else|module|begin|end)\b)(\w+)\s*(?:#\s*\((?:[^()]|\([^()]*\))*\)\s*)?\w+\s*\((.*?)\);", src, re.S | re.M):
++    for pin in re.findall(r"\.(\w+)\s*\(", m.group(2)):
++        pins.setdefault(m.group(1), {})[pin.lower()] = pin
++params = {"DSP_LHRomMap": "parameter USE_DSPn = 1'b1;"}
++seen, order = {}, []
++for f in ins:
++    text = open(f).read()
++    for m in re.finditer(r"^module (\w+)\b.*?^endmodule\s*$", text, re.S | re.M):
++        name, body = m.group(1), m.group(0)
++        if name in seen:
++            norm = lambda t: re.sub(r"n\d+", "n", t)
++            if norm(seen[name]) != norm(body):
++                sys.exit(f"module {name} differs between inputs")
++            continue
++        if name in pins:
++            header = re.match(r"module \w+\s*\((.*?)\);", body, re.S).group(1)
++            for port in re.findall(r"(\w+)\s*(?:,|$)", header.replace("\n", " ")):
++                want = pins[name].get(port.lower())
++                if want and want != port:
++                    body = re.sub(r"\b%s\b" % re.escape(port), want, body)
++        if name in params:
++            body = re.sub(r"\);", ");\n  " + params[name], body, count=1)
++        seen[name] = body
++        order.append(name)
++with open(out, "w") as o:
++    o.write("// Generated by sim/merge_vlog.py from ghdl synth output. Do not edit.\n")
++    o.write("/* verilator lint_off WIDTH */\n/* verilator lint_off UNOPTFLAT */\n")
++    for n in order:
++        o.write(seen[n] + "\n\n")
++print(f"{out}: {len(order)} modules")
+diff --git a/sim/sim_top.sv b/sim/sim_top.sv
+new file mode 100644
+index 0000000..7742476
+--- /dev/null
++++ b/sim/sim_top.sv
+@@ -0,0 +1,289 @@
++// Top level (Verilator) for simulating the whole SNES core (simulation only).
++// main.v with the VHDL parts translated by GHDL (sim/Makefile), the two
++// joypad ports from SNES.sv, and the memories left to the C++ harness
++// (sim/snes_sim.cpp), which models them like SNES.sv does: ROM and WRAM in
++// SDRAM, VRAM/ARAM/BSRAM in block RAM.
++module sim_top (
++	input         clk_sys,
++	input         reset,          // like SNES.sv's reset: RESET_N is released at HVCNT_ATZERO
++	input         freeze,         // SPEC 10.1: stops the emulated machine's clock
++	output        emu_clk_en,     // the gate's state: 1 = the next rising edge reaches the machine
++
++	input   [7:0] rom_type,
++	input  [23:0] rom_mask,
++	input  [23:0] ram_mask,
++	input   [3:0] ram_size,
++	input         pal,
++
++	input  [11:0] joy0,
++	input  [11:0] joy1,
++
++	output        sysclkr_ce,
++	output        sysclkf_ce,
++	output        refresh,
++
++	output [23:0] rom_addr,
++	output [15:0] rom_d,
++	input  [15:0] rom_q,
++	output        rom_oe_n,
++	output        rom_we_n,
++	output        rom_word,
++
++	output [19:0] bsram_addr,
++	output  [7:0] bsram_d,
++	input   [7:0] bsram_q,
++	output        bsram_ce_n,
++	output        bsram_oe_n,
++	output        bsram_we_n,
++
++	output [16:0] wram_addr,
++	output  [7:0] wram_d,
++	input   [7:0] wram_q,
++	output        wram_ce_n,
++	output        wram_oe_n,
++	output        wram_we_n,
++
++	output [15:0] vram1_addr,
++	input   [7:0] vram1_q,
++	output  [7:0] vram1_d,
++	output        vram1_we_n,
++	output [15:0] vram2_addr,
++	input   [7:0] vram2_q,
++	output  [7:0] vram2_d,
++	output        vram2_we_n,
++	output        vram_oe_n,
++
++	output [15:0] aram_addr,
++	output  [7:0] aram_d,
++	input   [7:0] aram_q,
++	output        aram_ce_n,
++	output        aram_we_n,
++
++	output  [7:0] r,
++	output  [7:0] g,
++	output  [7:0] b,
++	output        dotclk,
++	output        hblank_n,
++	output        vblank_n,
++	output        hsync,
++	output        vsync,
++	output        field,
++	output        interlace,
++	output        high_res,
++
++	output [15:0] audio_l,
++	output [15:0] audio_r
++);
++
++// The clock gate, as Cyclone V's ALTCLKCTRL: ena is latched on the falling
++// edge, so the gated clock never glitches. Everything of the emulated machine
++// (main, the joypad ports, the block RAMs in the harness) runs on clk_emu.
++reg en_l = 1'b1;
++always @(negedge clk_sys) en_l <= ~freeze;
++wire clk_emu = clk_sys & en_l;
++assign emu_clk_en = en_l;
++
++reg RESET_N = 0;
++wire HVCNT_ATZERO;
++always @(posedge clk_sys) begin
++	reg [1:0] div;
++	div <= div + 1'd1;
++	if (reset) begin
++		if (div == 2) RESET_N <= 0;
++	end
++	else if (HVCNT_ATZERO) RESET_N <= 1;
++end
++
++wire       JOY_STRB;
++wire [1:0] JOY1_DO, JOY2_DO;
++wire       JOY1_CLK, JOY2_CLK, JOY1_P6, JOY2_P6;
++
++ioport port1
++(
++	.CLK(clk_emu),
++	.MULTITAP(1'b0),
++	.PORT_LATCH(JOY_STRB),
++	.PORT_CLK(JOY1_CLK),
++	.PORT_P6(JOY1_P6),
++	.PORT_DO(JOY1_DO),
++	.JOYSTICK1(joy0),
++	.JOYSTICK2(12'd0),
++	.JOYSTICK3(12'd0),
++	.JOYSTICK4(12'd0),
++	.JOYSTICK1_RUMBLE(),
++	.MOUSE(25'd0),
++	.MOUSE_EN(1'b0)
++);
++
++ioport port2
++(
++	.CLK(clk_emu),
++	.MULTITAP(1'b0),
++	.PORT_LATCH(JOY_STRB),
++	.PORT_CLK(JOY2_CLK),
++	.PORT_P6(JOY2_P6),
++	.PORT_DO(JOY2_DO),
++	.JOYSTICK1(joy1),
++	.JOYSTICK2(12'd0),
++	.JOYSTICK3(12'd0),
++	.JOYSTICK4(12'd0),
++	.JOYSTICK1_RUMBLE(),
++	.MOUSE(25'd0),
++	.MOUSE_EN(1'b0)
++);
++
++main #(
++	.USE_DLH(1'b1),
++	.USE_CX4(1'b0),
++	.USE_SDD1(1'b0),
++	.USE_GSU(1'b0),
++	.USE_SA1(1'b1),
++	.USE_DSPn(1'b1),
++	.USE_SPC7110(1'b0),
++	.USE_BSX(1'b0),
++	.USE_SUFAMI(1'b0),
++	.USE_MSU(1'b0),
++	.USE_SS(1'b0)
++) main
++(
++	.RESET_N(RESET_N),
++	.MCLK(clk_emu),
++	.ACLK(clk_emu),
++
++	.ROM_TYPE(rom_type),
++	.ROM_MASK(rom_mask),
++	.RAM_MASK(ram_mask),
++	.RAM_SIZE(ram_size),
++
++	.SYSCLKR_CE(sysclkr_ce),
++	.SYSCLKF_CE(sysclkf_ce),
++	.REFRESH(refresh),
++
++	.ROM_ADDR(rom_addr),
++	.ROM_D(rom_d),
++	.ROM_Q(rom_q),
++	.ROM_CE_N(),
++	.ROM_OE_N(rom_oe_n),
++	.ROM_WE_N(rom_we_n),
++	.ROM_WORD(rom_word),
++
++	.BSRAM_ADDR(bsram_addr),
++	.BSRAM_D(bsram_d),
++	.BSRAM_Q(bsram_q),
++	.BSRAM_CE_N(bsram_ce_n),
++	.BSRAM_OE_N(bsram_oe_n),
++	.BSRAM_WE_N(bsram_we_n),
++
++	.WRAM_ADDR(wram_addr),
++	.WRAM_D(wram_d),
++	.WRAM_Q(wram_q),
++	.WRAM_CE_N(wram_ce_n),
++	.WRAM_OE_N(wram_oe_n),
++	.WRAM_WE_N(wram_we_n),
++
++	.VRAM1_ADDR(vram1_addr),
++	.VRAM1_DI(vram1_q),
++	.VRAM1_DO(vram1_d),
++	.VRAM1_WE_N(vram1_we_n),
++	.VRAM2_ADDR(vram2_addr),
++	.VRAM2_DI(vram2_q),
++	.VRAM2_DO(vram2_d),
++	.VRAM2_WE_N(vram2_we_n),
++	.VRAM_OE_N(vram_oe_n),
++
++	.ARAM_ADDR(aram_addr),
++	.ARAM_D(aram_d),
++	.ARAM_Q(aram_q),
++	.ARAM_CE_N(aram_ce_n),
++	.ARAM_OE_N(),
++	.ARAM_WE_N(aram_we_n),
++
++	.GSU_ACTIVE(),
++	.GSU_TURBO(1'b0),
++	.GSU_FASTROM(1'b0),
++	.SUFAMI_SWAP(1'b0),
++	.CC_DIP(8'h10),
++
++	.BLEND(1'b0),
++	.PAL(pal),
++	.HIGH_RES(high_res),
++	.V224_MODE(),
++	.FIELD(field),
++	.INTERLACE(interlace),
++	.DOTCLK(dotclk),
++	.R(r),
++	.G(g),
++	.B(b),
++	.HBLANKn(hblank_n),
++	.VBLANKn(vblank_n),
++	.HSYNC(hsync),
++	.VSYNC(vsync),
++	.HVCNT_ATZERO(HVCNT_ATZERO),
++
++	.JOY1_DI(JOY1_DO),
++	.JOY2_DI(JOY2_DO),
++	.JOY_STRB(JOY_STRB),
++	.JOY1_CLK(JOY1_CLK),
++	.JOY2_CLK(JOY2_CLK),
++	.JOY1_P6(JOY1_P6),
++	.JOY2_P6(JOY2_P6),
++	.JOY2_P6_in(1'b1),
++	.SNI_JOY(),
++
++	.EXT_RTC(65'd0),
++
++	.GG_EN(1'b0),
++	.GG_CODE(129'd0),
++	.GG_RESET(1'b0),
++	.GG_AVAILABLE(),
++
++	.SPC_MODE(1'b0),
++	.IO_ADDR(17'd0),
++	.IO_DAT(16'd0),
++	.IO_WR(1'b0),
++
++	.DBG_BG_EN(5'b11111),
++	.DBG_CPU_EN(1'b1),
++
++	.TURBO(1'b0),
++	.TURBO_ALLOW(),
++	.DSP_FREQ(1'b0),
++
++	.MSU_TRACK_NUM(),
++	.MSU_TRACK_REQUEST(),
++	.MSU_TRACK_MOUNTING(1'b0),
++	.MSU_TRACK_MISSING(1'b0),
++	.MSU_VOLUME(),
++	.MSU_AUDIO_STOP(1'b0),
++	.MSU_AUDIO_REPEAT(),
++	.MSU_AUDIO_RESUME(),
++	.MSU_AUDIO_PLAYING(),
++	.MSU_AUDIO_SECTOR(22'd0),
++	.MSU_RESUME_SECTOR(),
++	.MSU_AUDIO_LOOP_INDEX(32'd0),
++	.MSU_RESUME_LOOP_INDEX(),
++	.MSU_DATA_ADDR(),
++	.MSU_DATA(8'd0),
++	.MSU_DATA_ACK(1'b0),
++	.MSU_DATA_SEEK(),
++	.MSU_DATA_REQ(),
++	.MSU_ENABLE(1'b0),
++
++	.SS_SAVE(1'b0),
++	.SS_TOSD(1'b0),
++	.SS_LOAD(1'b0),
++	.SS_SLOT(2'd0),
++	.SS_AVAIL(),
++	.SS_DDR_DI(64'd0),
++	.SS_DDR_ACK(1'b0),
++	.SS_DDR_DO(),
++	.SS_DDR_ADDR(),
++	.SS_DDR_WE(),
++	.SS_DDR_BE(),
++	.SS_DDR_REQ(),
++
++	.AUDIO_L(audio_l),
++	.AUDIO_R(audio_r)
++);
++
++endmodule
+diff --git a/sim/snes_sim.cpp b/sim/snes_sim.cpp
+new file mode 100644
+index 0000000..e3e0c86
+--- /dev/null
++++ b/sim/snes_sim.cpp
+@@ -0,0 +1,381 @@
++// Whole-core SNES simulation (Verilator), simulation only.
++//
++//   snes_sim <rom> [--frames N] [--ppm DIR --shot F,F,...] [--freeze SEED]
++//            [--pad FILE] [--dump FRAME wram.bin] [--compare SEED] [--freeze-at FRAME CYCLES]
++//
++// Prints one line per frame: "frame <n> video <h> audio <h> wram <h> vram <h> aram <h>".
++// Two runs of the same ROM and inputs must print the same lines; with --freeze
++// the machine is frozen for a random number of cycles at random frame ticks
++// (SPEC 10.1), which must not change any line.
++//
++// --compare runs two machines side by side: A is never frozen, B is frozen as
++// with --freeze, and A waits while B is frozen. Every output of the core is
++// compared after every common cycle; the first difference is reported.
++//
++// Memories are modelled like SNES.sv does: ROM and WRAM in SDRAM (read data one
++// clk_sys after the request), VRAM, ARAM and BSRAM as block RAM (registered
++// address, unregistered output).
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cstdint>
++#include <string>
++#include <vector>
++#include <set>
++#include <memory>
++#include "Vsim_top.h"
++#include "verilated.h"
++#ifdef TRACE
++#include "verilated_vcd_c.h"
++#endif
++
++static uint64_t fnv(uint64_t h, const void *p, size_t n)
++{
++	const uint8_t *b = (const uint8_t *)p;
++	for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 0x100000001b3ULL; }
++	return h;
++}
++static const uint64_t FNV0 = 0xcbf29ce484222325ULL;
++
++// ---- ROM header, as Main_MiSTer's snes_get_header() (support/snes/snes.cpp) ----
++static int score_header(const uint8_t *d, uint32_t size, uint32_t a)
++{
++	if (size < a + 64) return 0;
++	int s = 0;
++	uint16_t rv = d[a + 0x3c] | (d[a + 0x3d] << 8);
++	uint16_t ck = d[a + 0x1e] | (d[a + 0x1f] << 8);
++	uint16_t cp = d[a + 0x1c] | (d[a + 0x1d] << 8);
++	if (rv < 0x8000) return 0;
++	uint8_t op = d[(a & ~0x7fff) | (rv & 0x7fff)];
++	uint8_t mapper = d[a + 0x15] & ~0x10;
++	if (op == 0x78 || op == 0x18 || op == 0x38 || op == 0x9c || op == 0x4c || op == 0x5c) s += 8;
++	if (op == 0xc2 || op == 0xe2 || op == 0xad || op == 0xae || op == 0xac || op == 0xaf || op == 0xa9 ||
++	    op == 0xa2 || op == 0xa0 || op == 0x20 || op == 0x22) s += 4;
++	if (op == 0x40 || op == 0x60 || op == 0x6b || op == 0xcd || op == 0xec || op == 0xcc) s -= 4;
++	if (op == 0x00 || op == 0x02 || op == 0xdb || op == 0x42 || op == 0xff) s -= 8;
++	if ((ck + cp) == 0xffff && ck && cp) s += 4;
++	if (a == 0x007fc0 && mapper == 0x20) s += 2;
++	if (a == 0x00ffc0 && mapper == 0x21) s += 2;
++	if (a == 0x007fc0 && mapper == 0x22) s += 2;
++	if (a == 0x40ffc0 && mapper == 0x25) s += 2;
++	if (d[a + 0x1a] == 0x33) s += 2;
++	if (d[a + 0x16] < 0x08) s++;
++	if (d[a + 0x17] < 0x10) s++;
++	if (d[a + 0x18] < 0x08) s++;
++	if (d[a + 0x19] < 14) s++;
++	return s < 0 ? 0 : s;
++}
++
++struct Cart { uint8_t rom_type = 0, rom_size = 0, ram_size = 0; bool pal = false; const char *kind = "?"; };
++
++static Cart detect(const uint8_t *d, uint32_t size)
++{
++	Cart c;
++	int lo = score_header(d, size, 0x7fc0), hi = score_header(d, size, 0xffc0), ex = score_header(d, size, 0x40ffc0);
++	if (ex) ex += 4;
++	uint32_t a = (lo >= hi && lo >= ex) ? (lo ? 0x7fc0 : 0) : (hi >= ex) ? (hi ? 0xffc0 : 0) : (ex ? 0x40ffc0 : 0);
++	if (!a) { fprintf(stderr, "no SNES header found\n"); exit(2); }
++	uint8_t ramsz = d[a + 0x18];
++	if (ramsz >= 9) ramsz = 0;
++	uint8_t romsz = 15;
++	uint32_t s = size - 1;
++	if (!(s & 0xFF000000)) while (!(s & 0x1000000)) { romsz--; s <<= 1; }
++	uint8_t mapper = d[a + 0x15], type = d[a + 0x16];
++	c.rom_type = a == 0xffc0 ? 1 : a == 0x40ffc0 ? 2 : 0;
++	c.kind = c.rom_type == 1 ? "HiROM" : c.rom_type == 2 ? "ExHiROM" : "LoROM";
++	if (mapper == 0x20 && type == 0x03) { c.rom_type |= 0x84; c.kind = "DSP1"; }
++	else if (mapper == 0x21 && type == 0x03) { c.rom_type |= 0x80; c.kind = "DSP1B"; }
++	if (mapper == 0x23 && (type == 0x32 || type == 0x33 || type == 0x34 || type == 0x35)) { c.rom_type |= 0x60; c.kind = "SA-1"; }
++	if (mapper == 0x20 && (type == 0x13 || type == 0x14 || type == 0x15 || type == 0x1a)) {
++		ramsz = d[a - 3];
++		if (ramsz == 0xFF) ramsz = 5;
++		if (ramsz > 6) ramsz = 6;
++		c.rom_type |= 0x70; c.kind = "GSU";
++	}
++	uint8_t region = d[a + 0x19];
++	c.pal = (region >= 0x02 && region <= 0x0C) || region == 0x11;
++	c.rom_size = romsz; c.ram_size = ramsz;
++	return c;
++}
++
++// One SNES: the core plus its memories.
++struct Machine {
++	std::unique_ptr<Vsim_top> top;
++	std::vector<uint8_t> sdram, wram, vram1, vram2, aram, bsram;
++	uint32_t vram1_a = 0, vram2_a = 0, aram_a = 0, bsram_a = 0;
++	bool vram_oe_d = true, read_pulse = false;
++	uint64_t cycle = 0;
++#ifdef TRACE
++	VerilatedVcdC *vcd = nullptr;
++	uint64_t tstamp = 0;      // advances only on traced cycles
++	void dump() { if (vcd) vcd->dump(tstamp++); }
++#else
++	void dump() {}
++#endif
++
++	Machine(const std::vector<uint8_t> &rom, const Cart &cart)
++		: top(new Vsim_top), sdram(16 << 20, 0), wram(128 << 10, 0x00), vram1(32 << 10, 0), vram2(32 << 10, 0),
++		  aram(64 << 10, 0), bsram(256 << 10, 0xFF)
++	{
++		memcpy(sdram.data(), rom.data(), std::min(rom.size(), sdram.size()));
++		top->rom_type = cart.rom_type;
++		top->rom_mask = (1024u << cart.rom_size) - 1;
++		top->ram_mask = cart.ram_size ? (1024u << cart.ram_size) - 1 : 0;
++		top->ram_size = cart.ram_size;
++		top->pal = cart.pal;
++		top->joy0 = 0; top->joy1 = 0;
++		top->reset = 1;
++		top->freeze = 0;
++		top->clk_sys = 0;
++		top->eval();
++	}
++
++	void step()
++	{
++		Vsim_top *t = top.get();
++		// sample the core's outputs before the edge
++		uint32_t ra = t->rom_addr; bool r_oe = !t->rom_oe_n, r_we = !t->rom_we_n, r_word = t->rom_word; uint16_t r_d = t->rom_d;
++		uint32_t wa = t->wram_addr; bool w_ce = !t->wram_ce_n, w_oe = !t->wram_oe_n, w_we = !t->wram_we_n; uint8_t w_d = t->wram_d;
++		bool sysf = t->sysclkf_ce, sysr = t->sysclkr_ce;
++		uint32_t v1a = t->vram1_addr & 0x7fff, v2a = t->vram2_addr & 0x7fff;
++		bool v1we = !t->vram1_we_n, v2we = !t->vram2_we_n; uint8_t v1d = t->vram1_d, v2d = t->vram2_d;
++		bool voe = t->vram_oe_n;
++		uint32_t aa = t->aram_addr; bool a_we = !t->aram_ce_n && !t->aram_we_n; uint8_t a_d = t->aram_d;
++		uint32_t ba = t->bsram_addr & 0x3ffff; bool b_we = !t->bsram_ce_n && !t->bsram_we_n; uint8_t b_d = t->bsram_d;
++		bool gate = t->emu_clk_en;   // this rising edge reaches the machine (SNES.sv: clk_emu)
++
++		dump();
++		t->clk_sys = 1;
++		t->eval();
++
++		if (gate) {
++		// SDRAM port 0 (ROM): read while OE is low, write while WE is low
++		if (r_we) {
++			if (r_word) { sdram[ra & ~1u] = r_d & 0xff; sdram[ra | 1] = r_d >> 8; }
++			else sdram[ra] = (ra & 1) ? (r_d >> 8) : (r_d & 0xff);
++		}
++		if (r_oe) {
++			uint16_t w = sdram[ra & ~1u] | (sdram[ra | 1] << 8);
++			t->rom_q = ((ra & 1) && !r_word) ? (uint16_t)((w & 0xff00) | (w >> 8)) : w;
++		}
++		// SDRAM port 1 (WRAM): read on READ_PULSE (SYSCLKR_CE delayed), write on SYSCLKF_CE
++		if (w_ce && w_we && sysf) wram[wa] = w_d;
++		if (w_ce && w_oe && read_pulse) t->wram_q = wram[wa];
++		read_pulse = sysr;
++		// block RAMs
++		if (v1we) vram1[v1a] = v1d;
++		if (v2we) vram2[v2a] = v2d;
++		vram1_a = v1a; vram2_a = v2a;
++		bool oe_d = vram_oe_d; vram_oe_d = voe;
++		if (a_we) aram[aa] = a_d;
++		aram_a = aa;
++		if (b_we) bsram[ba] = b_d;
++		bsram_a = ba;
++		bool vq = !t->vram_oe_n && !oe_d;
++		t->vram1_q = vq ? vram1[vram1_a] : 0xff;
++		t->vram2_q = vq ? vram2[vram2_a] : 0xff;
++		t->aram_q = aram[aram_a];
++		t->bsram_q = bsram[bsram_a];
++		}
++		t->eval();
++
++		t->clk_sys = 0;
++		t->eval();
++		cycle++;
++	}
++};
++
++// The core's outputs, for --compare
++#define OUTPUTS(X) X(sysclkr_ce) X(sysclkf_ce) X(refresh) X(rom_addr) X(rom_d) X(rom_oe_n) X(rom_we_n) X(rom_word) \
++	X(bsram_addr) X(bsram_d) X(bsram_ce_n) X(bsram_oe_n) X(bsram_we_n) X(wram_addr) X(wram_d) X(wram_ce_n) X(wram_oe_n) \
++	X(wram_we_n) X(vram1_addr) X(vram1_d) X(vram1_we_n) X(vram2_addr) X(vram2_d) X(vram2_we_n) X(vram_oe_n) X(aram_addr) \
++	X(aram_d) X(aram_ce_n) X(aram_we_n) X(r) X(g) X(b) X(dotclk) X(hblank_n) X(vblank_n) X(hsync) X(vsync) X(field) \
++	X(interlace) X(high_res) X(audio_l) X(audio_r)
++
++static const char *first_diff(const Vsim_top *a, const Vsim_top *b, uint64_t *va, uint64_t *vb)
++{
++#define CMP(n) if ((uint64_t)a->n != (uint64_t)b->n) { *va = a->n; *vb = b->n; return #n; }
++	OUTPUTS(CMP)
++#undef CMP
++	return nullptr;
++}
++
++int main(int argc, char **argv)
++{
++	Verilated::commandArgs(argc, argv);
++	if (argc < 2) {
++		fprintf(stderr, "usage: %s rom [--frames N] [--ppm DIR --shot F,...] [--freeze SEED] [--pad FILE] "
++		        "[--dump FRAME file] [--compare SEED]\n", argv[0]);
++		return 2;
++	}
++	const char *rom_path = argv[1];
++	int frames = 60;
++	std::string ppm_dir;
++	std::set<int> shots;
++	long freeze_seed = -1;
++	bool compare = false;
++	int at_frame = -1; long at_len = 0;
++	const char *pad_path = nullptr;
++	int dump_frame = -1;
++	std::string dump_path;
++	for (int i = 2; i < argc; i++) {
++		if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atoi(argv[++i]);
++		else if (!strcmp(argv[i], "--ppm") && i + 1 < argc) ppm_dir = argv[++i];
++		else if (!strcmp(argv[i], "--shot") && i + 1 < argc) {
++			for (char *t = strtok(argv[++i], ","); t; t = strtok(nullptr, ",")) shots.insert(atoi(t));
++		}
++		else if (!strcmp(argv[i], "--freeze") && i + 1 < argc) freeze_seed = atol(argv[++i]);
++		else if (!strcmp(argv[i], "--compare") && i + 1 < argc) { freeze_seed = atol(argv[++i]); compare = true; }
++		else if (!strcmp(argv[i], "--pad") && i + 1 < argc) pad_path = argv[++i];
++		else if (!strcmp(argv[i], "--freeze-at") && i + 2 < argc) { at_frame = atoi(argv[++i]); at_len = atol(argv[++i]); }
++		else if (!strcmp(argv[i], "--dump") && i + 2 < argc) { dump_frame = atoi(argv[++i]); dump_path = argv[++i]; }
++	}
++
++	// ROM into "SDRAM" at 0, as the cart download does (copier header skipped)
++	std::vector<uint8_t> file;
++	{
++		FILE *f = fopen(rom_path, "rb");
++		if (!f) { perror(rom_path); return 2; }
++		uint8_t buf[65536]; size_t n;
++		while ((n = fread(buf, 1, sizeof buf, f)) > 0) file.insert(file.end(), buf, buf + n);
++		fclose(f);
++	}
++	size_t skip = (file.size() & 512) ? 512 : 0;
++	std::vector<uint8_t> rom(file.begin() + skip, file.end());
++	Cart cart = detect(rom.data(), (uint32_t)rom.size());
++	fprintf(stderr, "%s: %s, rom_type %02x, rom %u, ram %u, %s\n", rom_path, cart.kind, cart.rom_type,
++	        cart.rom_size, cart.ram_size, cart.pal ? "PAL" : "NTSC");
++
++	// optional input script: lines "frame joy0 joy1" (hex joys), applied from that frame on
++	std::vector<std::pair<int, std::pair<int, int>>> pad;
++	if (pad_path) {
++		FILE *f = fopen(pad_path, "r");
++		if (!f) { perror(pad_path); return 2; }
++		int fr, j0, j1;
++		while (fscanf(f, "%d %x %x", &fr, &j0, &j1) == 3) pad.push_back({fr, {j0, j1}});
++		fclose(f);
++	}
++
++#ifdef TRACE
++	Verilated::traceEverOn(true);
++	uint64_t tr_from = getenv("TRACE_FROM") ? strtoull(getenv("TRACE_FROM"), 0, 10) : 0;
++	uint64_t tr_to = getenv("TRACE_TO") ? strtoull(getenv("TRACE_TO"), 0, 10) : 0;
++#endif
++	Machine m(rom, cart);                       // the machine that is reported (B in --compare)
++	std::unique_ptr<Machine> ref;               // A in --compare: never frozen
++	if (compare) ref.reset(new Machine(rom, cart));
++
++	// reset for a while, then release (RESET_N follows at HVCNT_ATZERO)
++	for (int i = 0; i < 2000; i++) { m.step(); if (ref) ref->step(); }
++	m.top->reset = 0;
++	if (ref) ref->top->reset = 0;
++
++	int frame = -1;               // the first VBlank start ends frame 0
++	uint64_t vh = FNV0, ah = FNV0;
++	uint16_t last_l = 0, last_r = 0;
++	bool last_vbl = true, last_dot = false, last_hbl = true;
++	std::vector<uint8_t> line, img;
++	int lines = 0, width = 0;
++	srand48(freeze_seed >= 0 ? freeze_seed : 1);
++	size_t pad_i = 0;
++	long freeze_left = 0, freezes = 0;
++	uint64_t frozen_cycles = 0, common = 0;
++	uint64_t max_cycles = (uint64_t)(frames + 4) * 450000ULL;
++
++	while (frame < frames && m.cycle < max_cycles + frozen_cycles) {
++		Vsim_top *t = m.top.get();
++		bool was_frozen = freeze_left > 0;
++#ifdef TRACE
++		// trace the emulated cycles TRACE_FROM..TRACE_TO (frozen cycles are not traced,
++		// so a run with freezes lines up with a run without)
++		uint64_t emu = m.cycle - frozen_cycles;
++		if (tr_to && emu == tr_from && !m.vcd) {
++			m.vcd = new VerilatedVcdC; m.top->trace(m.vcd, 99); m.vcd->open(getenv("TRACE_FILE") ? getenv("TRACE_FILE") : "trace.vcd");
++		}
++		if (tr_to && emu == tr_to && m.vcd) { m.vcd->close(); return 3; }
++		VerilatedVcdC *saved = m.vcd;
++		if (was_frozen) m.vcd = nullptr;
++#endif
++		m.step();
++#ifdef TRACE
++		m.vcd = saved;
++#endif
++		if (was_frozen) {
++			frozen_cycles++;
++			if (--freeze_left == 0) { t->freeze = 0; t->eval(); }
++		} else if (ref) {
++			ref->step();
++			common++;
++			uint64_t va, vb;
++			if (const char *d = first_diff(ref->top.get(), t, &va, &vb)) {
++				printf("DIFF frame %d, common cycle %llu (B frozen %llu cycles in %ld freezes): %s A=%llx B=%llx\n",
++				       frame, (unsigned long long)common, (unsigned long long)frozen_cycles, freezes, d,
++				       (unsigned long long)va, (unsigned long long)vb);
++				return 1;
++			}
++		}
++
++		bool vbl = !t->vblank_n, hbl = !t->hblank_n, dot = t->dotclk;
++		if (dot && !last_dot && !vbl && !hbl) {
++			uint8_t px[3] = { t->r, t->g, t->b };
++			vh = fnv(vh, px, 3);
++			line.insert(line.end(), px, px + 3);
++		}
++		if (hbl && !last_hbl && !line.empty()) {
++			if (!width) width = (int)line.size() / 3;
++			if ((int)line.size() / 3 == width) { img.insert(img.end(), line.begin(), line.end()); lines++; }
++			line.clear();
++		}
++		if (t->audio_l != last_l || t->audio_r != last_r) {
++			last_l = t->audio_l; last_r = t->audio_r;
++			uint16_t s[2] = { last_l, last_r };
++			ah = fnv(ah, s, 4);
++		}
++		if (vbl && !last_vbl) {
++			if (frame >= 0) {
++				printf("frame %d video %016llx audio %016llx wram %016llx vram %016llx aram %016llx\n", frame,
++				       (unsigned long long)vh, (unsigned long long)ah,
++				       (unsigned long long)fnv(FNV0, m.wram.data(), m.wram.size()),
++				       (unsigned long long)fnv(fnv(FNV0, m.vram1.data(), m.vram1.size()), m.vram2.data(), m.vram2.size()),
++				       (unsigned long long)fnv(FNV0, m.aram.data(), m.aram.size()));
++				fflush(stdout);
++				if (frame == dump_frame) {
++					if (FILE *f = fopen(dump_path.c_str(), "wb")) { fwrite(m.wram.data(), 1, m.wram.size(), f); fclose(f); }
++				}
++				if (!ppm_dir.empty() && shots.count(frame) && width) {
++					char path[512];
++					snprintf(path, sizeof path, "%s/frame%05d.ppm", ppm_dir.c_str(), frame);
++					if (FILE *f = fopen(path, "wb")) {
++						fprintf(f, "P6\n%d %d\n255\n", width, lines);
++						fwrite(img.data(), 1, img.size(), f);
++						fclose(f);
++					}
++				}
++			}
++			frame++;
++			// SPEC 10.1: freeze at the frame tick for a random time
++			if (freeze_seed >= 0 && frame > 0 && drand48() < 0.5) {
++				freeze_left = drand48() < 0.1 ? 1 + (long)(drand48() * 200000) : 1 + (long)(drand48() * 5000);
++			}
++			if (frame == at_frame) freeze_left = at_len;
++			if (freeze_left > 0) {
++				t->freeze = 1;
++				t->eval();      // FREEZE comes from a register: settled before the next edge
++				freezes++;
++				if (getenv("SNES_SIM_VERBOSE")) fprintf(stderr, "freeze at frame %d for %ld, common cycle %llu\n", frame, freeze_left, (unsigned long long)common);
++			}
++			vh = FNV0; ah = FNV0; img.clear(); lines = 0; width = 0;
++			while (pad_i < pad.size() && pad[pad_i].first <= frame) {
++				t->joy0 = pad[pad_i].second.first; t->joy1 = pad[pad_i].second.second;
++				t->eval();
++				if (ref) { ref->top->joy0 = t->joy0; ref->top->joy1 = t->joy1; ref->top->eval(); }
++				pad_i++;
++			}
++		}
++		last_vbl = vbl; last_hbl = hbl; last_dot = dot;
++	}
++	fprintf(stderr, "%d frames, %llu cycles, %ld freezes, %llu frozen cycles\n", frame, (unsigned long long)m.cycle,
++	        freezes, (unsigned long long)frozen_cycles);
++	m.top->final();
++	return frame >= frames ? 0 : 1;
++}
+diff --git a/sim/vhdl/bram_sim.vhd b/sim/vhdl/bram_sim.vhd
+new file mode 100644
+index 0000000..c8f2ff6
+--- /dev/null
++++ b/sim/vhdl/bram_sim.vhd
+@@ -0,0 +1,241 @@
++-- Simulation-only replacements for rtl/bram.vhd and rtl/mlab.vhd (the Altera
++-- megafunctions are not available to GHDL). Same ports and the same read
++-- behaviour as the altsyncram/altdpram settings in those files: registered
++-- address, unregistered output, new data on a read during a write.
++-- init files are not loaded (DSPn/CX4/BS-X ROMs stay empty in simulation).
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++
++entity dpram_dif is
++	generic (
++		addr_width_a  : integer := 8;
++		data_width_a  : integer := 8;
++		addr_width_b  : integer := 8;
++		data_width_b  : integer := 8;
++		mem_init_file : string := " "
++	);
++	port (
++		clock     : in  std_logic;
++		address_a : in  std_logic_vector(addr_width_a-1 downto 0);
++		data_a    : in  std_logic_vector(data_width_a-1 downto 0) := (others => '0');
++		enable_a  : in  std_logic := '1';
++		wren_a    : in  std_logic := '0';
++		q_a       : out std_logic_vector(data_width_a-1 downto 0);
++		cs_a      : in  std_logic := '1';
++		address_b : in  std_logic_vector(addr_width_b-1 downto 0) := (others => '0');
++		data_b    : in  std_logic_vector(data_width_b-1 downto 0) := (others => '0');
++		enable_b  : in  std_logic := '1';
++		wren_b    : in  std_logic := '0';
++		q_b       : out std_logic_vector(data_width_b-1 downto 0);
++		cs_b      : in  std_logic := '1'
++	);
++end entity;
++
++architecture sim of dpram_dif is
++	-- memory in units of the narrower port; the wider port covers RA or RB units
++	function min(a, b : integer) return integer is begin if a < b then return a; else return b; end if; end function;
++	constant W  : integer := min(data_width_a, data_width_b);
++	constant RA : integer := data_width_a / W;
++	constant RB : integer := data_width_b / W;
++	constant N  : integer := (2**addr_width_a) * RA;
++	type mem_t is array(0 to N-1) of std_logic_vector(W-1 downto 0);
++	signal mem : mem_t := (others => (others => '0'));
++	signal ra_r : std_logic_vector(addr_width_a-1 downto 0) := (others => '0');
++	signal rb_r : std_logic_vector(addr_width_b-1 downto 0) := (others => '0');
++	signal q0 : std_logic_vector(data_width_a-1 downto 0);
++	signal q1 : std_logic_vector(data_width_b-1 downto 0);
++begin
++	process(clock)
++	begin
++		if rising_edge(clock) then
++			if enable_a = '1' then
++				ra_r <= address_a;
++				if wren_a = '1' and cs_a = '1' then
++					for i in 0 to RA-1 loop
++						mem(to_integer(unsigned(address_a))*RA + i) <= data_a((i+1)*W-1 downto i*W);
++					end loop;
++				end if;
++			end if;
++			if enable_b = '1' then
++				rb_r <= address_b;
++				if wren_b = '1' and cs_b = '1' then
++					for i in 0 to RB-1 loop
++						mem(to_integer(unsigned(address_b))*RB + i) <= data_b((i+1)*W-1 downto i*W);
++					end loop;
++				end if;
++			end if;
++		end if;
++	end process;
++
++	g_a: for i in 0 to RA-1 generate
++		q0((i+1)*W-1 downto i*W) <= mem(to_integer(unsigned(ra_r))*RA + i);
++	end generate;
++	g_b: for i in 0 to RB-1 generate
++		q1((i+1)*W-1 downto i*W) <= mem(to_integer(unsigned(rb_r))*RB + i);
++	end generate;
++
++	q_a <= q0 when cs_a = '1' else (others => '1');
++	q_b <= q1 when cs_b = '1' else (others => '1');
++end architecture;
++
++library ieee;
++use ieee.std_logic_1164.all;
++
++entity dpram is
++	generic (
++		addr_width    : integer := 8;
++		data_width    : integer := 8;
++		mem_init_file : string := " "
++	);
++	port (
++		clock     : in  std_logic;
++		address_a : in  std_logic_vector(addr_width-1 downto 0);
++		data_a    : in  std_logic_vector(data_width-1 downto 0) := (others => '0');
++		enable_a  : in  std_logic := '1';
++		wren_a    : in  std_logic := '0';
++		q_a       : out std_logic_vector(data_width-1 downto 0);
++		cs_a      : in  std_logic := '1';
++		address_b : in  std_logic_vector(addr_width-1 downto 0) := (others => '0');
++		data_b    : in  std_logic_vector(data_width-1 downto 0) := (others => '0');
++		enable_b  : in  std_logic := '1';
++		wren_b    : in  std_logic := '0';
++		q_b       : out std_logic_vector(data_width-1 downto 0);
++		cs_b      : in  std_logic := '1'
++	);
++end entity;
++
++architecture sim of dpram is
++begin
++	ram : entity work.dpram_dif generic map(addr_width, data_width, addr_width, data_width, mem_init_file)
++	port map(clock, address_a, data_a, enable_a, wren_a, q_a, cs_a, address_b, data_b, enable_b, wren_b, q_b, cs_b);
++end architecture;
++
++library ieee;
++use ieee.std_logic_1164.all;
++
++-- Both clocks are clk_sys wherever this is used (GSU cache, CX4 data RAM).
++entity dpram_difclk is
++	generic (
++		addr_width_a  : integer := 8;
++		data_width_a  : integer := 8;
++		addr_width_b  : integer := 8;
++		data_width_b  : integer := 8;
++		mem_init_file : string := " "
++	);
++	port (
++		clock0    : in  std_logic;
++		clock1    : in  std_logic;
++		address_a : in  std_logic_vector(addr_width_a-1 downto 0);
++		data_a    : in  std_logic_vector(data_width_a-1 downto 0) := (others => '0');
++		enable_a  : in  std_logic := '1';
++		wren_a    : in  std_logic := '0';
++		q_a       : out std_logic_vector(data_width_a-1 downto 0);
++		cs_a      : in  std_logic := '1';
++		address_b : in  std_logic_vector(addr_width_b-1 downto 0) := (others => '0');
++		data_b    : in  std_logic_vector(data_width_b-1 downto 0) := (others => '0');
++		enable_b  : in  std_logic := '1';
++		wren_b    : in  std_logic := '0';
++		q_b       : out std_logic_vector(data_width_b-1 downto 0);
++		cs_b      : in  std_logic := '1'
++	);
++end entity;
++
++architecture sim of dpram_difclk is
++begin
++	ram : entity work.dpram_dif generic map(addr_width_a, data_width_a, addr_width_b, data_width_b, mem_init_file)
++	port map(clock0, address_a, data_a, enable_a, wren_a, q_a, cs_a, address_b, data_b, enable_b, wren_b, q_b, cs_b);
++end architecture;
++
++library ieee;
++use ieee.std_logic_1164.all;
++
++-- altsyncram SINGLE_PORT with the clock enable bypassed: "enable" is ignored.
++entity spram_sz is
++	generic (
++		addr_width    : integer := 8;
++		data_width    : integer := 8;
++		numwords      : integer := 2**8;
++		mem_init_file : string := " ";
++		mem_name      : string := "MEM"
++	);
++	port (
++		clock   : in  std_logic;
++		address : in  std_logic_vector(addr_width-1 downto 0);
++		data    : in  std_logic_vector(data_width-1 downto 0) := (others => '0');
++		enable  : in  std_logic := '1';
++		wren    : in  std_logic := '0';
++		q       : out std_logic_vector(data_width-1 downto 0);
++		cs      : in  std_logic := '1'
++	);
++end entity;
++
++architecture sim of spram_sz is
++begin
++	ram : entity work.dpram_dif generic map(addr_width, data_width, addr_width, data_width, mem_init_file)
++	port map(clock, address, data, '1', wren, q, cs);
++end architecture;
++
++library ieee;
++use ieee.std_logic_1164.all;
++
++entity spram is
++	generic (
++		addr_width    : integer := 8;
++		data_width    : integer := 8;
++		mem_init_file : string := " ";
++		mem_name      : string := "MEM"
++	);
++	port (
++		clock   : in  std_logic;
++		address : in  std_logic_vector(addr_width-1 downto 0);
++		data    : in  std_logic_vector(data_width-1 downto 0) := (others => '0');
++		enable  : in  std_logic := '1';
++		wren    : in  std_logic := '0';
++		q       : out std_logic_vector(data_width-1 downto 0);
++		cs      : in  std_logic := '1'
++	);
++end entity;
++
++architecture sim of spram is
++begin
++	ram : entity work.spram_sz generic map(addr_width, data_width, 2**addr_width, mem_init_file, mem_name)
++	port map(clock, address, data, enable, wren, q, cs);
++end architecture;
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++
++-- altdpram (MLAB): write address/data/enable registered, read address and
++-- output unregistered (asynchronous read).
++entity mlab is
++	generic (
++		addr_width : integer := 8;
++		data_width : integer := 8
++	);
++	port (
++		clock     : in  std_logic;
++		rdaddress : in  std_logic_vector(addr_width-1 downto 0);
++		wraddress : in  std_logic_vector(addr_width-1 downto 0);
++		data      : in  std_logic_vector(data_width-1 downto 0) := (others => '0');
++		wren      : in  std_logic := '0';
++		q         : out std_logic_vector(data_width-1 downto 0);
++		cs        : in  std_logic := '1'
++	);
++end entity;
++
++architecture sim of mlab is
++	type mem_t is array(0 to 2**addr_width-1) of std_logic_vector(data_width-1 downto 0);
++	signal mem : mem_t := (others => (others => '0'));
++begin
++	process(clock)
++	begin
++		if rising_edge(clock) then
++			if wren = '1' then
++				mem(to_integer(unsigned(wraddress))) <= data;
++			end if;
++		end if;
++	end process;
++	q <= mem(to_integer(unsigned(rdaddress))) when cs = '1' else (others => '1');
++end architecture;
+diff --git a/sim/vhdl/chip_sim.vhd b/sim/vhdl/chip_sim.vhd
+new file mode 100644
+index 0000000..7db1903
+--- /dev/null
++++ b/sim/vhdl/chip_sim.vhd
+@@ -0,0 +1,193 @@
++-- Simulation-only replacements for the coprocessor wrappers around Altera
++-- megafunctions (LPM_MULT, LPM_DIVIDE, scfifo, altdpram). Same ports and
++-- latency. Division by zero gives 0 here (only determinism is compared in
++-- simulation, not exact hardware results for that case).
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++
++entity SA1MULT is
++	port (
++		dataa  : in  std_logic_vector(15 downto 0);
++		datab  : in  std_logic_vector(15 downto 0);
++		result : out std_logic_vector(31 downto 0)
++	);
++end entity;
++architecture sim of SA1MULT is
++begin
++	result <= std_logic_vector(signed(dataa) * signed(datab));
++end architecture;
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++entity SPC7110_UMULT is
++	port (
++		dataa  : in  std_logic_vector(15 downto 0);
++		datab  : in  std_logic_vector(15 downto 0);
++		result : out std_logic_vector(31 downto 0)
++	);
++end entity;
++architecture sim of SPC7110_UMULT is
++begin
++	result <= std_logic_vector(unsigned(dataa) * unsigned(datab));
++end architecture;
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++entity SPC7110_SMULT is
++	port (
++		dataa  : in  std_logic_vector(15 downto 0);
++		datab  : in  std_logic_vector(15 downto 0);
++		result : out std_logic_vector(31 downto 0)
++	);
++end entity;
++architecture sim of SPC7110_SMULT is
++begin
++	result <= std_logic_vector(signed(dataa) * signed(datab));
++end architecture;
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++entity SPC7110_UDIV is
++	port (
++		clock    : in  std_logic;
++		denom    : in  std_logic_vector(15 downto 0);
++		numer    : in  std_logic_vector(31 downto 0);
++		quotient : out std_logic_vector(31 downto 0);
++		remain   : out std_logic_vector(15 downto 0)
++	);
++end entity;
++architecture sim of SPC7110_UDIV is
++	type q_t is array(0 to 7) of std_logic_vector(31 downto 0);
++	type r_t is array(0 to 7) of std_logic_vector(15 downto 0);
++	signal qp : q_t := (others => (others => '0'));
++	signal rp : r_t := (others => (others => '0'));
++begin
++	process(clock)
++		variable q : unsigned(31 downto 0);
++		variable r : unsigned(15 downto 0);
++	begin
++		if rising_edge(clock) then
++			if unsigned(denom) = 0 then
++				q := (others => '0'); r := (others => '0');
++			else
++				q := unsigned(numer) / unsigned(denom);
++				r := resize(unsigned(numer) mod unsigned(denom), 16);
++			end if;
++			qp(0) <= std_logic_vector(q); rp(0) <= std_logic_vector(r);
++			for i in 1 to 7 loop qp(i) <= qp(i-1); rp(i) <= rp(i-1); end loop;
++		end if;
++	end process;
++	quotient <= qp(7);
++	remain   <= rp(7);
++end architecture;
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++entity SPC7110_SDIV is
++	port (
++		clock    : in  std_logic;
++		denom    : in  std_logic_vector(15 downto 0);
++		numer    : in  std_logic_vector(31 downto 0);
++		quotient : out std_logic_vector(31 downto 0);
++		remain   : out std_logic_vector(15 downto 0)
++	);
++end entity;
++architecture sim of SPC7110_SDIV is
++	type q_t is array(0 to 7) of std_logic_vector(31 downto 0);
++	type r_t is array(0 to 7) of std_logic_vector(15 downto 0);
++	signal qp : q_t := (others => (others => '0'));
++	signal rp : r_t := (others => (others => '0'));
++begin
++	process(clock)
++		variable q : signed(31 downto 0);
++		variable r : signed(15 downto 0);
++	begin
++		if rising_edge(clock) then
++			if signed(denom) = 0 then
++				q := (others => '0'); r := (others => '0');
++			else
++				q := signed(numer) / resize(signed(denom), 32);
++				r := resize(signed(numer) rem resize(signed(denom), 32), 16);
++			end if;
++			qp(0) <= std_logic_vector(q); rp(0) <= std_logic_vector(r);
++			for i in 1 to 7 loop qp(i) <= qp(i-1); rp(i) <= rp(i-1); end loop;
++		end if;
++	end process;
++	quotient <= qp(7);
++	remain   <= rp(7);
++end architecture;
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++-- scfifo, 32 x 8, show-ahead, synchronous clear
++entity SPC7110_FIFO is
++	port (
++		clock : in  std_logic;
++		data  : in  std_logic_vector(7 downto 0);
++		rdreq : in  std_logic;
++		sclr  : in  std_logic;
++		wrreq : in  std_logic;
++		empty : out std_logic;
++		full  : out std_logic;
++		q     : out std_logic_vector(7 downto 0)
++	);
++end entity;
++architecture sim of SPC7110_FIFO is
++	type mem_t is array(0 to 31) of std_logic_vector(7 downto 0);
++	signal mem : mem_t := (others => (others => '0'));
++	signal rp, wp : unsigned(4 downto 0) := (others => '0');
++	signal cnt : unsigned(5 downto 0) := (others => '0');
++begin
++	process(clock)
++		variable do_rd, do_wr : boolean;
++	begin
++		if rising_edge(clock) then
++			if sclr = '1' then
++				rp <= (others => '0'); wp <= (others => '0'); cnt <= (others => '0');
++			else
++				do_rd := rdreq = '1' and cnt /= 0;
++				do_wr := wrreq = '1' and cnt /= 32;
++				if do_wr then mem(to_integer(wp)) <= data; wp <= wp + 1; end if;
++				if do_rd then rp <= rp + 1; end if;
++				if do_wr and not do_rd then cnt <= cnt + 1;
++				elsif do_rd and not do_wr then cnt <= cnt - 1; end if;
++			end if;
++		end if;
++	end process;
++	q     <= mem(to_integer(rp));
++	empty <= '1' when cnt = 0 else '0';
++	full  <= '1' when cnt = 32 else '0';
++end architecture;
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++-- altdpram (MLAB): registered write, asynchronous read
++entity cx4cache is
++	port (
++		clock     : in  std_logic;
++		data      : in  std_logic_vector(7 downto 0);
++		rdaddress : in  std_logic_vector(8 downto 0);
++		wraddress : in  std_logic_vector(8 downto 0);
++		wren      : in  std_logic := '0';
++		q         : out std_logic_vector(7 downto 0)
++	);
++end entity;
++architecture sim of cx4cache is
++	type mem_t is array(0 to 511) of std_logic_vector(7 downto 0);
++	signal mem : mem_t := (others => (others => '0'));
++begin
++	process(clock)
++	begin
++		if rising_edge(clock) then
++			if wren = '1' then mem(to_integer(unsigned(wraddress))) <= data; end if;
++		end if;
++	end process;
++	q <= mem(to_integer(unsigned(rdaddress)));
++end architecture;
+diff --git a/sim/vhdl_files.txt b/sim/vhdl_files.txt
+new file mode 100644
+index 0000000..c76716f
+--- /dev/null
++++ b/sim/vhdl_files.txt
+@@ -0,0 +1,52 @@
++sim/vhdl/bram_sim.vhd
++sim/vhdl/chip_sim.vhd
++rtl/65C816/P65816_pkg.vhd
++rtl/65C816/AddrGen.vhd
++rtl/65C816/BCDAdder.vhd
++rtl/65C816/AddSubBCD.vhd
++rtl/65C816/ALU.vhd
++rtl/65C816/MCode.vhd
++rtl/65C816/P65C816.vhd
++rtl/SPC700/SPC700_pkg.vhd
++rtl/SPC700/AddrGen.vhd
++rtl/SPC700/BCDAdj.vhd
++rtl/SPC700/AddSub.vhd
++rtl/SPC700/ALU.vhd
++rtl/SPC700/MCode.vhd
++rtl/SPC700/MulDiv.vhd
++rtl/SPC700/SPC700.vhd
++rtl/CEGen.vhd
++rtl/SWRAM.vhd
++rtl/SMP.vhd
++rtl/PPU_PKG.vhd
++rtl/PPU.vhd
++rtl/CPU.vhd
++rtl/DSP_PKG.vhd
++rtl/DSP.vhd
++rtl/SNES.vhd
++rtl/chip/DSP/OBC1.vhd
++rtl/chip/SRTC.vhd
++rtl/chip/RTC4513.vhd
++rtl/chip/CX4/CX4.vhd
++rtl/chip/CX4/CX4Map.vhd
++rtl/chip/DSP/DSPn.vhd
++rtl/chip/DSP/DSP_LHRomMap.vhd
++rtl/chip/SDD1/InputMgr.vhd
++rtl/chip/SDD1/Decoder.vhd
++rtl/chip/SDD1/SDD1.vhd
++rtl/chip/SDD1/SDD1Map.vhd
++rtl/chip/GSU/GSU_PKG.vhd
++rtl/chip/GSU/GSU.vhd
++rtl/chip/GSU/GSUMap.vhd
++rtl/chip/SA1/SA1DIV.vhd
++rtl/chip/SA1/SA1.vhd
++rtl/chip/SA1/SA1Map.vhd
++rtl/chip/SPC7110/SPC7110_DEC_PKG.vhd
++rtl/chip/SPC7110/SPC7110_DEC.vhd
++rtl/chip/SPC7110/SPC7110.vhd
++rtl/chip/SPC7110/SPC7110Map.vhd
++rtl/chip/Sufami/SufamiMap.vhd
++rtl/chip/BSX/BSX_MCC.vhd
++rtl/chip/BSX/BSX_DP.vhd
++rtl/chip/BSX/BSX_BS.vhd
++rtl/chip/BSX/BSXMap.vhd
+-- 
+2.43.0
+

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Sets up the netplay workspace next to this script:
 #   NES_MiSTer/   your fork (or upstream), branch "netplay" with the core patch
+#   SNES_MiSTer/  your fork (or upstream), branch "netplay" with the core patch
 #   Main_MiSTer/  your fork (or upstream), branch "netplay" with the HPS patch
 #
 # Use your own forks so you can push:
@@ -9,10 +10,12 @@ set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
 NES_URL="${NES_URL:-https://github.com/MiSTer-devel/NES_MiSTer.git}"
+SNES_URL="${SNES_URL:-https://github.com/MiSTer-devel/SNES_MiSTer.git}"
 MAIN_URL="${MAIN_URL:-https://github.com/MiSTer-devel/Main_MiSTer.git}"
 
 # The patches were written against these upstream commits.
 NES_BASE=49a0a662e244469ca77b2155746a066df704ffae
+SNES_BASE=4c2b74661b4c4c44eefb6b13743fcaf988bc8063
 MAIN_BASE=08271656799ede50358de1248f6ee878dd7ce5c4
 
 setup_repo() {
@@ -26,13 +29,16 @@ setup_repo() {
 		echo "$dir: branch netplay already exists, leaving it alone"
 	else
 		git checkout -b netplay "$base"
-		git am --3way "$here/patches/$patches"/*.patch
+		if ls "$here/patches/$patches"/*.patch >/dev/null 2>&1; then
+			git am --3way "$here/patches/$patches"/*.patch
+		fi
 		echo "$dir: branch netplay created on $base"
 	fi
 	cd "$here"
 }
 
 setup_repo NES_MiSTer  "$NES_URL"  "$NES_BASE"  NES_MiSTer
+setup_repo SNES_MiSTer "$SNES_URL" "$SNES_BASE" SNES_MiSTer
 setup_repo Main_MiSTer "$MAIN_URL" "$MAIN_BASE" Main_MiSTer
 
 echo

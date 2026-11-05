@@ -1,0 +1,63 @@
+From 6e0acb3b9976c2cde6c81e8edeb94b0e05c2f46c Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Wed, 4 Nov 2026 16:25:09 +0100
+Subject: [PATCH] netplay: SNES allows every Initial WRAM/ARAM pattern (each is
+ fixed)
+---
+ support/netplay/netplay_proto.cpp     | 7 +++----
+ support/netplay/netplay_proto.h       | 4 ++--
+ support/netplay/test/test_netplay.cpp | 3 +--
+ 3 files changed, 6 insertions(+), 8 deletions(-)
+
+diff --git a/support/netplay/netplay_proto.cpp b/support/netplay/netplay_proto.cpp
+index 44008ea..df486b6 100644
+--- a/support/netplay/netplay_proto.cpp
++++ b/support/netplay/netplay_proto.cpp
+@@ -104,12 +104,11 @@ uint8_t check_local(const Settings &s, uint8_t rom_region, uint8_t delay)
+ 	return REJ_OK;
+ }
+ 
+-uint8_t check_local(const SnesSettings &s, uint8_t rom_ok, uint8_t delay)
++uint8_t check_local(const SnesSettings &, uint8_t rom_ok, uint8_t delay)
+ {
+ 	if (delay < 2 || delay > 15) return REJ_DELAY;
+-	// Initial WRAM / ARAM: 0 9966, 1 00FF, 2 55, 3 FF. The patterns are fixed, but
+-	// SPEC.md 10.4 allows only the two that are the same on every console.
+-	if ((s.wram != 1 && s.wram != 3) || (s.aram != 1 && s.aram != 3)) return REJ_RAM_CLEAR;
++	// Initial WRAM / ARAM (9966, 00FF, 55, FF): every pattern is a fixed function
++	// of the address, so any of them is fine; both sides must match (settings).
+ 	if (rom_ok) return REJ_CHIP;
+ 	return REJ_OK;
+ }
+diff --git a/support/netplay/netplay_proto.h b/support/netplay/netplay_proto.h
+index 84beb41..ec7b68d 100644
+--- a/support/netplay/netplay_proto.h
++++ b/support/netplay/netplay_proto.h
+@@ -113,8 +113,8 @@ struct SnesSettings
+ 	uint8_t header;        // status [3:1] ROM Header
+ 	uint8_t blend_off;     // status [16] Pseudo Transparency (changes the picture)
+ 	uint8_t aclk;          // status [30] Audio Clock
+-	uint8_t wram;          // status [22:21] Initial WRAM: 1 00FF, 3 FF allowed
+-	uint8_t aram;          // status [45:44] Initial ARAM: 1 00FF, 3 FF allowed
++	uint8_t wram;          // status [22:21] Initial WRAM: 0 9966, 1 00FF, 2 55, 3 FF
++	uint8_t aram;          // status [45:44] Initial ARAM, same values
+ 	uint8_t gsu_slowrom;   // status [46] SuperFX FastROM, 1 = No
+ 	uint8_t sufami_swap;   // status [31]
+ };
+diff --git a/support/netplay/test/test_netplay.cpp b/support/netplay/test/test_netplay.cpp
+index fcf15d4..5ddd7d7 100644
+--- a/support/netplay/test/test_netplay.cpp
++++ b/support/netplay/test/test_netplay.cpp
+@@ -592,8 +592,7 @@ static void test_snes_settings()
+ 	printf("snes: settings\n");
+ 	SnesSettings s {}; s.wram = 1; s.aram = 3;
+ 	CHECK(check_local(s, 0, 3) == REJ_OK);
+-	s.wram = 0; CHECK(check_local(s, 0, 3) == REJ_RAM_CLEAR);    // 9966 is not the same everywhere
+-	s.wram = 3; s.aram = 2; CHECK(check_local(s, 0, 3) == REJ_RAM_CLEAR);
++	s.wram = 0; s.aram = 2; CHECK(check_local(s, 0, 3) == REJ_OK);    // all fill patterns are fixed
+ 	s.aram = 1; CHECK(check_local(s, 1, 3) == REJ_CHIP);
+ 	CHECK(check_local(s, 0, 1) == REJ_DELAY);
+ 	SnesSettings x {}, y {}; y.aclk = 1;
+-- 
+2.43.0
+
