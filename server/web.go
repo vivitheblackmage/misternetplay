@@ -105,13 +105,14 @@ aside h3{margin:2px 6px 12px;font:700 11px ui-monospace,Consolas,monospace;lette
 .tab .cnt{font:800 15px ui-monospace,Consolas,monospace;color:var(--dim)}
 .tab.NES .ico{background:linear-gradient(180deg,#ff6b85,#c81f4a);box-shadow:0 0 10px rgba(255,77,109,.55)}
 .tab.SNES .ico{background:linear-gradient(180deg,#b38bff,#6a3ae0);box-shadow:0 0 10px rgba(155,107,255,.55)}
+.tab.GB2P .ico{background:linear-gradient(180deg,#9be36b,#3f9a2a);box-shadow:0 0 10px rgba(120,220,90,.55)}
 .tab.BYO .ico{background:linear-gradient(180deg,#7ff3ff,#139bbf);box-shadow:0 0 10px rgba(62,232,255,.5)}
 .sel{position:absolute;opacity:0;pointer-events:none}
-#t-NES:checked~.wrap .tab.NES,#t-SNES:checked~.wrap .tab.SNES,#t-BYO:checked~.wrap .tab.BYO{background:var(--panel2);border-color:rgba(255,63,164,.55);box-shadow:0 0 16px rgba(255,63,164,.25) inset,0 0 14px rgba(214,60,255,.25)}
-#t-NES:checked~.wrap .tab.NES .cnt,#t-SNES:checked~.wrap .tab.SNES .cnt,#t-BYO:checked~.wrap .tab.BYO .cnt{color:#fff;text-shadow:0 0 8px var(--pink)}
-#t-NES:focus-visible~.wrap .tab.NES,#t-SNES:focus-visible~.wrap .tab.SNES,#t-BYO:focus-visible~.wrap .tab.BYO{outline:2px solid var(--cyan);outline-offset:2px}
+#t-NES:checked~.wrap .tab.NES,#t-SNES:checked~.wrap .tab.SNES,#t-GB2P:checked~.wrap .tab.GB2P,#t-BYO:checked~.wrap .tab.BYO{background:var(--panel2);border-color:rgba(255,63,164,.55);box-shadow:0 0 16px rgba(255,63,164,.25) inset,0 0 14px rgba(214,60,255,.25)}
+#t-NES:checked~.wrap .tab.NES .cnt,#t-SNES:checked~.wrap .tab.SNES .cnt,#t-GB2P:checked~.wrap .tab.GB2P .cnt,#t-BYO:checked~.wrap .tab.BYO .cnt{color:#fff;text-shadow:0 0 8px var(--pink)}
+#t-NES:focus-visible~.wrap .tab.NES,#t-SNES:focus-visible~.wrap .tab.SNES,#t-GB2P:focus-visible~.wrap .tab.GB2P,#t-BYO:focus-visible~.wrap .tab.BYO{outline:2px solid var(--cyan);outline-offset:2px}
 .lib{display:none}
-#t-NES:checked~.wrap .lib.NES,#t-SNES:checked~.wrap .lib.SNES,#t-BYO:checked~.wrap .lib.BYO{display:block}
+#t-NES:checked~.wrap .lib.NES,#t-SNES:checked~.wrap .lib.SNES,#t-GB2P:checked~.wrap .lib.GB2P,#t-BYO:checked~.wrap .lib.BYO{display:block}
 .side-foot{margin:14px 6px 0;padding-top:12px;border-top:1px solid var(--line);color:var(--dim);font-size:12px}
 main section+section{margin-top:34px}
 .rooms{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px}
@@ -136,6 +137,7 @@ aside.panel{animation-duration:8s,11s;animation-delay:-1s,-4s}
 .core{display:inline-block;min-width:48px;text-align:center;font:800 10.5px/1 ui-monospace,Consolas,monospace;letter-spacing:.1em;padding:5px 8px;border-radius:6px;color:#fff;background:#4a3a7a;border:1px solid rgba(255,255,255,.25)}
 .core.NES{background:linear-gradient(180deg,#ff6b85,#c81f4a);box-shadow:0 0 10px rgba(255,77,109,.55)}
 .core.SNES{background:linear-gradient(180deg,#b38bff,#6a3ae0);box-shadow:0 0 10px rgba(155,107,255,.55)}
+.core.GB2P{background:linear-gradient(180deg,#9be36b,#3f9a2a);box-shadow:0 0 10px rgba(120,220,90,.55)}
 .state{display:inline-flex;align-items:center;gap:7px;font:700 11px ui-monospace,Consolas,monospace;letter-spacing:.12em;text-transform:uppercase}
 .state::before{content:"";width:8px;height:8px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor}
 .state.waiting{color:var(--wait)}.state.playing{color:var(--ok)}
@@ -173,7 +175,7 @@ background:linear-gradient(115deg,transparent 35%,rgba(62,240,176,.16) 45%,rgba(
 @keyframes flicker{0%,93%,97%,100%{opacity:1}94%,96%{opacity:.55}95%{opacity:.9}}
 .tab:hover{transform:translateX(3px)}
 .tab{transition:background .15s,border-color .15s,box-shadow .15s,transform .15s}
-#t-NES:checked~.wrap .tab.NES,#t-SNES:checked~.wrap .tab.SNES,#t-BYO:checked~.wrap .tab.BYO{animation:tabglow 2.2s ease-in-out infinite alternate}
+#t-NES:checked~.wrap .tab.NES,#t-SNES:checked~.wrap .tab.SNES,#t-GB2P:checked~.wrap .tab.GB2P,#t-BYO:checked~.wrap .tab.BYO{animation:tabglow 2.2s ease-in-out infinite alternate}
 @keyframes tabglow{from{box-shadow:0 0 12px rgba(255,63,164,.18) inset,0 0 10px rgba(214,60,255,.2)}to{box-shadow:0 0 20px rgba(255,63,164,.35) inset,0 0 22px rgba(214,60,255,.45)}}
 tr:hover td{background:rgba(255,63,164,.08)}
 tr:hover td:first-child{box-shadow:3px 0 0 var(--pink) inset}
@@ -213,7 +215,7 @@ const pageLogo = `<img src="/logo.png" alt="MiSTer FPGA">`
 func coreBadge(core string) string {
 	c := strings.ToUpper(core)
 	cls := ""
-	if c == "NES" || c == "SNES" {
+	if c == "NES" || c == "SNES" || c == "GB2P" {
 		cls = " " + c
 	}
 	return fmt.Sprintf(`<span class="core%s">%s</span>`, cls, htmlEscape(c))
@@ -234,7 +236,7 @@ func writePage(w http.ResponseWriter, l *library, catalog string, r *relay) {
 	w.Header().Set("Cache-Control", "no-store")
 
 	rooms := r.list("")
-	games := map[string][]romInfo{"NES": l.list("NES"), "SNES": l.list("SNES")}
+	games := map[string][]romInfo{"NES": l.list("NES"), "SNES": l.list("SNES"), "GB2P": l.list("GB2P")}
 	cat := readCatalog(catalog)
 	waiting, playing := 0, 0
 	roomsBy := map[string]int{}
@@ -252,11 +254,11 @@ func writePage(w http.ResponseWriter, l *library, catalog string, r *relay) {
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
 <noscript><meta http-equiv="refresh" content="10"></noscript><title>Netplay lobby</title><style>%s</style></head><body>
 <div class="sky" aria-hidden="true"><div class="nebula"></div><div class="stars s1"></div><div class="stars s2"></div><div class="stars s3"></div><div class="stars s4"></div><div class="stars s5"></div><div class="glow"></div><div class="sunwrap"><div class="sun"></div></div><div class="floor"><div class="lines"></div></div></div>
-<input class="sel" type="radio" name="lib" id="t-NES" value="NES" checked><input class="sel" type="radio" name="lib" id="t-SNES" value="SNES"><input class="sel" type="radio" name="lib" id="t-BYO" value="BYO">
-<div class="wrap"><header>%s<div class="title"><div class="brand">NETPLAY</div><div class="tag">Lobby &amp; relay &middot; NES &middot; SNES</div></div>
+<input class="sel" type="radio" name="lib" id="t-NES" value="NES" checked><input class="sel" type="radio" name="lib" id="t-SNES" value="SNES"><input class="sel" type="radio" name="lib" id="t-GB2P" value="GB2P"><input class="sel" type="radio" name="lib" id="t-BYO" value="BYO">
+<div class="wrap"><header>%s<div class="title"><div class="brand">NETPLAY</div><div class="tag">Lobby &amp; relay &middot; NES &middot; SNES &middot; Game Boy 2P</div></div>
 <div class="stats" id="stats"><div class="stat wait"><b>%d</b><span>waiting</span></div><div class="stat play"><b>%d</b><span>playing</span></div><div class="stat games"><b>%d</b><span>games</span></div></div></header>
 <div class="neon"></div><div class="layout">`,
-		pageCSS, pageLogo, waiting, playing, len(games["NES"])+len(games["SNES"]))
+		pageCSS, pageLogo, waiting, playing, len(games["NES"])+len(games["SNES"])+len(games["GB2P"]))
 
 	// Sidebar: the libraries. Labels for the radio inputs above, so picking
 	// one needs no script.
@@ -273,6 +275,7 @@ func writePage(w http.ResponseWriter, l *library, catalog string, r *relay) {
 	for _, t := range []struct{ id, ico, label, sub string; n int }{
 		{"NES", "NES", "NES", roomsText("NES"), len(games["NES"])},
 		{"SNES", "SNES", "Super NES", roomsText("SNES"), len(games["SNES"])},
+		{"GB2P", "GB", "Game Boy 2P", roomsText("GB2P"), len(games["GB2P"])},
 		{"BYO", "MD5", "Bring your own", "catalog by MD5", len(cat)},
 	} {
 		fmt.Fprintf(&b, `<label class="tab %s" for="t-%s"><span class="ico">%s</span><span class="lbl"><b>%s</b><small>%s</small></span><span class="cnt">%d</span></label>`,
@@ -298,13 +301,14 @@ func writePage(w http.ResponseWriter, l *library, catalog string, r *relay) {
 
 	// The libraries; CSS shows the picked one.
 	b.WriteString(`<section id="libs">`)
-	for _, core := range []string{"NES", "SNES"} {
-		title := map[string]string{"NES": "NES games", "SNES": "Super NES games"}[core]
-		extra := map[string]string{"NES": " (or roms itself)", "SNES": ""}[core]
+	for _, core := range []string{"NES", "SNES", "GB2P"} {
+		title := map[string]string{"NES": "NES games", "SNES": "Super NES games", "GB2P": "Game Boy games"}[core]
+		extra := map[string]string{"NES": " (or roms itself)", "SNES": "", "GB2P": ""}[core]
+		folder := map[string]string{"NES": "NES", "SNES": "SNES", "GB2P": "GB"}[core]
 		fmt.Fprintf(&b, `<div class="lib %s"><h2>%s <span class="n">%d</span></h2><p class="hint">On the MiSTer: <b>_Netplay/Server games</b>, held in RAM only. Folder on the server: <b>roms/%s</b>%s.</p><div class="panel"><table>`,
-			core, title, len(games[core]), core, extra)
+			core, title, len(games[core]), folder, extra)
 		if len(games[core]) == 0 {
-			fmt.Fprintf(&b, `<tr><td class="empty">No %s games in the roms folder.</td></tr>`, core)
+			fmt.Fprintf(&b, `<tr><td class="empty">No %s games in the roms folder.</td></tr>`, map[string]string{"NES": "NES", "SNES": "SNES", "GB2P": "Game Boy"}[core])
 		} else {
 			b.WriteString(`<tr><th>Game</th><th class="hide-sm">Size</th><th class="hide-sm">MD5</th></tr>`)
 			for _, g := range games[core] {

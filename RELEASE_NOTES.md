@@ -1,5 +1,42 @@
 # Release notes
 
+## v0.3: Game Boy link-cable netplay
+
+### New: Game Boy 2P
+
+- **`GAMEBOY2P_netplay.rbf`**: pomstazlesa's Game Boy 2P core (two Game Boys
+  joined by a link cable inside the FPGA) with lockstep netplay. Each MiSTer
+  runs both Game Boys; the host plays Game Boy 1, the other player Game Boy 2.
+  Only the controller input goes over the network, so the link cable's timing
+  is the same as on one MiSTer.
+- Link-cable games such as Tetris, Tennis and Dr. Mario, with one game for
+  both, or two different games (load game 1 with *Rom for second GB* Off, then
+  game 2 with it On).
+- **Show → My screen** shows only your own Game Boy, centred at the right
+  aspect ratio; **Audio select → Own GB** plays your own Game Boy's sound.
+- Both Game Boys run on one shared clock enable, which also keeps them in step
+  without netplay; the SDRAM serves both from one read when they read the same
+  word, so the core runs at full speed with clean sound.
+- The Game Boys' RAM and the cartridge clock (MBC3, HuC3, TAMA) are cleared at
+  the start of a session, so a MiSTer that ran other games before starts like a
+  freshly loaded one. The cartridge clock runs on emulated time from the host's
+  start time.
+- Same lobby as NES and SNES: **OSD → Netplay → Host** in GAMEBOY2P_netplay,
+  the other player joins from **_Netplay/Rooms** (a room with two games holds
+  both files). The server's Game Boy games go in `roms/GB`.
+- Battery saves as on NES: the same `.sav` on both sides, or none. Not
+  supported: MegaDuck (`.bin`). Needs the SDRAM board.
+
+Tested on hardware: a Tetris link match between two MiSTers through the lobby
+server; Tennis with clean sound at full speed. In simulation: two MiSTers in
+sync over 1,800 frames of Tetris, and after one of them ran another game.
+
+### Other changes
+
+- The lobby folder is created on a MiSTer that has no games folder for the core
+  yet.
+- Main_MiSTer build: changed headers now rebuild the files that use them.
+
 ## v0.2: SNES netplay
 
 ### New: Super NES

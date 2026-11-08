@@ -1,0 +1,82 @@
+From 52f8b0a4c957a0378de66386f3e7fc7865f15a9e Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 7 Nov 2026 21:56:42 +0100
+Subject: [PATCH] Show My screen centred in the line as upstream's border; no
+ zoom
+---
+ Gameboy.sv | 16 ++++++++--------
+ rtl/lcd.v  |  9 +++++----
+ 2 files changed, 13 insertions(+), 12 deletions(-)
+
+diff --git a/Gameboy.sv b/Gameboy.sv
+index 097d9f4..6bd078e 100644
+--- a/Gameboy.sv
++++ b/Gameboy.sv
+@@ -208,8 +208,8 @@ wire  [7:0] np_joy_p1, np_joy_p2;
+ // 0         1         2         3          4         5         6
+ // 01234567890123456789012345678901 23456789012345678901234567890123
+ // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
+-// XXXXXXXXXXXXXXXXXXXXXXXXXX    X       XXXXXXXX XX
+-// 24-25 Show (both screens / my screen / my screen zoomed), 46-47 Netplay (read by Main_MiSTer support/netplay/netplay.cpp).
++// XXXXXXXXXXXXXXXXXXXXXXXXX     X       XXXXXXXX XX
++// 24 Show (both screens / my screen), 46-47 Netplay (read by Main_MiSTer support/netplay/netplay.cpp).
+ 
+ `include "build_id.v" 
+ localparam CONF_STR = {
+@@ -229,7 +229,7 @@ localparam CONF_STR = {
+ 	"P1-;",
+ 	"P1O[44],Extra sprites,No,Yes;",
+ 	"P1ON,Seperator Line,Off,On;",
+-	"P1O[25:24],Show,Both screens,My screen,My screen zoom;",
++	"P1O[24],Show,Both screens,My screen;",
+ 	"P1OC,Inverted color,No,Yes;",
+ 	"P1O12,Custom Palette,Off,Auto,On;",
+ 	"h1P1FC3,GBP,Load Palette;",
+@@ -682,8 +682,8 @@ lcd lcd
+ 
+ 	.isGBC  ( isGBC      ),
+    
+-	.seperatorLine  ( status[23] & ~|status[25:24] ),
+-	.single         ( |status[25:24] ),
++	.seperatorLine  ( status[23] & ~status[24] ),
++	.single         ( status[24] ),
+ 	.single_sel     ( np_active & np_join ),
+ 
+ 	.tint   ( |tint       ),
+@@ -743,10 +743,10 @@ video_freak video_freak
+ 	.VGA_DE_IN(VGA_DE),
+ 	.VGA_DE(),
+ 
+-	// one screen is 160x144 (10:9); zoomed shows its middle 120 lines (4:3)
+-	.ARX((!ar) ? (|status[25:24] ? 12'd10 : 12'd20) : (ar - 1'd1)),
++	// one screen is 160x144 (10:9)
++	.ARX((!ar) ? (status[24] ? 12'd10 : 12'd20) : (ar - 1'd1)),
+ 	.ARY((!ar) ? (12'd9 ) : 12'd0),
+-	.CROP_SIZE(status[25] ? 12'd120 : 12'd0),
++	.CROP_SIZE(0),
+ 	.CROP_OFF(0),
+ 	.SCALE(status[22:21])
+ );
+diff --git a/rtl/lcd.v b/rtl/lcd.v
+index bd89bf2..0177ce2 100644
+--- a/rtl/lcd.v
++++ b/rtl/lcd.v
+@@ -250,10 +250,11 @@ always @(posedge clk_vid) begin
+ 		end
+ 
+ 		// Hblank
+-		// one screen: 160 visible pixels at the same pixel rate and line length, so
+-		// the scaler sees 160x144 (a new size: Main reads the aspect ratio again)
+-		if(h_cnt == H_START)                     gb_hb <= 0;
+-		if(h_cnt == H_START + (one ? 9'd160 : H)) gb_hb <= 1;
++		// one screen: 160 visible pixels in the middle of the 320 (80 blank on each
++		// side, as upstream's border), same pixel rate and line length, so the
++		// scaler sees 160x144 (a new size: Main reads the aspect ratio again)
++		if(h_cnt == H_START + (one ? 9'd80 : 9'd0))  gb_hb <= 0;
++		if(h_cnt == H_START + (one ? 9'd240 : H))     gb_hb <= 1;
+ 
+ 		// Vblank
+ 		if(v_cnt == VSTART)    gb_vb <= 0;
+-- 
+2.43.0
+

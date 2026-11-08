@@ -1,0 +1,148 @@
+From ffcf2fb54e42c1f46593291bfcdca4cfe0410afa Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 7 Nov 2026 20:54:33 +0100
+Subject: [PATCH] OSD Show: both screens or only the Game Boy this MiSTer
+ plays; Audioselect plays the own Game Boy by default
+---
+ Gameboy.sv | 34 +++++++++++++++++++++-------------
+ rtl/lcd.v  | 26 +++++++++++++++++++++++---
+ 2 files changed, 44 insertions(+), 16 deletions(-)
+
+diff --git a/Gameboy.sv b/Gameboy.sv
+index 52ac784..8ce80e8 100644
+--- a/Gameboy.sv
++++ b/Gameboy.sv
+@@ -208,8 +208,8 @@ wire  [7:0] np_joy_p1, np_joy_p2;
+ // 0         1         2         3          4         5         6
+ // 01234567890123456789012345678901 23456789012345678901234567890123
+ // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
+-// XXXXXXXXXXXXXXXXXXXXXXXX      X       XXXXXXXX XX
+-// 46-47 Netplay (read by Main_MiSTer support/netplay/netplay.cpp).
++// XXXXXXXXXXXXXXXXXXXXXXXXX     X       XXXXXXXX XX
++// 24 Show (both screens / my screen), 46-47 Netplay (read by Main_MiSTer support/netplay/netplay.cpp).
+ 
+ `include "build_id.v" 
+ localparam CONF_STR = {
+@@ -229,6 +229,7 @@ localparam CONF_STR = {
+ 	"P1-;",
+ 	"P1O[44],Extra sprites,No,Yes;",
+ 	"P1ON,Seperator Line,Off,On;",
++	"P1O[24],Show,Both screens,My screen;",
+ 	"P1OC,Inverted color,No,Yes;",
+ 	"P1O12,Custom Palette,Off,Auto,On;",
+ 	"h1P1FC3,GBP,Load Palette;",
+@@ -241,7 +242,7 @@ localparam CONF_STR = {
+ 	"P1-;",
+ 	"P1O78,Stereo mix,none,25%,50%,100%;",
+ 	"P1O[43],Audio mode,Accurate,No Pops;",
+-	"P1OGH,Audioselect,GB 1,GB 2,Mixed,Split 1=L 2=R;",
++	"P1OGH,Audioselect,Own GB,Other GB,Mixed,Split own=L;",
+ 
+ 	"P2,Misc.;",
+ 	"P2-;",
+@@ -620,15 +621,20 @@ gb2p_machine machine
+ 	.ser2_data_out     ( ser2_data_out )
+ );
+ 
+-assign AUDIO_L = (status[17:16] == 3'd0) ? AUDIO_L1 : 
+-                 (status[17:16] == 3'd1) ? AUDIO_L2 : 
+-                 (status[17:16] == 3'd2) ? ($signed(AUDIO_L1[15:1]) + $signed(AUDIO_L2[15:1])) :
+-                                           ($signed(AUDIO_L1[15:1]) + $signed(AUDIO_R1[15:1]));
++// "Own" is the Game Boy this MiSTer plays: GB 2 on a netplay join, GB 1 otherwise
++wire        mine2 = np_active & np_join;
++wire [15:0] AUDIO_Lo = mine2 ? AUDIO_L2 : AUDIO_L1, AUDIO_Ro = mine2 ? AUDIO_R2 : AUDIO_R1;
++wire [15:0] AUDIO_Lx = mine2 ? AUDIO_L1 : AUDIO_L2, AUDIO_Rx = mine2 ? AUDIO_R1 : AUDIO_R2;
+ 
+-assign AUDIO_R = (status[17:16] == 3'd0) ? AUDIO_R1 : 
+-                 (status[17:16] == 3'd1) ? AUDIO_R2 : 
+-                 (status[17:16] == 3'd2) ? ($signed(AUDIO_R1[15:1]) + $signed(AUDIO_R2[15:1])) :
+-                                           ($signed(AUDIO_L2[15:1]) + $signed(AUDIO_R2[15:1]));
++assign AUDIO_L = (status[17:16] == 3'd0) ? AUDIO_Lo : 
++                 (status[17:16] == 3'd1) ? AUDIO_Lx : 
++                 (status[17:16] == 3'd2) ? ($signed(AUDIO_Lo[15:1]) + $signed(AUDIO_Lx[15:1])) :
++                                           ($signed(AUDIO_Lo[15:1]) + $signed(AUDIO_Ro[15:1]));
++
++assign AUDIO_R = (status[17:16] == 3'd0) ? AUDIO_Ro : 
++                 (status[17:16] == 3'd1) ? AUDIO_Rx : 
++                 (status[17:16] == 3'd2) ? ($signed(AUDIO_Ro[15:1]) + $signed(AUDIO_Rx[15:1])) :
++                                           ($signed(AUDIO_Lx[15:1]) + $signed(AUDIO_Rx[15:1]));
+ 
+ 
+ // the lcd to vga converter
+@@ -676,7 +682,9 @@ lcd lcd
+ 
+ 	.isGBC  ( isGBC      ),
+    
+-	.seperatorLine  ( status[23] ),
++	.seperatorLine  ( status[23] & ~status[24] ),
++	.single         ( status[24] ),
++	.single_sel     ( np_active & np_join ),
+ 
+ 	.tint   ( |tint       ),
+ 	.inv    ( status[12]  ),
+@@ -735,7 +743,7 @@ video_freak video_freak
+ 	.VGA_DE_IN(VGA_DE),
+ 	.VGA_DE(),
+ 
+-	.ARX((!ar) ? (12'd20) : (ar - 1'd1)),
++	.ARX((!ar) ? (status[24] ? 12'd10 : 12'd20) : (ar - 1'd1)),
+ 	.ARY((!ar) ? (12'd9 ) : 12'd0),
+ 	.CROP_SIZE(0),
+ 	.CROP_OFF(0),
+diff --git a/rtl/lcd.v b/rtl/lcd.v
+index 404afef..f227795 100644
+--- a/rtl/lcd.v
++++ b/rtl/lcd.v
+@@ -24,6 +24,8 @@ module lcd
+ 	input        isGBC,
+ 	input        double_buffer,
+    input        seperatorLine,
++   input        single,          // show one Game Boy over the whole width (each pixel twice)
++   input        single_sel,      // which one: 0 GB 1, 1 GB 2
+    
+    output       pauseVideoCore1,
+    output       pauseVideoCore2,
+@@ -218,6 +220,15 @@ reg [14:0] vbuffer_outptr1;
+ reg [14:0] vbuffer_outptr2;
+ reg bufferselect;
+ 
++// single, single_sel come from clk_sys and change only from the OSD
++reg [1:0] single_s, sel_s;
++always @(posedge clk_vid) begin
++	single_s <= {single_s[0], single};
++	sel_s    <= {sel_s[0], single_sel};
++end
++wire one = single_s[1];
++wire one_sel = sel_s[1];
++
+ reg [7:0] pauseCnt1;
+ reg [7:0] pauseCnt2;
+ 
+@@ -264,12 +275,21 @@ always @(posedge clk_vid) begin
+ 			end
+ 		end
+       
+-      if(h_cnt == 0            ) bufferselect <= 1'b0;
+-      if(h_cnt == H_START + 159) bufferselect <= 1'b1;
++      if(h_cnt == 0            ) bufferselect <= one ? one_sel : 1'b0;
++      if(h_cnt == H_START + 159) bufferselect <= one ? one_sel : 1'b1;
+ 
+ 		// visible area?
+ 		if(~gb_hb & ~gb_vb) begin
+-         if (h_cnt < H_START + 160)
++         if (one) begin
++            // one screen: 160 pixels over the 320 of the line, each shown twice
++            // H_START is odd: step on even h_cnt, so pixel 0 is shown at H_START
++            // and H_START+1 and pixel 159 at the last two positions
++            if (!h_cnt[0]) begin
++               if (one_sel) vbuffer_outptr2 <= vbuffer_outptr2 + 1'd1;
++               else         vbuffer_outptr1 <= vbuffer_outptr1 + 1'd1;
++            end
++         end
++         else if (h_cnt < H_START + 160)
+             vbuffer_outptr1 <= vbuffer_outptr1 + 1'd1;
+          else
+             vbuffer_outptr2 <= vbuffer_outptr2 + 1'd1;
+-- 
+2.43.0
+

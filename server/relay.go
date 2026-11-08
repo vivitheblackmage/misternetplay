@@ -170,8 +170,15 @@ func (r *relay) control(pkt string, from *net.UDPAddr, now time.Time) []outgoing
 		return reply("ERR bad request")
 	}
 	name, local := cleanName(f[4]), cleanField(f[5], 48)
-	core, sum, game := cleanField(f[6], 16), strings.ToLower(f[7]), cleanField(f[8], 80)
-	if !isHex(sum, 32) || core == "" {
+	core := cleanField(f[6], 16)
+	sum := strings.ToLower(f[7])
+	nameMax := 80
+	if strings.EqualFold(core, "GB2P") {
+		nameMax = 170 // "<game 1> + <game 2>", each up to 80 (SPEC.md 11.5)
+	}
+	game := cleanField(f[8], nameMax)
+	// Game Boy 2P with two games: rom_md5 + rom2_md5, 64 hex digits (SPEC.md 11.5)
+	if !(isHex(sum, 32) || (isHex(sum, 64) && strings.EqualFold(core, "GB2P"))) || core == "" {
 		return reply("ERR bad request")
 	}
 

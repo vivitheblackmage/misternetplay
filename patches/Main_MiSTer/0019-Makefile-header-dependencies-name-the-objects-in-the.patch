@@ -1,0 +1,31 @@
+From 504e3e318bd29098a42aae66923a38d427903b63 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 7 Nov 2026 18:43:02 +0100
+Subject: [PATCH] Makefile: header dependencies name the objects in the build
+ folder, so a changed header rebuilds them
+---
+ Makefile | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/Makefile b/Makefile
+index 233c5e5..ddb18f8 100644
+--- a/Makefile
++++ b/Makefile
+@@ -95,12 +95,12 @@ endif
+ $(BUILDDIR)/%.c.d: %.c
+ 	@mkdir -p $(dir $(BUILDDIR)/$*)
+ 	$(Q)$(info $< >> $@)
+-	$(Q)$(CC) $(DFLAGS) -MM $< -MT $@ -MT $*.c.o -MF $@ 2>&1 | $(OUTPUT_FILTER)
++	$(Q)$(CC) $(DFLAGS) -MM $< -MT $@ -MT $(BUILDDIR)/$*.c.o -MF $@ 2>&1 | $(OUTPUT_FILTER)
+ 
+ $(BUILDDIR)/%.cpp.d: %.cpp
+ 	@mkdir -p $(dir $(BUILDDIR)/$*)
+ 	$(Q)$(info $< >> $@)
+-	$(Q)$(CC) $(DFLAGS) -MM $< -MT $@ -MT $*.cpp.o -MF $@ 2>&1 | $(OUTPUT_FILTER)
++	$(Q)$(CC) $(DFLAGS) -MM $< -MT $@ -MT $(BUILDDIR)/$*.cpp.o -MF $@ 2>&1 | $(OUTPUT_FILTER)
+ 
+ # Ensure correct time stamp
+ $(BUILDDIR)/main.cpp.o: $(filter-out $(BUILDDIR)/main.cpp.o, $(OBJ))
+-- 
+2.43.0
+

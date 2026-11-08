@@ -556,3 +556,252 @@ As section 4, with these differences:
 | T4 | Quartus build of the SNES core | `TIMING OK` |
 | T5s | Replay on one MiSTer, ≥ 36000 frames | "replay OK" on LoROM, HiROM, SA-1 and GSU games |
 | T6s | Two MiSTers through the lobby | 30 min without a CRC mismatch |
+
+## 11. Game Boy 2P (v3, in progress: the core (T2g, T2n, T4), Main_MiSTer and the server (T3) done; hardware (T5g, T6g) open)
+
+**Goal:** two MiSTers play a Game Boy link-cable game, one player per board,
+with the same lockstep as NES and SNES. Base: the split-screen core
+Gameboy2PUW_MiSTer by pomstazlesa (branch `Gameboy2P`, `83e167f`, 2025-10-05,
+GPL like the MiSTer-devel Game Boy core it forks), a new upstream
+`Gameboy2P_MiSTer/` on branch `netplay` with its commits in
+`patches/Gameboy2P_MiSTer/`. Release file `GAMEBOY2P_netplay.rbf`; the
+core's name stays `GAMEBOY2P` (games and saves in `GAMEBOY2P/`). Needs the
+SDRAM board, as the original.
+
+**Why this core:** it has two complete Game Boys (`gb1`/`gb2`, each with its own
+cart, cart RAM and speed control) in one FPGA and a link cable *inside* it
+(`ser1_*` ↔ `ser2_*`, the user port is not used). Every MiSTer runs both
+Game Boys; the host's controller drives `gb1`, the join's `gb2`. The network
+only carries input, so the link cable's timing (a byte about every 1 ms at
+8 kHz) never meets the network's latency. A link cable over UDP between two
+one-player cores would need a round trip per byte and is not done.
+
+**Phases:**
+- **11.A** (v3): lockstep for one or two ROMs; the `.sav` as on NES (the same
+  file or none on both sides).
+- **11.B** (later): each player brings their own save (section 11.6).
+
+**Out of scope:** more than two players (the core has two Game Boys; four
+would need four cores, about 720 KB of block RAM against the DE10-Nano's
+~700 KB, more SDRAM ports and the 4-player adapter DMG-07), spectators,
+MegaDuck (refused: `REJ_SYSTEM` for System = MegaDuck or a `.bin` game), Super Game Boy (not in the core), a real
+link cable on the user port.
+
+### 11.1 One clock for both Game Boys
+
+Today each Game Boy has its own `speedcontrol`. It skips clock enables while
+that core's ROM read waits for the SDRAM (`romread`/`romack`), and `clkdiv`
+is not reset. So the two cores drift against each other by a number of
+`clk_sys` that depends on the SDRAM's refresh phase. The internal link
+samples the other core's serial clock on its own `ce`, so the drift is
+visible to the games. Without netplay it does no harm. With netplay the
+drift differs between the two MiSTers (and after every stall), which gives a
+desync.
+
+- **Requirement (normative):** both Game Boys get the *same* `ce`, `ce_n` and
+  `ce_2x` on every `clk_sys`. One `speedcontrol` drives both: it waits
+  (`WAITRAM`) while a ROM read of *either* core is not acknowledged. After
+  reset falls it gives no enable until its divider reaches its own `ce`
+  phase, so the first enable after reset is always a `ce`; the divider is
+  never restarted, so its phase mod 4 (and `ce_2x`) stays locked to the SDRAM
+  controller's free-running divider as upstream (`rtl/speedcontrol_shared.sv`).
+  A restart at reset fall put the ROM reads at a random SDRAM phase on every
+  reset: the core ran slower than real time and the sound was bad, differently
+  after every load (found on hardware).
+- **SDRAM:** the controller (`rtl/sdram.sv`) serves one read per cycle, port
+  1 first. On one clock enable the two Game Boys of one game read the same
+  word at the same time, so port 2 takes port 1's data (the word it read last,
+  or the read it starts in the same cycle) instead of a read of its own a cycle
+  later; a write (ROM download) forgets the last addresses. Measured in record
+  mode on hardware: 59.06 frames/s without this (bad sound), 59.66 with it,
+  59.70 with upstream's per-core speed control. Two different games still
+  collide more often. "Sync Video" (`pausevideo`, `O[5]`) is forced off while
+  netplay is active.
+- **Freeze:** netplay stops the machine with one more input to that
+  `speedcontrol`, `hold`, which skips enables exactly like `WAITRAM` (no
+  `ce`, `ce_n` or `ce_2x` while it is 1). The SDRAM, `lcd.v`, the video output
+  and the HPS interface keep running. `lcd.v` double-buffers, so HDMI and
+  analog video show the last picture during a freeze, with no blackout and no
+  repeated frame beyond the wait.
+- **Proof (normative):** a run with any number of freezes of any length gives
+  bit-identical outputs of both cores on every emulated `ce`, compared with a
+  run without freezes and with different SDRAM latencies (T2g). If skipping
+  enables is not bit-exact (logic on `clk_sys` between enables, as found in the
+  SNES core), the freeze becomes a gated clock as in 10.1, and the
+  requirement stays the same.
+
+### 11.2 Frame tick and input
+
+- **Frame tick** = every 70224th `ce` after reset (one Game Boy frame at
+  single speed: 154 lines × 456 dots; the shared enable runs in both speeds).
+  It is not the LCD's vsync: a game may turn the LCD off, and the two cores
+  have one each. Frame 0 starts at the first `ce` after `hold_reset` falls.
+  Frame k starts at tick k. The tick, `LOCAL[k]`, `CRC[k-1]` and the input
+  switch happen on that `ce`. Once the last `ce` of frame k-1 has passed,
+  `hold` is 1 as long as `INPUT[k]` is missing, so no `ce`, `ce_n` or `ce_2x`
+  follows until it is there: the machine waits exactly at the frame
+  boundary; no underrun error (as SNES).
+- **Input:** 8 bits per player, `joystick_N[7:0]` as the framework delivers it
+  (`J1,A,B,Select,Start`): bit 0 Right, 1 Left, 2 Down, 3 Up, 4 A, 5 B,
+  6 Select, 7 Start. `joy1_*` (gb1) take player 1, `joy2_*` (gb2) player 2.
+  Both are switched only at the tick.
+- **Reset:** `hold_reset` is ORed into `reset` (both cores, both carts, the
+  speed control). The RAMs are not part of the upstream reset, so
+  while netplay is active `gb2p_machine` clears them once when reset rises
+  (the `rtc_clr` pulse of the RTC bullet below starts it): 2^17 `clk_sys`
+  writing 0 through the savestate port of WRAM, HRAM, VRAM, OAM (both Game
+  Boys) and the cart RAM (both carts); savestates are not used in this core.
+  The clear's cart RAM writes are masked from `sav_pending` (no autosave of
+  them). The ROM download and the `.sav` load of the session's reload come
+  after it, so a MiSTer that ran other games before starts like a fresh one
+  (the DSP-register lesson from 10.2). `sim --dirty` checks it as on SNES;
+  it found the gap with Tennis (reads RAM before writing it), not with
+  Tetris.
+- While netplay is active: OSD reset, the user button, *Reload Backup RAM*
+  (`R9`) and *Sync Video* are ignored; *Save Backup RAM* and autosave still
+  write the file. Rumble only drives the local pad. A game download during
+  PRIME/RUN gives `RELOAD`. The core has no cheats, savestates, OSD pause or
+  fast forward, so nothing else needs to be turned off.
+- **RTC:** the README says no RTC, but `gb1`'s cart (MBC3, HuC3, TAMA) runs
+  one: it starts from the HPS's `TIMESTAMP` (wall-clock time) and counts a
+  32768 Hz enable made from `clk_sys`, which keeps running during a freeze.
+  While netplay is active the enable counts emulated cycles instead (every
+  128th `ce`, `gb2p_machine` input `rtc_emu`) and `RTC_time` is the host's
+  value, sent in HELLO, on both sides. `gb2`'s cart gets the same `RTC_time`
+  and enable (only `gb1`'s saves its timestamp).
+- **RTC start state:** the RTC registers of MBC3, HuC3 and TAMA are not part of
+  the reset upstream, so a clock a game set before the session (and its
+  sub-second phase) would carry over. While netplay is active they are
+  cleared once when reset rises (`rtc_clr`, in both carts: sub-seconds,
+  seconds, minutes, hours, days, flags, latched copies, the pending catch-up);
+  a `.sav` loaded during that reset then sets them as usual. The catch-up of
+  the time since the `.sav` was written (`diffSeconds`, MBC3 and HuC3) counts
+  one second per emulated `ce` instead of per `clk_sys`, so it ends at the
+  same emulated moment on both sides. Checked by `npsim/make_rtctest.py`
+  (T2n with `--dirty rtcdirty.gb`).
+
+### 11.3 Mailbox
+
+As section 4, with these differences:
+
+- The core does not use DDR3 (`DDRAM_*` were tied off), so a one-channel
+  controller, `rtl/np_ddram.sv`, serves only the mailbox: single 64-bit
+  words, toggle handshake, no read cache, read data taken even when
+  `DDRAM_BUSY` is high. The module is `rtl/netplay.sv`, reset by `~pll_locked`.
+- Base **`0x3C000000`** (as NES; a core uses one mailbox at a time and
+  `MAGIC` tells them apart), `MAGIC` = `"GB2PNP01"`.
+- `LOCAL`, `INPUT` and `CRC` words exactly as section 4 (8-bit input,
+  16-bit frame tag).
+- `CTRL[2]` = 1 on the join (it plays `gb2`). The module latches it when it
+  arms; while netplay is active only the local pad rumbles, with the rumble
+  of the Game Boy it plays (`gb1` on the host, `gb2` on the join), and the
+  second pad not at all.
+- **CRC** of frame k: CRC-32 as section 5, seeded with `p1` and `p2`, then fed
+  on every emulated `ce` with `gb1`'s pixel (`lcd1_data`, 15 bits, low byte
+  first) when `lcd1_clkena`, then `gb2`'s when `lcd2_clkena`, then with
+  `{4'b0, ser2_data_out, ser2_clk_out, ser1_data_out, ser1_clk_out}` when
+  those four link lines differ from their value at the previous `ce`. The
+  link lines cover frames with both LCDs off. Unlike NES and SNES, frame 0 is
+  hashed too: after reset everything starts at the first `ce`.
+
+### 11.4 Loading one or two ROMs
+
+The core loads two different games in two steps: a game loaded with *Rom for
+second GB* (`O[6]`) Off goes into both Game Boys; one loaded with it On goes
+only into `gb2`. Both reset on every game load.
+
+- Main_MiSTer tracks the pair: a load (index 1) with `O[6]` Off sets ROM 1 =
+  ROM 2 = that file, one with `O[6]` On sets ROM 2. Every game load starts or
+  restarts the session with the current pair, as on NES. A load with `O[6]`
+  On before any game 1 starts no session ("load game 1 with Rom for second GB
+  Off").
+- The session's reload does the same: first `UIO_TIMESTAMP` with the
+  session's `rtc_time` (11.2), then ROM 1 with `O[6]` Off, then ROM 2 with
+  `O[6]` On if it is another file. Main sets `O[6]` itself
+  (`user_io_status_set`) and restores the player's setting afterwards. The
+  `.sav` mounted is the one of the last loaded game, as the core does without
+  netplay: with two games ROM 1 is sent without one, ROM 2 with it.
+- Boot ROMs (OSD indexes 4, 5, 6, or `boot*.rom` at core load, index 0 with
+  any extension bits): `boot_md5` in HELLO is the md5 over `{index u8,
+  md5[16]}` of each loaded boot file, in order of the index byte, the last
+  file per index; zeros when none was loaded since the core. This includes the
+  boot ROMs Main reloads from `GAMEBOY2P.f4`–`.f6` when the core loads (before
+  `netplay_start()`). A boot ROM loaded while a session exists starts the
+  session again with the current pair. They change the boot and the fast-boot
+  choice.
+
+### 11.5 HPS, protocol and server
+
+- `System` gets `SYS_GB2P = 2`, chosen by the core name `GAMEBOY2P`. Games
+  `.gb`/`.gbc` up to 8 MB, saves under `saves/GAMEBOY2P/`. OSD *Netplay:
+  netplay.ini/Off/Host/Join* is `O[47:46]` (free in the core's status map).
+- UDP **version 3** for GB2P: as version 2 (a `system u8` = 2 after `version`,
+  input samples `u16`, 8 bits used), and HELLO and HELLO_ACK carry, right after
+  `sav_md5` and before `settings`: `rom2_md5[16]` (the same as `rom_md5` for one
+  game), `boot_md5[16]` (11.4) and `rtc_time u32` (the sender's local time as
+  Unix seconds, as Main sends `TIMESTAMP` at core load). Both sides use the
+  host's `rtc_time` from HELLO_ACK. A different `rom2_md5` gives `REJ_ROM`, a
+  different `boot_md5` `REJ_SETTINGS`. NES (v1) and SNES (v2) packets are
+  unchanged. A peer of another console gets `REJ_OTHER_SYSTEM`, in the HELLO
+  version the peer sent (1, 2 or 3), so older builds can read it. `CTRL[2]`
+  is written by the join on every CTRL write while enabled.
+- `settings` for HELLO: System `[15:14]`, Mapper `[41:39]`, Extra sprites
+  `[44]`, GBC/GBA mode `[37]`, Fast boot `[42]`, Audio mode `[43]`, Dupe save to
+  GB 2 `[11]`, and the extension number of game 1 and game 2 (bits 7:6 of the
+  index byte: `.gbc` 0, `.gb` 1, `.bin` 2), because with System Auto the
+  extension of the game loaded last picks GBC or DMG mode. Video and audio output options (palette, colors, inversion,
+  scale, audio select, separator line, *Show*) and rumble are local.
+- **Own Game Boy (local options):** *Show* `O[24]` = *Both screens* or *My
+  screen*: the Game Boy this MiSTer plays (`gb2` on a join while netplay is
+  active, `gb1` otherwise) as a 160x144 picture (aspect 10:9) in the middle
+  of the 320-pixel line, 80 blank pixels on each side as upstream's SGB
+  border; the pixel rate and line length do not change, only the visible
+  width, so Main sees a new size and takes the new aspect ratio. Full
+  height at 10:9 is the largest picture without losing lines or distorting
+  it, so there is no zoom.
+  *Audioselect* `O[17:16]` is *Own GB*, *Other GB*, *Mixed*, *Split own=L*,
+  with "own" the same Game Boy, so the default plays the player's own sound.
+  Without netplay both behave as upstream (GB 1 = own).
+- Recordings: `NPR3` with system 2, and `rom2_md5[16]` and `rtc_time u32` after
+  the system byte; a replay starts the cart RTC at the recorded `rtc_time`.
+- **Server:** the core field in REG is `GB2P`; games in `roms/GB/` (`.gb`,
+  `.gbc`, up to 8 MB). A room has one md5 for one game. For two games, `md5`
+  is `rom_md5` + `rom2_md5` (64 hex digits) and the game name is
+  `<game 1> + <game 2>` (up to 170 characters for `GB2P`, 80 for the others);
+  GB2P game names keep the file extension, so a join's room files get the
+  host's (GBC or DMG mode, above); a join without a room matches on both. On the MiSTer
+  the room folder holds both files (named from the game name, split at its
+  last ` + `), and loading either one joins the room, also with *Rom for
+  second GB* On. Main then loads the
+  pair itself (11.4); the `.sav` is that of game 2 (the last loaded). A
+  64-digit md5 is accepted only with the core `GB2P`. The status page has a
+  Game Boy 2P library (`roms/GB`).
+
+### 11.6 Own saves (11.B, later)
+
+The point of trading and battling (Pokémon and similar) is that each player
+plays with their own save, and in lockstep both MiSTers need the same one.
+
+- Each player's own save is the single-player `saves/GAMEBOY/<game>.sav` of
+  the normal Game Boy core (at most 128 KB), or none.
+- After HELLO the two sides exchange their saves in new packets `SAVE_DATA`
+  (`offset u32`, `total u32`, up to 1024 bytes, also through the server's
+  relay) and `SAVE_ACK`, checked against an md5 in HELLO. Each MiSTer builds
+  the same 256 KB image {host's save, join's save} (the core's layout:
+  `sd_lba[8]` selects the half) in RAM and mounts it instead of
+  `saves/GAMEBOY2P/<game>.sav`.
+- When the session ends without a desync, each side writes only *its own*
+  half back to its own file, after a copy to `<game>.sav.bak`. The other
+  player's half is never written to disk.
+
+### 11.7 Tests (Game Boy 2P)
+
+| # | Test | Passes when |
+| --- | --- | --- |
+| T2g | Both Game Boys in Verilator (VHDL through GHDL as for SNES), real ROMs; a frozen and an unfrozen machine side by side, the SDRAM model with random latency on both | no output of either core differs on any emulated `ce` for ≥ 600 frames, on a DMG game, a GBC game in double speed and Tetris in a two-player match (link every frame) |
+| T2n | The netplay module with the real core, two machines, a fake HPS each, random network latency, sides starting at different times | `PASS netplay` (the same CRC every frame) |
+| T3 | Engine tests (HELLO v3, two ROMs, boot md5, settings, GB2P vs NES/SNES refused) and `NP_SYSTEM=gb2p` UDP runs (direct, server, server with two games) | `PASS` |
+| T4 | Quartus build of the GB2P core | `TIMING OK` |
+| T5g | Replay on one MiSTer, ≥ 36000 frames | "replay OK" on Tetris (2P), Dr. Mario (2P) and a GBC link game |
+| T6g | Two MiSTers through the lobby | 30 min of a two-player match without a CRC mismatch |
+| T7g | 11.B: own saves | after a trade both `.sav` files hold the traded result, each only its own half changed |

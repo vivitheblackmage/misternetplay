@@ -27,22 +27,25 @@ if [ -n "$server" ] && [ -z "$key" ]; then echo "--server needs --key"; exit 1; 
 kit="$root/dist/netplay-kit"
 rbf="$root/NES_MiSTer/output_files/NES.rbf"
 srbf="$root/SNES_MiSTer/output_files/SNES.rbf"
+grbf="$root/Gameboy2P_MiSTer/output_files/Gameboy.rbf"
 bin="$root/Main_MiSTer/bin/MiSTer"
 rom="$root/netpong/netpong.nes"
 
-for f in "$rbf" "$srbf" "$bin" "$rom"; do [ -f "$f" ] || { echo "missing $f"; exit 1; }; done
+for f in "$rbf" "$srbf" "$grbf" "$bin" "$rom"; do [ -f "$f" ] || { echo "missing $f"; exit 1; }; done
 
 rm -rf "$kit" "$root/dist/netplay-kit.zip"
-mkdir -p "$kit/_Console" "$kit/Scripts" "$kit/games/NES/NetPong"
+mkdir -p "$kit/_Console" "$kit/Scripts" "$kit/games/NES/NetPong" "$kit/games/GAMEBOY2P"
 cp "$rbf" "$kit/_Console/NES_netplay.rbf"
 cp "$srbf" "$kit/_Console/SNES_netplay.rbf"
+cp "$grbf" "$kit/_Console/GAMEBOY2P_netplay.rbf"
 cp "$bin" "$kit/MiSTer_online"
 cp "$root"/tools/mister-scripts/netplay_on.sh "$root"/tools/mister-scripts/netplay_off.sh "$kit/Scripts/"
 cp "$rom" "$kit/games/NES/NetPong/NetPong.nes"
 chmod +x "$kit/MiSTer_online" "$kit"/Scripts/*.sh
 
 cat > "$kit/netplay.ini" <<EOF
-; NES and SNES netplay. The NES_netplay/SNES_netplay OSD option "Netplay" picks Off/Host/Join;
+; NES, SNES and Game Boy 2P netplay. The OSD option "Netplay" of NES_netplay, SNES_netplay and
+; GAMEBOY2P_netplay picks Off/Host/Join;
 ; this file gives the address, port and delay.
 
 [netplay]
@@ -57,11 +60,12 @@ file=               ; record/replay: empty = one file per game
 EOF
 
 cat > "$kit/README-netplay.txt" <<'EOF'
-NES AND SNES NETPLAY - GETTING STARTED
+NES, SNES AND GAME BOY 2P NETPLAY - GETTING STARTED
 
 1. Unzip everything into the root of the SD card (where the _Console folder is).
-   None of your own files is overwritten: the cores are NES_netplay.rbf and
-   SNES_netplay.rbf, the binary MiSTer_online, NetPong goes to games/NES/NetPong/.
+   None of your own files is overwritten: the cores are NES_netplay.rbf,
+   SNES_netplay.rbf and GAMEBOY2P_netplay.rbf, the binary MiSTer_online,
+   NetPong goes to games/NES/NetPong/.
    If you already have a netplay.ini, keep yours and change peer= or server= in it.
 
 2. Scripts menu -> netplay_on. The MiSTer restarts with the netplay binary.
@@ -77,6 +81,15 @@ SNES: start SNES_netplay (under Console). OSD Netplay -> Host or Join, the
    Games come from your own games/SNES folder (both need the same file) or from
    the server. Not supported: MSU-1, BS-X/Satellaview, games with a clock
    (S-RTC, SPC7110 RTC) and SPC music files.
+
+GAME BOY 2P: start GAMEBOY2P_netplay (under Console). It runs two Game Boys
+   linked by cable; the host plays Game Boy 1, the join Game Boy 2, and both
+   screens are shown. Games go in games/GAMEBOY2P (.gb/.gbc). OSD Netplay ->
+   Host or Join, then load a game (same file on both, same file extension).
+   Two different games (e.g. two Pokemon versions): load game 1 with
+   "Rom for second GB" Off, then set it On and load game 2; the join does the
+   same, or opens the room in _Netplay/Rooms (both files are in it).
+   Needs the SDRAM board. Not supported: MegaDuck (.bin).
 
 SWITCHING CORES: to go from NES_netplay to SNES_netplay (or back), reboot from
    the MiSTer's menu first and then start the other core. Jumping straight from
@@ -106,7 +119,7 @@ WITH A SERVER (server= and key= are set in netplay.ini)
    "... (missing game)" in Rooms        you do not have that game (same md5)
 
 Check: the files must have the md5 sums in md5sums.txt. Over ssh on the MiSTer:
-  cd /media/fat && md5sum MiSTer_online _Console/NES_netplay.rbf _Console/SNES_netplay.rbf
+  cd /media/fat && md5sum MiSTer_online _Console/*_netplay.rbf
 Always pass on the zip file, not loose files: some transfers (FTP in ASCII
 mode, git) change line endings in binaries, and MiSTer_online then does not
 start (black screen). To recover, put the SD card in a computer: delete
@@ -114,11 +127,11 @@ MiSTer, rename MiSTer_offline to MiSTer.
 
 OSD errors:
   "Different ROM file"       you do not have the same game file
-  "Different core build"     you have different NES_netplay/SNES_netplay.rbf files
+  "Different core build"     you have different *_netplay.rbf files
   "Different core settings"  set the same OSD options on both MiSTers
   "Set RAM Clear to $00..."  step 3 (NES)
   "Game chip not supported"  SNES: MSU-1, BS-X or a game with a clock
-  "...runs another console"  one of you is in NES, the other in SNES
+  "...runs another console"  you are in different cores (NES, SNES, Game Boy 2P)
   no connection              the host's router must forward UDP 7845
 EOF
 

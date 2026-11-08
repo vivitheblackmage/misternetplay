@@ -1,0 +1,1098 @@
+From a2e5a8eab525d9275580d724081e99f46e1204be Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 7 Nov 2026 15:44:42 +0100
+Subject: [PATCH 4/4] Netplay: mailbox module in DDR3, OSD Host/Join,
+ two-machine netplay simulation (T2n)
+---
+ Gameboy.sv         |  97 +++++++++--
+ files.qip          |   2 +
+ npsim/Makefile     |   2 +-
+ npsim/gb2p_sim.cpp | 237 +++++++++++++++++++++++++-
+ npsim/sim_top.sv   |  58 ++++++-
+ rtl/netplay.sv     | 411 +++++++++++++++++++++++++++++++++++++++++++++
+ rtl/np_ddram.sv    |  76 +++++++++
+ 7 files changed, 856 insertions(+), 27 deletions(-)
+ create mode 100644 rtl/netplay.sv
+ create mode 100644 rtl/np_ddram.sv
+
+diff --git a/Gameboy.sv b/Gameboy.sv
+index 7970997..52ac784 100644
+--- a/Gameboy.sv
++++ b/Gameboy.sv
+@@ -200,19 +200,16 @@ assign HDMI_BOB_DEINT = 0;
+ 
+ assign AUDIO_MIX = status[8:7];
+ 
+-assign DDRAM_CLK      = 0;
+-assign DDRAM_BURSTCNT = 0;
+-assign DDRAM_ADDR     = 0;
+-assign DDRAM_RD       = 0;
+-assign DDRAM_DIN      = 0;
+-assign DDRAM_BE       = 0;
+-assign DDRAM_WE       = 0;
++// Netplay (SPEC.md 11, rtl/netplay.sv); declared here because they are used early.
++wire        np_active, np_hold_reset, np_hold, np_join;
++wire  [7:0] np_joy_p1, np_joy_p2;
+ 
+ // Status Bit Map: (0..31 => "O", 32..63 => "o")
+ // 0         1         2         3          4         5         6
+ // 01234567890123456789012345678901 23456789012345678901234567890123
+ // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
+-// XXXXXXXXXXXXXXXXXXXXXXXX      X       XXXXXXXX
++// XXXXXXXXXXXXXXXXXXXXXXXX      X       XXXXXXXX XX
++// 46-47 Netplay (read by Main_MiSTer support/netplay/netplay.cpp).
+ 
+ `include "build_id.v" 
+ localparam CONF_STR = {
+@@ -257,6 +254,7 @@ localparam CONF_STR = {
+ 	"P2o6,Rumble,On,Off;",
+ 
+ 	"-;",
++	"O[47:46],Netplay,netplay.ini,Off,Host,Join;",
+ 	"R0,Reset;",
+ 	"J1,A,B,Select,Start;",
+ 	"V,v",`BUILD_DATE
+@@ -502,7 +500,8 @@ end
+ 
+ assign AUDIO_S = 1;
+ 
+-wire reset = (RESET | status[0] | buttons[1] | cart_download | boot_download | bk_loading);
++// netplay: the OSD reset and the user button are ignored, the session holds reset itself
++wire reset = (RESET | ((status[0] | buttons[1]) & ~np_active) | np_hold_reset | cart_download | boot_download | bk_loading);
+ 
+ reg megaduck = 0;
+ reg isGBC = 0;
+@@ -523,8 +522,11 @@ end
+ wire [15:0] AUDIO_L1, AUDIO_R1, AUDIO_L2, AUDIO_R2;
+ wire        ser1_clk_out, ser1_data_out, ser2_clk_out, ser2_data_out;
+ 
+-assign joy0_rumble = {8'd0, ((rumbling1 & ~status[38]) ? 8'd128 : 8'd0)};
+-assign joy1_rumble = {8'd0, ((rumbling2 & ~status[38]) ? 8'd128 : 8'd0)};
++// netplay: only the local pad rumbles, with the Game Boy it plays
++wire rumble_pad0 = np_active ? (np_join ? rumbling2 : rumbling1) : rumbling1;
++wire rumble_pad1 = rumbling2 & ~np_active;
++assign joy0_rumble = {8'd0, ((rumble_pad0 & ~status[38]) ? 8'd128 : 8'd0)};
++assign joy1_rumble = {8'd0, ((rumble_pad1 & ~status[38]) ? 8'd128 : 8'd0)};
+ 
+ // both Game Boys, their carts, the link cable and the clock enables (netplay: SPEC 11.1)
+ gb2p_machine machine
+@@ -533,10 +535,10 @@ gb2p_machine machine
+ 	.reset             ( reset ),
+ 
+ 	.shared_ce         ( 1'b1 ),
+-	.hold              ( 1'b0 ),
+-	.pausevideo1       ( pauseVideoCore1 & status[5] ),
+-	.pausevideo2       ( pauseVideoCore2 & status[5] ),
+-	.rtc_emu           ( 1'b0 ),
++	.hold              ( np_hold ),
++	.pausevideo1       ( pauseVideoCore1 & status[5] & ~np_active ),   // Sync Video is off in netplay
++	.pausevideo2       ( pauseVideoCore2 & status[5] & ~np_active ),
++	.rtc_emu           ( np_active ),
+ 
+ 	.isGBC             ( isGBC ),
+ 	.real_cgb_boot     ( using_real_cgb_bios ),
+@@ -566,8 +568,8 @@ gb2p_machine machine
+ 	.sdram_do2         ( sdram_do2 ),
+ 	.sdram_ack2        ( sdram_ack2 ),
+ 
+-	.joy1              ( joystick_0[7:0] ),
+-	.joy2              ( joystick_1[7:0] ),
++	.joy1              ( np_active ? np_joy_p1 : joystick_0[7:0] ),
++	.joy2              ( np_active ? np_joy_p2 : joystick_1[7:0] ),
+ 	.joystick_analog_0 ( joystick_analog_0 ),
+ 	.joystick_analog_1 ( joystick_analog_1 ),
+ 
+@@ -758,6 +760,65 @@ speedcontrol speedcontrolSDRAM
+ 	.ce_2x       (ce_ram2x)
+ );
+ 
++/////////////////////////////  Netplay  ///////////////////////////////////
++// Delay-based lockstep, see SPEC.md 11 and rtl/netplay.sv.
++
++wire [31:3] np_ddr_addr;
++wire [63:0] np_ddr_din, np_ddr_dout;
++wire        np_ddr_we, np_ddr_req, np_ddr_ack;
++
++netplay netplay
++(
++	.clk         ( clk_sys ),
++	.reset       ( ~pll_locked ),
++	.downloading ( cart_download | boot_download ),
++	.ce          ( ce1_cpu ),
++	.lcd1_clkena ( lcd1_clkena ),
++	.lcd1_data   ( lcd1_data ),
++	.lcd2_clkena ( lcd2_clkena ),
++	.lcd2_data   ( lcd2_data ),
++	.link        ( {ser2_data_out, ser2_clk_out, ser1_data_out, ser1_clk_out} ),
++	.local_joy   ( joystick_0[7:0] ),
++	.active      ( np_active ),
++	.hold_reset  ( np_hold_reset ),
++	.hold        ( np_hold ),
++	.is_join     ( np_join ),
++	.joy_p1      ( np_joy_p1 ),
++	.joy_p2      ( np_joy_p2 ),
++	.ddr_addr    ( np_ddr_addr ),
++	.ddr_din     ( np_ddr_din ),
++	.ddr_dout    ( np_ddr_dout ),
++	.ddr_we      ( np_ddr_we ),
++	.ddr_req     ( np_ddr_req ),
++	.ddr_ack     ( np_ddr_ack ),
++	.state_o     ( ),
++	.frame_o     ( ),
++	.error_o     ( )
++);
++
++// DDR3 serves only the netplay mailbox (SPEC.md 11.3)
++assign DDRAM_CLK = clk_sys;
++
++np_ddram np_ddram
++(
++	.DDRAM_CLK        ( clk_sys ),
++	.DDRAM_BUSY       ( DDRAM_BUSY ),
++	.DDRAM_BURSTCNT   ( DDRAM_BURSTCNT ),
++	.DDRAM_ADDR       ( DDRAM_ADDR ),
++	.DDRAM_DOUT       ( DDRAM_DOUT ),
++	.DDRAM_DOUT_READY ( DDRAM_DOUT_READY ),
++	.DDRAM_RD         ( DDRAM_RD ),
++	.DDRAM_DIN        ( DDRAM_DIN ),
++	.DDRAM_BE         ( DDRAM_BE ),
++	.DDRAM_WE         ( DDRAM_WE ),
++	.addr             ( np_ddr_addr ),
++	.din              ( np_ddr_din ),
++	.we               ( np_ddr_we ),
++	.dout             ( np_ddr_dout ),
++	.req              ( np_ddr_req ),
++	.ack              ( np_ddr_ack )
++);
++
+ /////////////////////////////  Serial link  ///////////////////////////////
+ 
+ assign USER_OUT[0] = 1'b1;
+@@ -807,7 +868,7 @@ always @(posedge clk_sys) begin
+ 		sav_pending <= 1'b0;
+ end
+ 
+-wire bk_load    = status[9] | new_load;
++wire bk_load    = (status[9] & ~np_active) | new_load;   // Reload Backup RAM: one side only, not in netplay
+ wire bk_save    = status[10] | (sav_pending & OSD_STATUS & status[13]);
+ reg  bk_loading = 0;
+ reg  bk_state   = 0;
+diff --git a/files.qip b/files.qip
+index 5f9f666..f73a72f 100644
+--- a/files.qip
++++ b/files.qip
+@@ -15,6 +15,8 @@ set_global_assignment -name VHDL_FILE rtl/gbc_snd.vhd
+ set_global_assignment -name VHDL_FILE rtl/speedcontrol.vhd
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/speedcontrol_shared.sv
+ set_global_assignment -name SYSTEMVERILOG_FILE rtl/gb2p_machine.sv
++set_global_assignment -name SYSTEMVERILOG_FILE rtl/netplay.sv
++set_global_assignment -name SYSTEMVERILOG_FILE rtl/np_ddram.sv
+ set_global_assignment -name VHDL_FILE rtl/bus_savestates.vhd
+ set_global_assignment -name VHDL_FILE rtl/reg_savestates.vhd
+ set_global_assignment -name VHDL_FILE rtl/gb_statemanager.vhd
+diff --git a/npsim/Makefile b/npsim/Makefile
+index bff5bab..d06966b 100644
+--- a/npsim/Makefile
++++ b/npsim/Makefile
+@@ -10,7 +10,7 @@ BUILD      := build
+ TOPS       := GBse gbc_snd speedcontrol gb_savestates gb_statemanager
+ GEN_gb_statemanager := -gSoftmap_SaveState_ADDR=58720256 -gSoftmap_Rewind_ADDR=33554432
+ RTL_V      := $(BUILD)/video.v $(addprefix ../rtl/,gb.v cart.v sprites.v sprites_extra.v sprites_extra_store.v \
+-              timer.v hdma.v link.v cheatcodes.sv megaswizzle.sv gb2p_machine.sv speedcontrol_shared.sv) \
++              timer.v hdma.v link.v cheatcodes.sv megaswizzle.sv gb2p_machine.sv speedcontrol_shared.sv netplay.sv) \
+               $(wildcard ../rtl/mappers/*.v ../rtl/mappers/*.sv)
+ SIM_SV     := sim_top.sv ram_sim.sv sdram_model.sv
+ VHDL_SRC   := $(shell sed 's|^|../|' vhdl_files.txt)
+diff --git a/npsim/gb2p_sim.cpp b/npsim/gb2p_sim.cpp
+index 909ef39..64ebae8 100644
+--- a/npsim/gb2p_sim.cpp
++++ b/npsim/gb2p_sim.cpp
+@@ -11,6 +11,8 @@
+ //   gb2p_sim ROM [--frames N] [--seed S] [--unshared] [--no-freeze] [--no-jitter]
+ //            [--offset CYCLES] [--p1 HEX] [--p2 HEX] [--sys 0|1|2] [--quiet]
+ //            [--script FILE] [--shot FRAME[,FRAME...] --shot-prefix PATH]
++//   gb2p_sim ROM --netplay SEED [--frames N] [--delay D] [--latency CYCLES] [--dirty ROM2 FRAMES] [--script FILE]
++//   (--script with --netplay: p1 is the host's pad, p2 the join's, by each side's netplay frame)
+ //
+ // --unshared runs the upstream per-core speedcontrol (no freezes possible) as a
+ // control: with link traffic it is expected to differ.
+@@ -80,6 +82,11 @@ struct Side {
+ 	bool     sb_wr_seen = false;
+ 	uint64_t cart_exec = 0;
+ 	const std::map<uint64_t, std::pair<uint8_t, uint8_t>> *script = nullptr;
++	// netplay: the mailbox (DDR3 channel, word-addressed) with random latency
++	std::map<uint32_t, uint64_t> ddr;
++	int      ddr_wait = -1;
++	bool     np_mode = false;         // the local pad is `pad`, the netplay module drives the cores
++	uint8_t  pad = 0;
+ 	uint16_t lcd[2][160 * 144] = {};
+ 	uint32_t lcd_ptr[2] = {0, 0};
+ 	bool     lcd_off_old[2] = {true, true};
+@@ -134,8 +141,12 @@ struct Side {
+ 		m->clk_sys = sys; m->clk_ram = ram; m->eval();
+ 	}
+ 
++	// load the ROM again (the session's reload)
++	void reload() { dl_state = 0; dl_pos = 0; start_at = cycles; }
++
+ 	// one clk_sys cycle; samples go to q[core]
+ 	void step(std::deque<Sample> *q, bool collect) {
++		m->np_reset = cycles < 16;
+ 		// download driver (inputs change while clk_sys is low)
+ 		m->ioctl_wr = 0;
+ 		switch (dl_state) {
+@@ -162,8 +173,8 @@ struct Side {
+ 			auto it = script->upper_bound(ce1 / CE_PER_FRAME);
+ 			if (it != script->begin()) { --it; p1 = it->second.first; p2 = it->second.second; }
+ 		}
+-		m->joy1 = running ? p1 : 0;
+-		m->joy2 = running ? p2 : 0;
++		m->joy1 = np_mode ? pad : running ? p1 : 0;
++		m->joy2 = np_mode ? 0 : running ? p2 : 0;
+ 		if (jitter) m->jitter = (rng() % 3) == 0;
+ 		if (freeze && running) {
+ 			if (hold_left) hold_left--;
+@@ -190,6 +201,18 @@ struct Side {
+ 			}
+ 		}
+ 		eval_half(1, 1);
++		// the mailbox port (toggle handshake), served after a random 4..40 clocks
++		if (m->np_ddr_req != m->np_ddr_ack) {
++			if (ddr_wait < 0) ddr_wait = 4 + rng() % 37;
++			else if (ddr_wait-- == 0) {
++				uint32_t a = (uint32_t)m->np_ddr_addr << 3;
++				if (m->np_ddr_we) ddr[a] = m->np_ddr_din;
++				else { auto it = ddr.find(a); m->np_ddr_dout = it == ddr.end() ? 0 : it->second; }
++				m->np_ddr_ack = m->np_ddr_req;
++				ddr_wait = -1;
++				m->eval();
++			}
++		}
+ 		eval_half(1, 0);
+ 		eval_half(0, 1);
+ 		eval_half(0, 0);
+@@ -208,9 +231,219 @@ static std::vector<uint8_t> load(const char *path) {
+ 	return v;
+ }
+ 
++
++// ---------------------------------------------------------------------------
++// --netplay (T2n, SPEC 11.7): two MiSTers (host and join), each with the
++// netplay module, a fake HPS (SPEC 4: session start, combining LOCAL into
++// INPUT) and a network with random latency between them. Passes when both
++// post the same CRC for every frame.
++
++static const uint32_t NP_BASE = 0x3C000000;
++static const uint32_t OFF_MAGIC = 0x0000, OFF_STATUS = 0x0008, OFF_CTRL = 0x0010;
++static const uint32_t OFF_LOCAL = 0x1000, OFF_CRC = 0x1800, OFF_INPUT = 0x2000;
++static const uint64_t NP_MAGIC = 0x3130504E50324247ULL;   // "GB2PNP01"
++static const uint64_t CTRL_MAGIC = 0x4C525443ULL;         // "CTRL"
++
++struct FakeHps {
++	Side &s;
++	bool host;
++	int delay;
++	uint8_t sess;
++	int phase = 0;                      // 0 wait MAGIC, 1 reloading, 2 running
++	uint64_t arm_at = 0;                // when "the user starts the session" on this side
++	uint64_t t_loaded = 0;
++	uint64_t settle = 200000;           // after the load (Main waits for the .sav)
++	const std::vector<uint8_t> *rom;    // the session's ROM
++	uint32_t next_local = 0;
++	std::map<uint32_t, uint8_t> mine, peer;   // LOCAL by frame
++	uint32_t next_input;
++	std::map<uint32_t, uint32_t> crcs;
++	uint32_t next_crc = 0;
++
++	FakeHps(Side &ss, bool h, int d, uint8_t sid, const std::vector<uint8_t> *r)
++		: s(ss), host(h), delay(d), sess(sid), rom(r), next_input(d) {}
++
++	uint64_t rd(uint32_t off) { auto it = s.ddr.find(NP_BASE + off); return it == s.ddr.end() ? 0 : it->second; }
++	void wr(uint32_t off, uint64_t v) { s.ddr[NP_BASE + off] = v; }
++	uint32_t half(uint32_t f, uint8_t v) { return ((f & 0xFFFF) << 16) | ((uint32_t)sess << 8) | v; }
++	uint64_t input_word(uint32_t f, uint8_t p1, uint8_t p2) { return ((uint64_t)half(f, p2) << 32) | half(f, p1); }
++
++	void poll(uint64_t now, std::vector<std::pair<uint32_t, uint8_t>> &send) {
++		if (phase == 0) {
++			if (now < arm_at || rd(OFF_MAGIC) != NP_MAGIC) return;
++			for (uint32_t i = 0; i < 256; i++) {
++				wr(OFF_LOCAL + i * 8, 0xFFFF000000000000ULL);
++				wr(OFF_CRC + i * 8, 0xFFFF000000000000ULL);
++				wr(OFF_INPUT + i * 8, 0xFFFF000000000000ULL);
++			}
++			wr(OFF_CTRL, (CTRL_MAGIC << 32) | ((uint64_t)sess << 8) | (host ? 0 : 4) | 1);
++			s.rom = *rom;
++			s.reload();      // the session's ROM load (the module is ARMED by the next CTRL read or so)
++			phase = 1;
++			return;
++		}
++		if (phase == 1) {
++			if (s.dl_state != 3) return;
++			if (!t_loaded) t_loaded = now;
++			if (now - t_loaded < settle) return;
++			for (int f = 0; f < delay; f++) wr(OFF_INPUT + (f & 0xFF) * 8, input_word(f, 0, 0));
++			wr(OFF_CTRL, (CTRL_MAGIC << 32) | ((uint64_t)sess << 8) | (host ? 0 : 4) | 3);
++			phase = 2;
++			return;
++		}
++		for (;;) {
++			uint64_t w = rd(OFF_LOCAL + (next_local & 0xFF) * 8);
++			uint32_t hi = w >> 32, lo = (uint32_t)w;
++			if (hi != lo || (hi >> 16) != (next_local & 0xFFFF) || ((hi >> 8) & 0xFF) != sess) break;
++			mine[next_local] = lo & 0xFF;
++			send.push_back({next_local, (uint8_t)(lo & 0xFF)});
++			next_local++;
++		}
++		for (;;) {
++			uint32_t f = next_input - delay;
++			if (!mine.count(f) || !peer.count(f)) break;
++			uint8_t p1 = host ? mine[f] : peer[f], p2 = host ? peer[f] : mine[f];
++			wr(OFF_INPUT + (next_input & 0xFF) * 8, input_word(next_input, p1, p2));
++			next_input++;
++		}
++		for (;;) {
++			uint64_t w = rd(OFF_CRC + (next_crc & 0xFF) * 8);
++			uint32_t hi = w >> 32, lo = (uint32_t)w;
++			uint32_t tag = next_crc & 0xFFFF;
++			if ((hi >> 16) != tag || (lo >> 16) != tag) break;
++			crcs[next_crc] = ((hi & 0xFFFF) << 16) | (lo & 0xFFFF);
++			next_crc++;
++		}
++	}
++};
++
++static int run_netplay(const char *rom_path, const char *dirty_path, int dirty_frames, int frames, uint64_t seed,
++                       int delay, uint64_t max_lat, const std::map<uint64_t, std::pair<uint8_t, uint8_t>> *script)
++{
++	auto rom = load(rom_path);
++	std::vector<uint8_t> dirty = dirty_path ? load(dirty_path) : std::vector<uint8_t>();
++	auto *ctx = new VerilatedContext;
++	Side H, J;
++	H.m = new Vgb2p_side{ctx, "H"}; H.name = "host";
++	J.m = new Vgb2p_side{ctx, "J"}; J.name = "join";
++	auto ext_index = [](const char *p) {
++		std::string r = p, ext = r.size() >= 4 ? r.substr(r.size() - 4) : "";
++		for (auto &ch : ext) ch = tolower(ch);
++		return (uint8_t)(ext == ".gbc" ? 0x01 : ext == ".bin" ? 0x81 : 0x41);
++	};
++	for (Side *s : {&H, &J}) {
++		s->rom = rom; s->index = ext_index(rom_path);
++		s->np_mode = true; s->jitter = true;
++		s->m->shared_ce = 1; s->m->sys_select = 0; s->m->rom_load_gb2 = 0;
++		s->m->reset_in = 1; s->m->hold = 0; s->m->jitter = 0; s->m->np_ddr_ack = 0;
++		s->eval_half(0, 0);
++	}
++	H.rng.seed(seed * 7 + 1); J.rng.seed(seed * 13 + 2);
++	if (dirty_path) { J.rom = dirty; J.index = ext_index(dirty_path); }   // the join ran another game first
++
++	FakeHps hh(H, true, delay, 0x5A, &rom), hj(J, false, delay, 0x5A, &rom);
++	std::mt19937_64 r(seed);
++	const uint64_t FRAME_CLK = CE_PER_FRAME * 8;
++	hh.arm_at = 300000;
++	hj.arm_at = 300000 + (dirty_path ? (uint64_t)dirty_frames * FRAME_CLK : 0) + r() % (3 * FRAME_CLK);
++	hj.settle += r() % FRAME_CLK;
++	printf("join arms %llu cycles after the host%s\n", (unsigned long long)(hj.arm_at - hh.arm_at),
++	       dirty_path ? " (after running the other ROM)" : "");
++	fflush(stdout);
++
++	struct Pkt { uint64_t at; uint32_t f; uint8_t joy; };
++	std::deque<Pkt> to_j, to_h;
++	uint64_t now = 0, h_hold = 0, j_hold = 0;
++	uint64_t max_cycles = hj.arm_at + (uint64_t)(frames + 20) * FRAME_CLK * 3;
++	uint64_t pad_seed = seed * 31 + 5;
++	auto rnd = [&]() { pad_seed ^= pad_seed << 13; pad_seed ^= pad_seed >> 7; pad_seed ^= pad_seed << 17; return pad_seed; };
++	uint32_t last_report = 0;
++	while (now < max_cycles) {
++		H.step(nullptr, false); J.step(nullptr, false); now++;
++		h_hold += H.m->np_hold; j_hold += J.m->np_hold;
++		// local pads change at random wall-clock moments (and the dirty run gets some too)
++		if (script) {
++			// the script's p1 is the host's pad, p2 the join's, by each side's own frame
++			auto at = [&](uint32_t f, bool p2) -> uint8_t {
++				auto it = script->upper_bound(f);
++				if (it == script->begin()) return 0;
++				--it; return p2 ? it->second.second : it->second.first;
++			};
++			H.pad = hh.phase == 2 ? at(H.m->np_frame, false) : 0;
++			J.pad = hj.phase == 2 ? at(J.m->np_frame, true) : 0;
++		} else {
++			if (rnd() % 200000 == 0) H.pad = rnd() & 0xFF;
++			if (rnd() % 200000 == 0) J.pad = rnd() & 0xFF;
++		}
++		if (now % 64) continue;
++		std::vector<std::pair<uint32_t, uint8_t>> sh, sj;
++		hh.poll(now, sh); hj.poll(now, sj);
++		for (auto &x : sh) to_j.push_back({ now + r() % (max_lat + 1), x.first, x.second });
++		for (auto &x : sj) to_h.push_back({ now + r() % (max_lat + 1), x.first, x.second });
++		// UDP may reorder; the HPS keeps samples by frame, so delivery order does not matter
++		for (auto it = to_j.begin(); it != to_j.end();) { if (it->at <= now) { hj.peer[it->f] = it->joy; it = to_j.erase(it); } else ++it; }
++		for (auto it = to_h.begin(); it != to_h.end();) { if (it->at <= now) { hh.peer[it->f] = it->joy; it = to_h.erase(it); } else ++it; }
++		if (H.m->np_error || J.m->np_error || H.m->np_state == 4 || J.m->np_state == 4) {
++			printf("FAIL: netplay error host %02x join %02x\n", H.m->np_error, J.m->np_error);
++			return 1;
++		}
++		uint32_t n = std::min(hh.next_crc, hj.next_crc);
++		if (n && n / 60 != last_report) {
++			last_report = n / 60;
++			printf("frame %u: host stalls %llu, join stalls %llu\n", n, (unsigned long long)(hh.rd(OFF_STATUS) & 0xFFFF),
++			       (unsigned long long)(hj.rd(OFF_STATUS) & 0xFFFF));
++			fflush(stdout);
++			for (uint32_t f = 0; f < n; f++)
++				if (hh.crcs[f] != hj.crcs[f]) { printf("FAIL: CRC mismatch at frame %u: host %08x join %08x\n", f, hh.crcs[f], hj.crcs[f]); return 1; }
++		}
++		if (n > (uint32_t)frames) break;
++	}
++	int bad = 0;
++	uint32_t n = std::min(hh.next_crc, hj.next_crc);
++	for (uint32_t f = 0; f < n; f++)
++		if (hh.crcs[f] != hj.crcs[f]) { if (bad++ < 5) printf("CRC mismatch frame %u: host %08x join %08x\n", f, hh.crcs[f], hj.crcs[f]); }
++	std::set<uint32_t> distinct;
++	for (auto &x : hh.crcs) distinct.insert(x.second);
++	printf("%u frames compared, %d CRC mismatches, %zu distinct CRCs; held cycles host %llu join %llu; "
++	       "stalls host %u join %u; delay %d, latency up to %llu cycles\n",
++	       n, bad, distinct.size(), (unsigned long long)h_hold, (unsigned long long)j_hold,
++	       (unsigned)(hh.rd(OFF_STATUS) & 0xFFFF), (unsigned)(hj.rd(OFF_STATUS) & 0xFFFF), delay,
++	       (unsigned long long)max_lat);
++	bool ok = n > (uint32_t)frames && !bad && distinct.size() > 1;
++	printf("%s netplay\n", ok ? "PASS" : "FAIL");
++	return ok ? 0 : 1;
++}
++
+ int main(int argc, char **argv) {
+ 	if (argc < 2) { fprintf(stderr, "usage: gb2p_sim ROM [options]\n"); return 2; }
+ 	const char *rom = argv[1];
++	// --netplay SEED [--delay D] [--latency CYCLES] [--dirty ROM2 FRAMES] [--frames N]
++	for (int i = 2; i < argc; i++) if (!strcmp(argv[i], "--netplay")) {
++		if (FILE *f = fopen("build/cgb_boot.hex", "r")) fclose(f);
++		else { fprintf(stderr, "build/cgb_boot.hex not found: run from the npsim directory\n"); return 2; }
++		uint64_t seed = i + 1 < argc ? strtoull(argv[i + 1], 0, 0) : 1;
++		int nf = 300, d = 3, df = 0; uint64_t lat = 400000; const char *dirty = nullptr;
++		std::map<uint64_t, std::pair<uint8_t, uint8_t>> scr; bool use_scr = false;
++		for (int k = 2; k < argc; k++) {
++			if (!strcmp(argv[k], "--frames") && k + 1 < argc) nf = atoi(argv[++k]);
++			else if (!strcmp(argv[k], "--delay") && k + 1 < argc) d = atoi(argv[++k]);
++			else if (!strcmp(argv[k], "--latency") && k + 1 < argc) lat = strtoull(argv[++k], 0, 0);
++			else if (!strcmp(argv[k], "--dirty") && k + 2 < argc) { dirty = argv[++k]; df = atoi(argv[++k]); }
++			else if (!strcmp(argv[k], "--script") && k + 1 < argc) {
++				FILE *f = fopen(argv[++k], "r");
++				if (!f) { perror("script"); return 2; }
++				char line[256];
++				while (fgets(line, sizeof line, f)) {
++					if (char *h = strchr(line, '#')) *h = 0;
++					unsigned long long fr; unsigned a1, a2;
++					if (sscanf(line, "%llu %x %x", &fr, &a1, &a2) == 3) scr[fr] = {(uint8_t)a1, (uint8_t)a2};
++				}
++				fclose(f);
++				use_scr = true;
++			}
++		}
++		return run_netplay(rom, dirty, df, nf, seed, d, lat, use_scr ? &scr : nullptr);
++	}
+ 	uint64_t frames = 60, seed = 1, offset = 12345;
+ 	bool shared = true, freeze = true, jitter = true, quiet = false;
+ 	int p1 = 0, p2 = 0, sys = 0;
+diff --git a/npsim/sim_top.sv b/npsim/sim_top.sv
+index 3f6ce0f..9cfece6 100644
+--- a/npsim/sim_top.sv
++++ b/npsim/sim_top.sv
+@@ -10,6 +10,7 @@ module gb2p_side
+ 	input         clk_ram,
+ 
+ 	input         reset_in,      // the OSD/HPS reset (the download resets by itself)
++	input         np_reset,      // power-on reset of the netplay module (Gameboy.sv: ~pll_locked)
+ 	input         shared_ce,
+ 	input         hold,
+ 	input         jitter,
+@@ -61,12 +62,26 @@ module gb2p_side
+ 	output        cpu2_rd_n,
+ 	output        isGBC_out,
+ 	output [22:0] mbc1_addr,
+-	output [22:0] mbc2_addr
++	output [22:0] mbc2_addr,
++
++	// netplay (rtl/netplay.sv): the mailbox port, served by the C++ side
++	output [31:3] np_ddr_addr,
++	output [63:0] np_ddr_din,
++	input  [63:0] np_ddr_dout,
++	output        np_ddr_we,
++	output        np_ddr_req,
++	input         np_ddr_ack,
++	output        np_active,
++	output        np_hold,
++	output  [2:0] np_state,
++	output [31:0] np_frame,
++	output  [7:0] np_error
+ );
+ 
+ wire [7:0] filetype = ioctl_index;
+ wire cart_download = ioctl_download && (filetype[5:0] == 6'h01 || filetype == 8'h80);
+-wire reset = reset_in | cart_download;
++wire np_hold_reset;
++wire reset = (reset_in & ~np_active) | np_hold_reset | cart_download;
+ 
+ wire sys_auto = (sys_select == 0);
+ wire sys_gbc  = (sys_select == 2);
+@@ -148,10 +163,10 @@ gb2p_machine machine
+ 	.clk_sys           ( clk_sys ),
+ 	.reset             ( reset ),
+ 	.shared_ce         ( shared_ce ),
+-	.hold              ( hold ),
++	.hold              ( hold | np_hold ),
+ 	.pausevideo1       ( 1'b0 ),
+ 	.pausevideo2       ( 1'b0 ),
+-	.rtc_emu           ( 1'b1 ),
++	.rtc_emu           ( 1'b1 ),   // Gameboy.sv: np_active
+ 	.isGBC             ( isGBC ),
+ 	.real_cgb_boot     ( 1'b0 ),
+ 	.megaduck          ( 1'b0 ),
+@@ -177,8 +192,8 @@ gb2p_machine machine
+ 	.sdram_oe2         ( sdram_oe2 ),
+ 	.sdram_do2         ( sdram_do2 ),
+ 	.sdram_ack2        ( sdram_ack2 ),
+-	.joy1              ( joy1 ),
+-	.joy2              ( joy2 ),
++	.joy1              ( np_active ? np_joy_p1 : joy1 ),
++	.joy2              ( np_active ? np_joy_p2 : joy2 ),
+ 	.joystick_analog_0 ( 16'd0 ),
+ 	.joystick_analog_1 ( 16'd0 ),
+ 	.bk_wr1            ( 1'b0 ),
+@@ -222,6 +237,37 @@ gb2p_machine machine
+ 	.ser2_data_out     ( ser2_data_out )
+ );
+ 
++wire [7:0] np_joy_p1, np_joy_p2;
++
++netplay #(.POLL_INTERVAL(256), .CTRL_INTERVAL(4096)) netplay
++(
++	.clk         ( clk_sys ),
++	.reset       ( np_reset ),
++	.downloading ( cart_download ),
++	.ce          ( ce1_cpu ),
++	.lcd1_clkena ( lcd1_clkena ),
++	.lcd1_data   ( lcd1_data ),
++	.lcd2_clkena ( lcd2_clkena ),
++	.lcd2_data   ( lcd2_data ),
++	.link        ( {ser2_data_out, ser2_clk_out, ser1_data_out, ser1_clk_out} ),
++	.local_joy   ( joy1 ),
++	.active      ( np_active ),
++	.hold_reset  ( np_hold_reset ),
++	.hold        ( np_hold ),
++	.is_join     ( ),
++	.joy_p1      ( np_joy_p1 ),
++	.joy_p2      ( np_joy_p2 ),
++	.ddr_addr    ( np_ddr_addr ),
++	.ddr_din     ( np_ddr_din ),
++	.ddr_dout    ( np_ddr_dout ),
++	.ddr_we      ( np_ddr_we ),
++	.ddr_req     ( np_ddr_req ),
++	.ddr_ack     ( np_ddr_ack ),
++	.state_o     ( np_state ),
++	.frame_o     ( np_frame ),
++	.error_o     ( np_error )
++);
++
+ assign cpu1_addr = machine.gb1.cpu_addr;
+ assign cpu1_do   = machine.gb1.cpu_do;
+ assign cpu1_wr_n = machine.gb1.cpu_wr_n;
+diff --git a/rtl/netplay.sv b/rtl/netplay.sv
+new file mode 100644
+index 0000000..628dc8e
+--- /dev/null
++++ b/rtl/netplay.sv
+@@ -0,0 +1,411 @@
++// netplay.sv
++//
++// Delay-based lockstep netplay for the Game Boy 2P core (SPEC.md, section 11).
++//
++// Each MiSTer runs both Game Boys; the network carries only input. The FPGA
++// side never touches the network. It exchanges per-frame input with
++// Main_MiSTer through a mailbox in DDR3 (SPEC.md 4 and 11.3):
++//
++//   - A frame is 70224 emulated `ce` (SPEC.md 11.2), counted from the first
++//     `ce` after hold_reset falls. On the `ce` that starts frame k it applies
++//     INPUT[k], samples the local pad and posts LOCAL[k], and posts CRC[k-1].
++//   - It keeps a two-entry lookahead of INPUT[] read back from the mailbox.
++//     If INPUT[k] is not in hand when frame k is due, `hold` stops the shared
++//     clock enable (rtl/speedcontrol_shared.sv) before that `ce` until it is.
++//
++// clk is clk_sys. `ce` is the shared 4 MHz enable of both Game Boys (gb2p_machine
++// ce1_cpu): everything that must follow emulated time changes only on it.
++//
++// This program is GPL licensed. See COPYING for the full license.
++
++module netplay #(
++	parameter int          POLL_INTERVAL  = 256,          // clocks between INPUT polls
++	parameter int          CTRL_INTERVAL  = 4096,         // clocks between CTRL reads
++	parameter int          CE_PER_FRAME   = 70224,        // 154 lines x 456 dots
++	parameter logic [31:0] BASE           = 32'h3C000000  // physical byte address of the mailbox
++)
++(
++	input             clk,
++	input             reset,          // power-on only, never on ROM load
++	input             downloading,    // a ROM or boot ROM load is in progress
++
++	// the emulated machine
++	input             ce,             // the shared clock enable of both Game Boys
++	input             lcd1_clkena,
++	input      [14:0] lcd1_data,
++	input             lcd2_clkena,
++	input      [14:0] lcd2_data,
++	input       [3:0] link,           // {ser2_data, ser2_clk, ser1_data, ser1_clk} out of the cores
++
++	input       [7:0] local_joy,      // joystick_0[7:0] as the framework delivers it
++
++	output            active,
++	output            hold_reset,
++	output            hold,           // skip the clock enables (speedcontrol_shared)
++	output reg        is_join,        // CTRL[2]: this side plays gb2 (rumble goes to the local pad)
++	output reg  [7:0] joy_p1,
++	output reg  [7:0] joy_p2,
++
++	// DDR3 channel (rtl/np_ddram.sv, toggle handshake: req != ack = busy)
++	output reg [31:3] ddr_addr,
++	output reg [63:0] ddr_din,
++	input      [63:0] ddr_dout,
++	output reg        ddr_we,
++	output reg        ddr_req,
++	input             ddr_ack,
++
++	// observation
++	output      [2:0] state_o,
++	output     [31:0] frame_o,
++	output      [7:0] error_o
++);
++
++// ---------------------------------------------------------------------------
++// Mailbox layout (byte offsets from BASE), SPEC.md 4 and 11.3
++localparam logic [15:0] OFF_MAGIC  = 16'h0000;
++localparam logic [15:0] OFF_STATUS = 16'h0008;
++localparam logic [15:0] OFF_CTRL   = 16'h0010;
++localparam logic [15:0] OFF_LOCAL  = 16'h1000;
++localparam logic [15:0] OFF_CRC    = 16'h1800;
++localparam logic [15:0] OFF_INPUT  = 16'h2000;
++
++localparam logic [63:0] MAGIC = 64'h3130504E50324247; // "GB2PNP01"
++// CTRL is only believed with this in its upper half. DDR3 is not cleared when
++// cores change, so a stray word left by another core must never arm netplay.
++localparam logic [31:0] CTRL_MAGIC = 32'h4C525443;      // "CTRL"
++
++localparam logic [2:0] S_IDLE  = 3'd0;
++localparam logic [2:0] S_ARMED = 3'd1;
++localparam logic [2:0] S_PRIME = 3'd2;
++localparam logic [2:0] S_RUN   = 3'd3;
++localparam logic [2:0] S_ERROR = 3'd4;
++
++localparam int ERR_CTRL_DROP = 1;
++localparam int ERR_RELOAD    = 2;
++
++localparam logic [31:0] CRC_INIT = 32'hFFFFFFFF;
++localparam logic [16:0] CE_LAST  = 17'(CE_PER_FRAME);
++
++function automatic logic [31:0] crc_byte(input logic [31:0] c, input logic [7:0] d);
++	logic [31:0] x;
++	x = c ^ {24'd0, d};
++	for (int i = 0; i < 8; i++)
++		x = x[0] ? ((x >> 1) ^ 32'hEDB88320) : (x >> 1);
++	return x;
++endfunction
++
++function automatic logic [31:0] crc_joy(input logic [7:0] p1, input logic [7:0] p2);
++	return crc_byte(crc_byte(CRC_INIT, p1), p2);
++endfunction
++
++function automatic logic [31:3] waddr(input logic [15:3] off);
++	return BASE[31:3] + {16'd0, off};
++endfunction
++
++function automatic logic [15:3] ring(input logic [15:3] base_off, input logic [7:0] slot);
++	return base_off + {5'd0, slot};
++endfunction
++
++// ---------------------------------------------------------------------------
++// State
++
++logic [2:0]  state;
++logic [31:0] frame;
++logic [7:0]  error;
++logic [15:0] stalls;
++logic [7:0]  sess;
++
++// Lookahead: slot 0 holds INPUT[base], slot 1 INPUT[base+1], where base is
++// the first frame not started yet (0 in PRIME, frame+1 in RUN).
++logic        have0, have1;
++logic [7:0]  a_p1, a_p2;      // slot 0
++logic [7:0]  b_p1, b_p2;      // slot 1
++logic [31:0] crc;
++
++// Emulated time: ce seen in the current frame (1..CE_PER_FRAME)
++logic [16:0] ce_cnt;
++logic  [3:0] link_prev;
++
++wire         at_tick  = (state == S_RUN) && (ce_cnt == CE_LAST);   // the next ce starts a frame
++assign hold           = (at_tick && !have0) || (state == S_ERROR && !downloading);
++wire         consume  = at_tick && have0 && ce;                     // frame k starts on this ce
++
++assign active     = (state != S_IDLE);
++assign hold_reset = (state == S_ARMED) || (state == S_PRIME);
++
++assign state_o = state;
++assign frame_o = frame;
++assign error_o = error;
++
++// What this ce adds to the CRC: gb1's pixel, gb2's pixel, the link lines
++// when they changed (they cover frames with both LCDs off).
++function automatic logic [31:0] crc_ce(input logic [31:0] c);
++	logic [31:0] x;
++	x = c;
++	if (lcd1_clkena) x = crc_byte(crc_byte(x, lcd1_data[7:0]), {1'b0, lcd1_data[14:8]});
++	if (lcd2_clkena) x = crc_byte(crc_byte(x, lcd2_data[7:0]), {1'b0, lcd2_data[14:8]});
++	if (link != link_prev) x = crc_byte(x, {4'd0, link});
++	return x;
++endfunction
++
++// Pending mailbox work
++logic        p_ctrl_clr, p_magic, p_status, p_local, p_crc;
++logic [15:0] local_frame;
++logic [7:0]  local_val;
++logic [15:0] crc_frame;
++logic [31:0] crc_val;
++logic        hold_prev;
++
++// Poll timers
++logic [15:0] poll_cnt, ctrl_cnt;
++logic        poll_due, ctrl_due;
++
++// DDR sequencer
++localparam logic [2:0] OP_NONE    = 3'd0;
++localparam logic [2:0] OP_MAGIC   = 3'd1;
++localparam logic [2:0] OP_CRC     = 3'd2;
++localparam logic [2:0] OP_LOCAL   = 3'd3;
++localparam logic [2:0] OP_STATUS  = 3'd4;
++localparam logic [2:0] OP_CTRL    = 3'd5;
++localparam logic [2:0] OP_INPUT   = 3'd6;
++localparam logic [2:0] OP_CTRLCLR = 3'd7;
++
++logic [2:0]  op;
++logic [31:0] op_frame;   // INPUT frame being fetched
++wire         ddr_done = (op != OP_NONE) && (ddr_req == ddr_ack);
++
++wire  [31:0] base       = (state == S_PRIME) ? 32'd0 : frame + 32'd1;
++wire         fetching   = (state == S_PRIME) || (state == S_RUN);
++wire         need_input = fetching && !(have0 && have1);
++wire  [31:0] want_frame = have0 ? base + 32'd1 : base;
++
++wire         ctrl_ok  = (ddr_dout[63:32] == CTRL_MAGIC);
++wire         ctrl_en  = ctrl_ok & ddr_dout[0];
++wire         ctrl_run = ctrl_ok & ddr_dout[1];
++
++wire  [63:0] status_word = {frame, 5'd0, state, error, stalls};
++
++// Tag check for INPUT entries: both halves must carry frame tag and session.
++wire  [31:0] in_hi = ddr_dout[63:32];
++wire  [31:0] in_lo = ddr_dout[31:0];
++wire         in_ok = (in_hi[31:16] == op_frame[15:0]) && (in_lo[31:16] == op_frame[15:0])
++                  && (in_hi[15:8] == sess)            && (in_lo[15:8] == sess);
++
++always_ff @(posedge clk) begin
++	hold_prev <= hold;
++
++	// timers
++	if (poll_cnt == POLL_INTERVAL[15:0] - 16'd1) begin poll_cnt <= 16'd0; poll_due <= 1'b1; end
++	else poll_cnt <= poll_cnt + 16'd1;
++	if (ctrl_cnt == CTRL_INTERVAL[15:0] - 16'd1) begin ctrl_cnt <= 16'd0; ctrl_due <= 1'b1; end
++	else ctrl_cnt <= ctrl_cnt + 16'd1;
++
++	// -----------------------------------------------------------------------
++	// Per-frame work in RUN
++	if (state == S_RUN) begin
++		if (hold && !hold_prev && stalls != 16'hFFFF) stalls <= stalls + 16'd1;
++
++		if (ce) link_prev <= link;
++
++		if (consume) begin
++			frame       <= frame + 32'd1;
++			joy_p1      <= a_p1;
++			joy_p2      <= a_p2;
++			// shift the lookahead
++			have0       <= have1;
++			a_p1        <= b_p1;
++			a_p2        <= b_p2;
++			have1       <= 1'b0;
++
++			crc_frame   <= frame[15:0];
++			crc_val     <= crc;
++			p_crc       <= 1'b1;
++
++			local_frame <= frame[15:0] + 16'd1;
++			local_val   <= local_joy;
++			p_local     <= 1'b1;
++
++			p_status    <= 1'b1;
++			// this ce is the first of the new frame
++			ce_cnt      <= 17'd1;
++			crc         <= crc_ce(crc_joy(a_p1, a_p2));
++		end
++		else if (ce) begin
++			ce_cnt      <= ce_cnt + 17'd1;
++			crc         <= crc_ce(crc);
++		end
++
++		if (downloading) begin
++			error[ERR_RELOAD] <= 1'b1;
++			state    <= S_ERROR;
++			p_status <= 1'b1;
++		end
++	end
++
++	if (state == S_PRIME && downloading) begin
++		error[ERR_RELOAD] <= 1'b1;
++		state    <= S_ERROR;
++		p_status <= 1'b1;
++	end
++
++	// PRIME -> RUN once INPUT[0] and INPUT[1] are in hand: release reset with
++	// INPUT[0] applied; frame 0 starts at the first ce after that (the shared
++	// speed control restarts its divider when reset falls). INPUT[1] is slot 0
++	// for the first tick.
++	if (state == S_PRIME && have0 && have1 && !downloading) begin
++		state       <= S_RUN;
++		frame       <= 32'd0;
++		ce_cnt      <= 17'd0;
++		link_prev   <= link;
++		joy_p1      <= a_p1;
++		joy_p2      <= a_p2;
++		have0       <= 1'b1;
++		a_p1        <= b_p1;
++		a_p2        <= b_p2;
++		have1       <= 1'b0;
++		local_frame <= 16'd0;
++		local_val   <= local_joy;
++		p_local     <= 1'b1;
++		p_status    <= 1'b1;
++		crc         <= crc_joy(a_p1, a_p2);
++	end
++
++	// -----------------------------------------------------------------------
++	// DDR sequencer: one outstanding request at a time.
++	if (op == OP_NONE) begin
++		if (p_ctrl_clr) begin
++			// Before MAGIC: once Main_MiSTer sees MAGIC, CTRL is known clean.
++			op <= OP_CTRLCLR; ddr_addr <= waddr(OFF_CTRL[15:3]);   ddr_din <= 64'd0;       ddr_we <= 1'b1; ddr_req <= ~ddr_req;
++		end
++		else if (p_magic) begin
++			op <= OP_MAGIC;   ddr_addr <= waddr(OFF_MAGIC[15:3]);  ddr_din <= MAGIC;       ddr_we <= 1'b1; ddr_req <= ~ddr_req;
++		end
++		else if (p_crc) begin
++			op <= OP_CRC;     ddr_addr <= waddr(ring(OFF_CRC[15:3], crc_frame[7:0]));
++			ddr_din <= {crc_frame, crc_val[31:16], crc_frame, crc_val[15:0]};
++			ddr_we <= 1'b1; ddr_req <= ~ddr_req;
++		end
++		else if (p_local) begin
++			op <= OP_LOCAL;   ddr_addr <= waddr(ring(OFF_LOCAL[15:3], local_frame[7:0]));
++			ddr_din <= {local_frame, sess, local_val, local_frame, sess, local_val};
++			ddr_we <= 1'b1; ddr_req <= ~ddr_req;
++		end
++		else if (p_status) begin
++			op <= OP_STATUS;  ddr_addr <= waddr(OFF_STATUS[15:3]); ddr_din <= status_word; ddr_we <= 1'b1; ddr_req <= ~ddr_req;
++		end
++		else if (ctrl_due) begin
++			op <= OP_CTRL;    ddr_addr <= waddr(OFF_CTRL[15:3]);   ddr_we <= 1'b0; ddr_req <= ~ddr_req;
++		end
++		else if (poll_due && need_input) begin
++			op <= OP_INPUT;   ddr_addr <= waddr(ring(OFF_INPUT[15:3], want_frame[7:0]));
++			op_frame <= want_frame;
++			ddr_we <= 1'b0; ddr_req <= ~ddr_req;
++		end
++	end
++	else if (ddr_done) begin
++		op <= OP_NONE;
++		case (op)
++			OP_CTRLCLR: p_ctrl_clr <= 1'b0;
++			OP_MAGIC:  p_magic  <= 1'b0;
++			OP_CRC:    p_crc    <= 1'b0;
++			OP_LOCAL:  p_local  <= 1'b0;
++			OP_STATUS: p_status <= 1'b0;
++			OP_INPUT: begin
++				poll_due <= 1'b0;
++				// A frame starting in this very cycle shifts the lookahead; drop the
++				// word and let the next poll fetch it again rather than race the
++				// shift. A start earlier in flight moves base, so match op_frame afresh.
++				if (in_ok && fetching && !consume) begin
++					if (!have0 && op_frame == base) begin
++						a_p1  <= in_lo[7:0];
++						a_p2  <= in_hi[7:0];
++						have0 <= 1'b1;
++					end
++					else if (have0 && !have1 && op_frame == base + 32'd1) begin
++						b_p1  <= in_lo[7:0];
++						b_p2  <= in_hi[7:0];
++						have1 <= 1'b1;
++					end
++				end
++			end
++			OP_CTRL: begin
++				ctrl_due <= 1'b0;
++				// without the magic the word means "disabled"
++				case (state)
++					S_IDLE: if (ctrl_en) begin
++						state     <= S_ARMED;
++						sess      <= ddr_dout[15:8];
++						is_join   <= ddr_dout[2];
++						error     <= 8'd0;
++						stalls    <= 16'd0;
++						frame     <= 32'd0;
++						have0     <= 1'b0;
++						have1     <= 1'b0;
++						p_status  <= 1'b1;
++					end
++					S_ARMED: begin
++						if (!ctrl_en)     begin state <= S_IDLE;  p_status <= 1'b1; end
++						else if (ctrl_run) begin state <= S_PRIME; p_status <= 1'b1; end
++					end
++					S_PRIME, S_ERROR: if (!ctrl_en) begin
++						state    <= S_IDLE;
++						p_status <= 1'b1;
++						p_local  <= 1'b0;
++						p_crc    <= 1'b0;
++					end
++					S_RUN: if (!ctrl_en) begin
++						error[ERR_CTRL_DROP] <= 1'b1;
++						state    <= S_IDLE;
++						p_status <= 1'b1;
++						p_local  <= 1'b0;
++						p_crc    <= 1'b0;
++					end
++					default: ;
++				endcase
++			end
++			default: ;
++		endcase
++	end
++
++	if (reset) begin
++		state     <= S_IDLE;
++		frame     <= 32'd0;
++		error     <= 8'd0;
++		stalls    <= 16'd0;
++		sess      <= 8'd0;
++		is_join   <= 1'b0;
++		have0     <= 1'b0;
++		have1     <= 1'b0;
++		a_p1      <= 8'd0;
++		a_p2      <= 8'd0;
++		b_p1      <= 8'd0;
++		b_p2      <= 8'd0;
++		joy_p1    <= 8'd0;
++		joy_p2    <= 8'd0;
++		crc       <= CRC_INIT;
++		ce_cnt    <= 17'd0;
++		link_prev <= 4'd0;
++		p_ctrl_clr <= 1'b1;
++		p_magic   <= 1'b1;
++		p_status  <= 1'b1;
++		p_local   <= 1'b0;
++		p_crc     <= 1'b0;
++		poll_cnt  <= 16'd0;
++		ctrl_cnt  <= 16'd0;
++		poll_due  <= 1'b0;
++		ctrl_due  <= 1'b1;
++		op        <= OP_NONE;
++		op_frame  <= 32'd0;
++		ddr_we    <= 1'b0;
++		ddr_addr  <= '0;
++		ddr_din   <= '0;
++		local_frame <= 16'd0;
++		local_val   <= 8'd0;
++		crc_frame   <= 16'd0;
++		crc_val     <= 32'd0;
++		hold_prev   <= 1'b0;
++		// ddr_req is not reset: it must keep matching ddr_ack across a reset
++	end
++end
++
++endmodule
+diff --git a/rtl/np_ddram.sv b/rtl/np_ddram.sv
+new file mode 100644
+index 0000000..91b76ed
+--- /dev/null
++++ b/rtl/np_ddram.sv
+@@ -0,0 +1,76 @@
++// np_ddram.sv
++//
++// The netplay mailbox's DDR3 port (SPEC.md 11.3). The core does not otherwise
++// use DDR3, so this is its only master: single 64-bit words, toggle handshake
++// (req != ack = busy), no cache (the HPS writes the mailbox behind its back).
++// Read data is taken even when DDRAM_BUSY is high in the same cycle.
++//
++// This program is GPL licensed. See COPYING for the full license.
++
++module np_ddram
++(
++	input             DDRAM_CLK,
++	input             DDRAM_BUSY,
++	output      [7:0] DDRAM_BURSTCNT,
++	output     [28:0] DDRAM_ADDR,
++	input      [63:0] DDRAM_DOUT,
++	input             DDRAM_DOUT_READY,
++	output            DDRAM_RD,
++	output     [63:0] DDRAM_DIN,
++	output      [7:0] DDRAM_BE,
++	output            DDRAM_WE,
++
++	input      [31:3] addr,
++	input      [63:0] din,
++	input             we,
++	output reg [63:0] dout,
++	input             req,
++	output reg        ack = 0
++);
++
++reg [28:0] ram_address = 0;
++reg [63:0] ram_data    = 0;
++reg        ram_read    = 0;
++reg        ram_write   = 0;
++reg  [1:0] state       = 0;   // 0 idle, 1 read issued, 2 write issued
++
++assign DDRAM_BURSTCNT = 8'd1;
++assign DDRAM_ADDR     = ram_address;
++assign DDRAM_RD       = ram_read;
++assign DDRAM_WE       = ram_write;
++assign DDRAM_DIN      = ram_data;
++assign DDRAM_BE       = 8'hFF;
++
++always @(posedge DDRAM_CLK) begin
++	if (state == 1 && DDRAM_DOUT_READY) begin
++		dout  <= DDRAM_DOUT;
++		ack   <= req;
++		state <= 0;
++	end
++
++	if (!DDRAM_BUSY) begin
++		ram_read  <= 0;
++		ram_write <= 0;
++		case (state)
++			0: if (req != ack) begin
++					ram_address <= addr[31:3];
++					if (we) begin
++						ram_data  <= din;
++						ram_write <= 1;
++						state     <= 2;
++					end
++					else begin
++						ram_read  <= 1;
++						state     <= 1;
++					end
++				end
++			2: begin
++					ack   <= req;   // the write was accepted
++					state <= 0;
++				end
++			default: ;
++		endcase
++	end
++end
++
++endmodule
+-- 
+2.43.0
+

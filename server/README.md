@@ -50,7 +50,7 @@ Without systemd, or just to try it: run `./netplay-server-linux-arm64` directly.
 port=7845          ; UDP + TCP
 key=3f9c...        ; the same key in the players' netplay.ini
 roms=roms          ; games the server hands out (in RAM only on the MiSTers):
-                   ; roms/NES (or roms itself) and roms/SNES
+                   ; roms/NES (or roms itself), roms/SNES and roms/GB
 catalog=catalog.txt ; "md5 name" per line: versions everyone brings themselves
 ```
 
@@ -63,8 +63,11 @@ Rooms and games show in a web browser: `http://<server>:7845/?key=<key>`.
 folder.
 
 Each core gets the games of its own folder: NES the files in `roms/NES` and
-directly in `roms`, SNES the files in `roms/SNES` (`.sfc`/`.smc`, up to 8 MB).
+directly in `roms`, SNES the files in `roms/SNES` (`.sfc`/`.smc`, up to 8 MB),
+Game Boy 2P the files in `roms/GB` (`.gb`/`.gbc`, up to 8 MB).
 Rooms are per core too: an SNES room only shows on MiSTers running the SNES core.
+A Game Boy 2P room can hold two different games (one per Game Boy); its folder
+on the MiSTer then has both files, and loading either one joins the room.
 
 Only put games in `roms` that you are allowed to share, such as your own games
 and homebrew.

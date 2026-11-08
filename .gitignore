@@ -13,3 +13,4 @@ __pycache__/
 # Left by tools/backup_to_windows.sh in the copy
 .netplay-backup
 /SNES_MiSTer/
+/Gameboy2P_MiSTer/

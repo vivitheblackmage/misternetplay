@@ -1,0 +1,1328 @@
+From 4ae9c9b7808881bcf81f23ab01af02284173d6be Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Fri, 6 Nov 2026 22:49:19 +0100
+Subject: [PATCH 1/4] Netplay: both Game Boys in gb2p_machine, shared clock
+ enable
+
+The two cores, the link cable and the clock enables move from Gameboy.sv
+into rtl/gb2p_machine.sv. speedcontrol_shared.sv drives both cores from one
+divider: the enables are skipped while either core's ROM read waits for the
+SDRAM, while hold is 1 or while pausevideo is 1, so SDRAM latency never
+changes the order of events between the two cores (SPEC 11.1). Gameboy.sv
+selects it (shared_ce = 1); shared_ce = 0 gives the upstream per-core
+enables. The cart RTC can count emulated cycles instead of wall-clock time
+(rtc_emu, 0 in Gameboy.sv for now).
+---
+ Gameboy.sv                 | 539 ++++++---------------------------
+ files.qip                  |   2 +
+ rtl/gb2p_machine.sv        | 594 +++++++++++++++++++++++++++++++++++++
+ rtl/speedcontrol_shared.sv |  80 +++++
+ 4 files changed, 768 insertions(+), 447 deletions(-)
+ create mode 100644 rtl/gb2p_machine.sv
+ create mode 100644 rtl/speedcontrol_shared.sv
+
+diff --git a/Gameboy.sv b/Gameboy.sv
+index 86eba15..7970997 100644
+--- a/Gameboy.sv
++++ b/Gameboy.sv
+@@ -377,25 +377,8 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
+ 
+ ///////////////////////////////////////////////////
+ 
+-wire [14:0] cart1_addr;
+-wire        cart1_a15;
+-wire        cart1_rd;
+-wire        cart1_wr;
+-wire        cart1_oe;
+-wire  [7:0] cart1_di;
+-wire  [7:0] cart1_do;
+ wire [22:0] mbc1_addr;
+-wire        gb1_nCS; // WRAM or Cart RAM CS
+-
+-wire [14:0] cart2_addr;
+-wire        cart2_a15;
+-wire        cart2_rd;
+-wire        cart2_wr;
+-wire        cart2_oe;
+-wire  [7:0] cart2_di;
+-wire  [7:0] cart2_do;
+ wire [22:0] mbc2_addr;
+-wire        gb2_nCS;
+ 
+ 
+ wire cart_download = ioctl_download && (filetype[5:0] == 6'h01 || filetype == 8'h80);
+@@ -460,13 +443,13 @@ wire  [1:0] sdram_ds = cart_download ? 2'b11 : {mbc1_addr[0], ~mbc1_addr[0]};
+ wire [15:0] sdram_do;
+ wire [15:0] sdram_di = cart_download ? ioctl_dout : 16'd0;
+ wire [23:0] sdram_addr = cart_download? { 1'b0, rom_bank_gb2, ioctl_addr[22:1] } : {2'b00, mbc1_addr[22:1]};
+-wire sdram_oe = ~cart_download & cart1_rd & ~cram1_rd;
++wire sdram_oe;
+ wire sdram_ack;
+ wire sdram_we = cart_download & dn_write;
+ 
+ wire [15:0] sdram_do2;
+ wire [23:0] sdram_addr2 = {1'b0, rom_bank_gb2, mbc2_addr[22:1]};
+-wire        sdram_oe2   = ~cart_download & cart2_rd & ~cram2_rd;
++wire        sdram_oe2;
+ wire        sdram_ack2;
+ 
+ assign SDRAM_CKE = 1;
+@@ -503,15 +486,9 @@ sdram sdram (
+    .ack2           ( sdram_ack2                )
+ );
+ 
+-wire cram1_rd, cram1_wr;
+-wire cram2_rd, cram2_wr;
+-wire [7:0] rom1_do = (mbc1_addr[0]) ? sdram_do[15:8]  : sdram_do[7:0];
+-wire [7:0] rom2_do = (mbc2_addr[0]) ? sdram_do2[15:8] : sdram_do2[7:0];
++wire cram1_wr, cram2_wr;
+ wire isGBC_game1, isGBC_game2;
+ wire cart1_has_save, cart2_has_save;
+-wire [31:0] RTC_timestampOut;
+-wire [47:0] RTC_savedtimeOut;
+-wire RTC_inuse;
+ wire rumbling1, rumbling2;
+ wire [2:0] mapper_sel = status[41:39];
+ 
+@@ -543,395 +520,104 @@ always @(posedge clk_sys) if(reset) begin
+ end
+ 
+ // core 1
+-wire speed1;
+-wire SaveStateBus_rst1;
++wire [15:0] AUDIO_L1, AUDIO_R1, AUDIO_L2, AUDIO_R2;
++wire        ser1_clk_out, ser1_data_out, ser2_clk_out, ser2_data_out;
+ 
+ assign joy0_rumble = {8'd0, ((rumbling1 & ~status[38]) ? 8'd128 : 8'd0)};
+-
+-reg ce_32k; // 32768Hz clock for RTC
+-reg [9:0] ce_32k_div;
+-always @(posedge clk_sys) begin
+-	ce_32k_div <= ce_32k_div + 1'b1;
+-	ce_32k <= !ce_32k_div;
+-end
+-
+-cart_top cart1 (
+-	.reset	     ( reset      ),
+-
+-	.clk_sys     ( clk_sys    ),
+-	.ce_cpu      ( ce1_cpu    ),
+-	.ce_cpu2x    ( ce1_cpu2x  ),
+-	.speed       ( speed1     ),
+-	.megaduck    ( megaduck   ),
+-	.mapper_sel  ( mapper_sel ),
+-
+-	.cart_addr   ( cart1_addr  ),
+-	.cart_a15    ( cart1_a15   ),
+-	.cart_rd     ( cart1_rd    ),
+-	.cart_wr     ( cart1_wr    ),
+-	.cart_do     ( cart1_do    ),
+-	.cart_di     ( cart1_di    ),
+-	.cart_oe     ( cart1_oe    ),
+-
+-	.nCS         ( gb1_nCS        ),
+-
+-	.mbc_addr    ( mbc1_addr   ),
+-
+-	.dn_write    (             ),
+-	.cart_ready  (             ),
+-
+-	.cram_rd     ( cram1_rd     ),
+-	.cram_wr     ( cram1_wr     ),
+-
+-	.cart_download ( cart_download & ~rom_load_gb2),
+-
+-	.ram_mask_file (  ),
+-	.ram_size      (  ),
+-	.has_save      ( cart1_has_save ),
+-
+-	.isGBC_game    ( isGBC_game1   ),
+-	.isSGB_game    (               ),
+-
+-	.ioctl_download ( 1'b0           ),
+-	.ioctl_wr       ( ioctl_wr & ~rom_load_gb2),
+-	.ioctl_addr     ( ioctl_addr     ),
+-	.ioctl_dout     ( ioctl_dout     ),
+-	.ioctl_wait     (                ),
+-
+-	.bk_wr          ( bk_wr1         ),
+-	.bk_rtc_wr      ( 1'b0           ),
+-	.bk_addr        ( bk_addr        ),
+-	.bk_data        ( bk_data        ),
+-	.bk_q           ( bk_q1          ),
+-	.img_size       ( img_size       ),
+-
+-	.rom_di         ( rom1_do       ),
+-
+-	.joystick_analog_0 ( joystick_analog_0 ),
+-
+-	.ce_32k           ( ce_32k           ),
+-	.RTC_time         ( RTC_time         ),
+-	.RTC_timestampOut ( RTC_timestampOut ),
+-	.RTC_savedtimeOut ( RTC_savedtimeOut ),
+-	.RTC_inuse        ( RTC_inuse        ),
+-
+-	.SaveStateExt_Din ( 0  ),
+-	.SaveStateExt_Adr ( 0  ),
+-	.SaveStateExt_wren( 0 ),
+-	.SaveStateExt_rst ( SaveStateBus_rst1  ),
+-	.SaveStateExt_Dout(  ),
+-	.savestate_load   ( 0   ),
+-	.sleep_savestate  ( 0   ),
+-
+-	.Savestate_CRAMAddr     ( 0  ),
+-	.Savestate_CRAMRWrEn    ( 0  ),
+-	.Savestate_CRAMWriteData( 0  ),
+-	.Savestate_CRAMReadData (    ),
+-
+-	.rumbling (rumbling1)
+-);
+-
+-wire [15:0] AUDIO_L1;
+-wire [15:0] AUDIO_R1;
+-
+-// the gameboy itself
+-gb gb1 (
+-	.reset	    ( reset      ),
+-	
+-	.clk_sys     ( clk_sys    ),
+-	.ce          ( ce1_cpu    ),   // the whole gameboy runs on 4mhnz
+-	.ce_n        ( ce1_cpu_n   ),  // 4MHz falling edge clock enable
+-	.ce_2x       ( ce1_cpu2x  ),   // ~8MHz in dualspeed mode (GBC)
+-	
+-	.isGBC       ( isGBC      ),
+-	.real_cgb_boot ( using_real_cgb_bios ),
+-	.isSGB       ( 1'b0 ),
+-	.megaduck    ( megaduck   ),
+-	.extra_spr_en( status[44] ),
+-
+-	.joy_p54     ( joy1_p54     ),
+-	.joy_din     ( joy1_do      ),
+-
+-	// interface to the "external" game cartridge
+-	.ext_bus_addr( cart1_addr  ),
+-	.ext_bus_a15 ( cart1_a15   ),
+-	.cart_rd     ( cart1_rd    ),
+-	.cart_wr     ( cart1_wr    ),
+-	.cart_do     ( cart1_do    ),
+-	.cart_di     ( cart1_di    ),
+-	.cart_oe     ( cart1_oe    ),
+-
+-	.nCS         ( gb1_nCS     ),
+-
+-	.boot_gba_en    ( boot_gba_available && status[37] ),
+-	.fast_boot_en   ( fastboot_available && status[42] ),
+-
+-	.cgb_boot_download ( cgb_boot_download ),
+-	.dmg_boot_download ( dmg_boot_download ),
+-	.sgb_boot_download ( sgb_boot_download ),
+-	.ioctl_wr       ( ioctl_wr       ),
+-	.ioctl_addr     ( ioctl_addr     ),
+-	.ioctl_dout     ( ioctl_dout     ),
+-
+-	// audio
+-	.audio_l 	 ( AUDIO_L1 ),
+-	.audio_r 	 ( AUDIO_R1 ),
+-	.audio_no_pops (status[43]),
+-	
+-	// interface to the lcd
+-	.lcd_clkena  ( lcd1_clkena ),
+-	.lcd_data    ( lcd1_data   ),
+-	.lcd_data_gb (            ),
+-	.lcd_mode    ( lcd1_mode   ),
+-	.lcd_on      ( lcd1_on     ),
+-	.lcd_vsync   ( lcd1_vsync  ),
+-	
+-	.speed       ( speed1    ),
+-	.DMA_on      (     ),
+-	
+-	// serial port
+-	.sc_int_clock2  (sc1_int_clock_out),
+-	.serial_clk_in  (ser1_clk_in),
+-	.serial_data_in (ser1_data_in),
+-	.serial_clk_out (ser1_clk_out),
+-	.serial_data_out(ser1_data_out),
+-	
+-	// Palette download will disable cheats option (HPS doesn't distinguish downloads),
+-	// so clear the cheats and disable second option (chheats enable/disable)
+-	.gg_reset(1'b0),
+-	.gg_en(1'b0),
+-	.gg_code(0),
+-	.gg_available(),
+-	
+-	// savestates
+-	.increaseSSHeaderCount (1'b0),
+-	.cart_ram_size   (8'd0),
+-	.save_state      (1'b0),
+-	.load_state      (1'b0),
+-	.savestate_number(2'b00),
+-	.sleep_savestate (),
+-	
+-	.SaveStateExt_Din (),
+-	.SaveStateExt_Adr (),
+-	.SaveStateExt_wren(),
+-	.SaveStateExt_rst (SaveStateBus_rst1),
+-	.SaveStateExt_Dout(0),
+-	.SaveStateExt_load(),
+-	
+-	.Savestate_CRAMAddr     (),
+-	.Savestate_CRAMRWrEn    (),
+-	.Savestate_CRAMWriteData(),
+-	.Savestate_CRAMReadData (0),
+-	
+-	.SAVE_out_Din(),            // data read from savestate
+-	.SAVE_out_Dout(0),          // data written to savestate
+-	.SAVE_out_Adr(),           // all addresses are DWORD addresses!
+-	.SAVE_out_rnw(),            // read = 1, write = 0
+-	.SAVE_out_ena(),            // one cycle high for each action
+-	.SAVE_out_be(),            
+-	.SAVE_out_done(1'b1),            // should be one cycle high when write is done or read value is valid
+-	
+-	.rewind_on(1'b0),
+-	.rewind_active(1'b0)
+-);
+-
+-wire [1:0] joy1_p54;
+-wire [3:0] joy1_dir     = ~{ joystick_0[2], joystick_0[3], joystick_0[1], joystick_0[0] } | {4{joy1_p54[0]}};
+-wire [3:0] joy1_buttons = ~{ joystick_0[7], joystick_0[6], joystick_0[5], joystick_0[4] } | {4{joy1_p54[1]}};
+-wire [3:0] joy1_do      = joy1_dir & joy1_buttons;
+-
+-// core 2
+-wire speed2;
+-wire SaveStateBus_rst2;
+-
+ assign joy1_rumble = {8'd0, ((rumbling2 & ~status[38]) ? 8'd128 : 8'd0)};
+ 
+-cart_top cart2 (
+-	.reset	     ( reset      ),
+-
+-	.clk_sys     ( clk_sys    ),
+-	.ce_cpu      ( ce2_cpu    ),
+-	.ce_cpu2x    ( ce2_cpu2x  ),
+-	.speed       ( speed2     ),
+-	.megaduck    ( megaduck   ),
+-	.mapper_sel  ( mapper_sel ),
+-
+-	.cart_addr   ( cart2_addr  ),
+-	.cart_a15    ( cart2_a15   ),
+-	.cart_rd     ( cart2_rd    ),
+-	.cart_wr     ( cart2_wr    ),
+-	.cart_do     ( cart2_do    ),
+-	.cart_di     ( cart2_di    ),
+-	.cart_oe     ( cart2_oe    ),
+-
+-	.nCS         ( gb2_nCS        ),
+-
+-	.mbc_addr    ( mbc2_addr   ),
+-
+-	.dn_write    (      ),
+-	.cart_ready  (      ),
+-
+-	.cram_rd     ( cram2_rd     ),
+-	.cram_wr     ( cram2_wr     ),
+-
+-	.cart_download ( cart_download ),
+-
+-	.ram_mask_file (  ),
+-	.ram_size      (  ),
+-	.has_save      ( cart2_has_save ),
+-
+-	.isGBC_game    ( isGBC_game2 ),
+-	.isSGB_game    (             ),
+-
+-	.ioctl_download ( 1'b0           ),
+-	.ioctl_wr       ( ioctl_wr       ),
+-	.ioctl_addr     ( ioctl_addr     ),
+-	.ioctl_dout     ( ioctl_dout     ),
+-	.ioctl_wait     (  ),
+-
+-	.bk_wr          ( bk_wr2         ),
+-	.bk_rtc_wr      ( 1'b0           ),
+-	.bk_addr        ( bk_addr        ),
+-	.bk_data        ( bk_data        ),
+-	.bk_q           ( bk_q2          ),
+-	.img_size       ( img_size       ),
+-
+-	.rom_di         ( rom2_do      ),
+-
+-	.joystick_analog_0 ( joystick_analog_1 ),
+-
+-	.ce_32k           ( ce_32k           ),
+-	.RTC_time         ( RTC_time         ),
+-	.RTC_timestampOut (  ),
+-	.RTC_savedtimeOut (  ),
+-	.RTC_inuse        (  ),
+-
+-	.SaveStateExt_Din ( 0  ),
+-	.SaveStateExt_Adr ( 0  ),
+-	.SaveStateExt_wren( 0 ),
+-	.SaveStateExt_rst ( SaveStateBus_rst2  ),
+-	.SaveStateExt_Dout(  ),
+-	.savestate_load   ( 0   ),
+-	.sleep_savestate  ( 0   ),
+-
+-	.Savestate_CRAMAddr     ( 0  ),
+-	.Savestate_CRAMRWrEn    ( 0  ),
+-	.Savestate_CRAMWriteData( 0  ),
+-	.Savestate_CRAMReadData (    ),
+-
+-	.rumbling (rumbling2)
+-);
+-
+-wire [15:0] AUDIO_L2;
+-wire [15:0] AUDIO_R2;
+-
+-// the gameboy itself
+-gb gb2 (
+-	.reset	    ( reset      ),
+-	
+-	.clk_sys     ( clk_sys    ),
+-	.ce          ( ce2_cpu    ),   // the whole gameboy runs on 4mhnz
+-	.ce_n        ( ce2_cpu_n   ),  // 4MHz falling edge clock enable
+-	.ce_2x       ( ce2_cpu2x  ),   // ~8MHz in dualspeed mode (GBC)
+-	
+-
+-	.isGBC       ( isGBC      ),
+-	.real_cgb_boot ( using_real_cgb_bios ),
+-	.isSGB       ( 1'b0 ),
+-	.megaduck    ( megaduck   ),
+-	.extra_spr_en( status[44] ),
+-
+-	.joy_p54     ( joy2_p54     ),
+-	.joy_din     ( joy2_do      ),
+-
+-	// interface to the "external" game cartridge
+-	.ext_bus_addr( cart2_addr  ),
+-	.ext_bus_a15 ( cart2_a15   ),
+-	.cart_rd     ( cart2_rd    ),
+-	.cart_wr     ( cart2_wr    ),
+-	.cart_do     ( cart2_do    ),
+-	.cart_di     ( cart2_di    ),
+-	.cart_oe     ( cart2_oe    ),
+-
+-	.nCS         ( gb2_nCS     ),
+-
+-	.boot_gba_en    ( boot_gba_available && status[37] ),
+-	.fast_boot_en   ( fastboot_available && status[42] ),
+-
++// both Game Boys, their carts, the link cable and the clock enables (netplay: SPEC 11.1)
++gb2p_machine machine
++(
++	.clk_sys           ( clk_sys ),
++	.reset             ( reset ),
++
++	.shared_ce         ( 1'b1 ),
++	.hold              ( 1'b0 ),
++	.pausevideo1       ( pauseVideoCore1 & status[5] ),
++	.pausevideo2       ( pauseVideoCore2 & status[5] ),
++	.rtc_emu           ( 1'b0 ),
++
++	.isGBC             ( isGBC ),
++	.real_cgb_boot     ( using_real_cgb_bios ),
++	.megaduck          ( megaduck ),
++	.mapper_sel        ( mapper_sel ),
++	.extra_spr_en      ( status[44] ),
++	.boot_gba_en       ( boot_gba_available && status[37] ),
++	.fast_boot_en      ( fastboot_available && status[42] ),
++	.audio_no_pops     ( status[43] ),
++
++	.cart_download     ( cart_download ),
++	.rom_load_gb2      ( rom_load_gb2 ),
+ 	.cgb_boot_download ( cgb_boot_download ),
+ 	.dmg_boot_download ( dmg_boot_download ),
+ 	.sgb_boot_download ( sgb_boot_download ),
+-	.ioctl_wr       ( ioctl_wr       ),
+-	.ioctl_addr     ( ioctl_addr     ),
+-	.ioctl_dout     ( ioctl_dout     ),
+-
+-	// audio
+-	.audio_l 	 ( AUDIO_L2 ),
+-	.audio_r 	 ( AUDIO_R2 ),
+-	.audio_no_pops (status[43]),
+-	
+-	// interface to the lcd
+-	.lcd_clkena  ( lcd2_clkena ),
+-	.lcd_data    ( lcd2_data   ),
+-	.lcd_data_gb (            ),
+-	.lcd_mode    ( lcd2_mode   ),
+-	.lcd_on      ( lcd2_on     ),
+-	.lcd_vsync   ( lcd2_vsync  ),
+-	
+-	.speed       ( speed2     ),
+-	.DMA_on      (      ),
+-	
+-	// serial port
+-	.sc_int_clock2  (sc2_int_clock_out),
+-	.serial_clk_in  (ser2_clk_in),
+-	.serial_data_in (ser2_data_in),
+-	.serial_clk_out (ser2_clk_out),
+-	.serial_data_out(ser2_data_out),
+-	
+-	// Palette download will disable cheats option (HPS doesn't distinguish downloads),
+-	// so clear the cheats and disable second option (chheats enable/disable)
+-	.gg_reset(1'b0),
+-	.gg_en(1'b0),
+-	.gg_code(0),
+-	.gg_available(),
+-	
+-	// savestates
+-	.increaseSSHeaderCount (1'b0),
+-	.cart_ram_size   (8'd0),
+-	.save_state      (1'b0),
+-	.load_state      (1'b0),
+-	.savestate_number(2'b00),
+-	.sleep_savestate (),
+-	
+-	.SaveStateExt_Din (),
+-	.SaveStateExt_Adr (),
+-	.SaveStateExt_wren(),
+-	.SaveStateExt_rst (SaveStateBus_rst2),
+-	.SaveStateExt_Dout(0),
+-	.SaveStateExt_load(),
+-	
+-	.Savestate_CRAMAddr     (),
+-	.Savestate_CRAMRWrEn    (),
+-	.Savestate_CRAMWriteData(),
+-	.Savestate_CRAMReadData (0),
+-	
+-	.SAVE_out_Din(),            // data read from savestate
+-	.SAVE_out_Dout(0),          // data written to savestate
+-	.SAVE_out_Adr(),           // all addresses are DWORD addresses!
+-	.SAVE_out_rnw(),            // read = 1, write = 0
+-	.SAVE_out_ena(),            // one cycle high for each action
+-	.SAVE_out_be(),            
+-	.SAVE_out_done(1'b1),            // should be one cycle high when write is done or read value is valid
+-	
+-	.rewind_on(1'b0),
+-	.rewind_active(1'b0)
++	.ioctl_wr          ( ioctl_wr ),
++	.ioctl_addr        ( ioctl_addr ),
++	.ioctl_dout        ( ioctl_dout ),
++	.img_size          ( img_size ),
++
++	.mbc1_addr         ( mbc1_addr ),
++	.sdram_oe          ( sdram_oe ),
++	.sdram_do          ( sdram_do ),
++	.sdram_ack         ( sdram_ack ),
++	.mbc2_addr         ( mbc2_addr ),
++	.sdram_oe2         ( sdram_oe2 ),
++	.sdram_do2         ( sdram_do2 ),
++	.sdram_ack2        ( sdram_ack2 ),
++
++	.joy1              ( joystick_0[7:0] ),
++	.joy2              ( joystick_1[7:0] ),
++	.joystick_analog_0 ( joystick_analog_0 ),
++	.joystick_analog_1 ( joystick_analog_1 ),
++
++	.bk_wr1            ( bk_wr1 ),
++	.bk_wr2            ( bk_wr2 ),
++	.bk_addr           ( bk_addr ),
++	.bk_data           ( bk_data ),
++	.bk_q1             ( bk_q1 ),
++	.bk_q2             ( bk_q2 ),
++	.cart1_has_save    ( cart1_has_save ),
++	.cart2_has_save    ( cart2_has_save ),
++	.cram1_wr          ( cram1_wr ),
++	.cram2_wr          ( cram2_wr ),
++	.isGBC_game1       ( isGBC_game1 ),
++	.isGBC_game2       ( isGBC_game2 ),
++
++	.RTC_time          ( RTC_time ),
++
++	.ce1_cpu           ( ce1_cpu ),
++	.ce1_cpu_n         ( ce1_cpu_n ),
++	.ce1_cpu2x         ( ce1_cpu2x ),
++	.ce2_cpu           ( ce2_cpu ),
++	.ce2_cpu_n         ( ce2_cpu_n ),
++	.ce2_cpu2x         ( ce2_cpu2x ),
++
++	.lcd1_clkena       ( lcd1_clkena ),
++	.lcd1_data         ( lcd1_data ),
++	.lcd1_mode         ( lcd1_mode ),
++	.lcd1_on           ( lcd1_on ),
++	.lcd1_vsync        ( lcd1_vsync ),
++	.lcd2_clkena       ( lcd2_clkena ),
++	.lcd2_data         ( lcd2_data ),
++	.lcd2_mode         ( lcd2_mode ),
++	.lcd2_on           ( lcd2_on ),
++	.lcd2_vsync        ( lcd2_vsync ),
++
++	.AUDIO_L1          ( AUDIO_L1 ),
++	.AUDIO_R1          ( AUDIO_R1 ),
++	.AUDIO_L2          ( AUDIO_L2 ),
++	.AUDIO_R2          ( AUDIO_R2 ),
++
++	.rumbling1         ( rumbling1 ),
++	.rumbling2         ( rumbling2 ),
++
++	.ser1_clk_out      ( ser1_clk_out ),
++	.ser1_data_out     ( ser1_data_out ),
++	.ser2_clk_out      ( ser2_clk_out ),
++	.ser2_data_out     ( ser2_data_out )
+ );
+ 
+-wire [1:0] joy2_p54;
+-wire [3:0] joy2_dir     = ~{ joystick_1[2], joystick_1[3], joystick_1[1], joystick_1[0] } | {4{joy2_p54[0]}};
+-wire [3:0] joy2_buttons = ~{ joystick_1[7], joystick_1[6], joystick_1[5], joystick_1[4] } | {4{joy2_p54[1]}};
+-wire [3:0] joy2_do      = joy2_dir & joy2_buttons;
+-
+ assign AUDIO_L = (status[17:16] == 3'd0) ? AUDIO_L1 : 
+                  (status[17:16] == 3'd1) ? AUDIO_L2 : 
+                  (status[17:16] == 3'd2) ? ($signed(AUDIO_L1[15:1]) + $signed(AUDIO_L2[15:1])) :
+@@ -1061,30 +747,6 @@ wire ce1_cpu, ce1_cpu_n, ce1_cpu2x;
+ wire ce2_cpu, ce2_cpu_n, ce2_cpu2x;
+ wire ce_ram2x;
+ 
+-speedcontrol speedcontrol1
+-(
+-	.clk_sys     (clk_sys),
+-	.reset       (reset),
+-	.romread     (sdram_oe),
+-	.romack      (sdram_ack),
+-	.pausevideo  (pauseVideoCore1 & status[5]),
+-	.ce          (ce1_cpu),
+-	.ce_n        (ce1_cpu_n),
+-	.ce_2x       (ce1_cpu2x)
+-);
+-
+-speedcontrol speedcontrol2
+-(
+-	.clk_sys     (clk_sys),
+-	.reset       (reset),
+-	.romread     (sdram_oe2),
+-	.romack      (sdram_ack2),
+-	.pausevideo  (pauseVideoCore2 & status[5]),
+-	.ce          (ce2_cpu),
+-	.ce_n        (ce2_cpu_n),
+-	.ce_2x       (ce2_cpu2x)
+-);
+-
+ speedcontrol speedcontrolSDRAM
+ (
+ 	.clk_sys     (clk_sys),
+@@ -1106,23 +768,6 @@ assign USER_OUT[4] = 1'b1;
+ assign USER_OUT[5] = 1'b1;
+ assign USER_OUT[6] = 1'b1;
+ 
+-wire sc1_int_clock_out;
+-wire ser1_data_in;
+-wire ser1_data_out;
+-wire ser1_clk_in;
+-wire ser1_clk_out;
+-
+-wire sc2_int_clock_out;
+-wire ser2_data_in;
+-wire ser2_data_out;
+-wire ser2_clk_in;
+-wire ser2_clk_out;
+-
+-assign ser1_data_in = ser2_data_out;
+-assign ser1_clk_in  = ser2_clk_out;
+-
+-assign ser2_data_in = ser1_data_out;
+-assign ser2_clk_in  = ser1_clk_out;
+ 
+ /////////////////////////  BRAM SAVE/LOAD  /////////////////////////////
+ 
+diff --git a/files.qip b/files.qip
+index 1bcfbbf..5f9f666 100644
+--- a/files.qip
++++ b/files.qip
+@@ -13,6 +13,8 @@ set_global_assignment -name VERILOG_FILE rtl/sprites_extra_store.v
+ set_global_assignment -name VERILOG_FILE rtl/lcd.v
+ set_global_assignment -name VHDL_FILE rtl/gbc_snd.vhd
+ set_global_assignment -name VHDL_FILE rtl/speedcontrol.vhd
++set_global_assignment -name SYSTEMVERILOG_FILE rtl/speedcontrol_shared.sv
++set_global_assignment -name SYSTEMVERILOG_FILE rtl/gb2p_machine.sv
+ set_global_assignment -name VHDL_FILE rtl/bus_savestates.vhd
+ set_global_assignment -name VHDL_FILE rtl/reg_savestates.vhd
+ set_global_assignment -name VHDL_FILE rtl/gb_statemanager.vhd
+diff --git a/rtl/gb2p_machine.sv b/rtl/gb2p_machine.sv
+new file mode 100644
+index 0000000..a1eeafd
+--- /dev/null
++++ b/rtl/gb2p_machine.sv
+@@ -0,0 +1,594 @@
++// The two Game Boys of the 2P core with their carts, the link cable between
++// them and their clock enables. Moved out of Gameboy.sv unchanged (netplay,
++// SPEC 11.1) so that the simulation runs the same code as the FPGA. New:
++// - shared_ce = 1: one speedcontrol_shared for both cores (both get the same
++//   enables; they stall together for either core's SDRAM read and for `hold`).
++//   0 = the upstream per-core speedcontrol (kept for the simulation's
++//   comparison only; Gameboy.sv ties it to 1).
++// - rtc_emu = 1: the carts' 32768 Hz RTC enable counts emulated cycles (every
++//   128th ce) instead of wall-clock time, so a freeze stops the RTC too.
++module gb2p_machine
++(
++	input         clk_sys,
++	input         reset,
++
++	input         shared_ce,
++	input         hold,          // freeze both cores (shared_ce only)
++	input         pausevideo1,
++	input         pausevideo2,
++	input         rtc_emu,
++
++	input         isGBC,
++	input         real_cgb_boot,
++	input         megaduck,
++	input   [2:0] mapper_sel,
++	input         extra_spr_en,
++	input         boot_gba_en,
++	input         fast_boot_en,
++	input         audio_no_pops,
++
++	input         cart_download,
++	input         rom_load_gb2,
++	input         cgb_boot_download,
++	input         dmg_boot_download,
++	input         sgb_boot_download,
++	input         ioctl_wr,
++	input  [24:0] ioctl_addr,
++	input  [15:0] ioctl_dout,
++	input  [63:0] img_size,
++
++	// ROM reads (the SDRAM controller and download mux stay in Gameboy.sv)
++	output [22:0] mbc1_addr,
++	output        sdram_oe,
++	input  [15:0] sdram_do,
++	input         sdram_ack,
++	output [22:0] mbc2_addr,
++	output        sdram_oe2,
++	input  [15:0] sdram_do2,
++	input         sdram_ack2,
++
++	input   [7:0] joy1,          // {Start, Select, B, A, Up, Down, Left, Right}
++	input   [7:0] joy2,
++	input  [15:0] joystick_analog_0,
++	input  [15:0] joystick_analog_1,
++
++	input         bk_wr1,
++	input         bk_wr2,
++	input  [16:0] bk_addr,
++	input  [15:0] bk_data,
++	output [15:0] bk_q1,
++	output [15:0] bk_q2,
++	output        cart1_has_save,
++	output        cart2_has_save,
++	output        cram1_wr,
++	output        cram2_wr,
++	output        isGBC_game1,
++	output        isGBC_game2,
++
++	input  [32:0] RTC_time,
++
++	output        ce1_cpu,
++	output        ce1_cpu_n,
++	output        ce1_cpu2x,
++	output        ce2_cpu,
++	output        ce2_cpu_n,
++	output        ce2_cpu2x,
++
++	output        lcd1_clkena,
++	output [14:0] lcd1_data,
++	output  [1:0] lcd1_mode,
++	output        lcd1_on,
++	output        lcd1_vsync,
++	output        lcd2_clkena,
++	output [14:0] lcd2_data,
++	output  [1:0] lcd2_mode,
++	output        lcd2_on,
++	output        lcd2_vsync,
++
++	output [15:0] AUDIO_L1,
++	output [15:0] AUDIO_R1,
++	output [15:0] AUDIO_L2,
++	output [15:0] AUDIO_R2,
++
++	output        rumbling1,
++	output        rumbling2,
++
++	// the link cable, for the simulation's and netplay's eyes only
++	output        ser1_clk_out,
++	output        ser1_data_out,
++	output        ser2_clk_out,
++	output        ser2_data_out
++);
++
++wire [14:0] cart1_addr;
++wire        cart1_a15;
++wire        cart1_rd;
++wire        cart1_wr;
++wire        cart1_oe;
++wire  [7:0] cart1_di;
++wire  [7:0] cart1_do;
++wire        gb1_nCS; // WRAM or Cart RAM CS
++
++wire [14:0] cart2_addr;
++wire        cart2_a15;
++wire        cart2_rd;
++wire        cart2_wr;
++wire        cart2_oe;
++wire  [7:0] cart2_di;
++wire  [7:0] cart2_do;
++wire        gb2_nCS;
++
++wire cram1_rd;
++wire cram2_rd;
++assign sdram_oe  = ~cart_download & cart1_rd & ~cram1_rd;
++assign sdram_oe2 = ~cart_download & cart2_rd & ~cram2_rd;
++wire [7:0] rom1_do = (mbc1_addr[0]) ? sdram_do[15:8]  : sdram_do[7:0];
++wire [7:0] rom2_do = (mbc2_addr[0]) ? sdram_do2[15:8] : sdram_do2[7:0];
++
++wire [31:0] RTC_timestampOut;
++wire [47:0] RTC_savedtimeOut;
++wire RTC_inuse;
++
++//////////////////////////////// CE ////////////////////////////////////
++
++wire ces_cpu, ces_cpu_n, ces_cpu2x;
++speedcontrol_shared speedcontrol_shared
++(
++	.clk_sys     (clk_sys),
++	.reset       (reset),
++	.romread1    (sdram_oe),
++	.romack1     (sdram_ack),
++	.romread2    (sdram_oe2),
++	.romack2     (sdram_ack2),
++	.pausevideo  (pausevideo1 | pausevideo2),
++	.hold        (hold),
++	.ce          (ces_cpu),
++	.ce_n        (ces_cpu_n),
++	.ce_2x       (ces_cpu2x)
++);
++
++wire cep1_cpu, cep1_cpu_n, cep1_cpu2x;
++wire cep2_cpu, cep2_cpu_n, cep2_cpu2x;
++
++speedcontrol speedcontrol1
++(
++	.clk_sys     (clk_sys),
++	.reset       (reset),
++	.romread     (sdram_oe),
++	.romack      (sdram_ack),
++	.pausevideo  (pausevideo1),
++	.ce          (cep1_cpu),
++	.ce_n        (cep1_cpu_n),
++	.ce_2x       (cep1_cpu2x)
++);
++
++speedcontrol speedcontrol2
++(
++	.clk_sys     (clk_sys),
++	.reset       (reset),
++	.romread     (sdram_oe2),
++	.romack      (sdram_ack2),
++	.pausevideo  (pausevideo2),
++	.ce          (cep2_cpu),
++	.ce_n        (cep2_cpu_n),
++	.ce_2x       (cep2_cpu2x)
++);
++
++assign ce1_cpu   = shared_ce ? ces_cpu   : cep1_cpu;
++assign ce1_cpu_n = shared_ce ? ces_cpu_n : cep1_cpu_n;
++assign ce1_cpu2x = shared_ce ? ces_cpu2x : cep1_cpu2x;
++assign ce2_cpu   = shared_ce ? ces_cpu   : cep2_cpu;
++assign ce2_cpu_n = shared_ce ? ces_cpu_n : cep2_cpu_n;
++assign ce2_cpu2x = shared_ce ? ces_cpu2x : cep2_cpu2x;
++
++// 32768 Hz for the carts' RTC: wall clock (upstream) or every 128th ce
++reg ce_32k;
++reg [9:0] ce_32k_div;
++reg [6:0] ce_32k_emu;
++always @(posedge clk_sys) begin
++	ce_32k_div <= ce_32k_div + 1'b1;
++	ce_32k <= 0;
++	if (rtc_emu) begin
++		if (reset) ce_32k_emu <= 0;
++		else if (ce1_cpu) begin
++			ce_32k_emu <= ce_32k_emu + 1'd1;
++			ce_32k <= !ce_32k_emu;
++		end
++	end else
++		ce_32k <= !ce_32k_div;
++end
++
++/////////////////////////////  Serial link  ///////////////////////////////
++
++wire sc1_int_clock_out;
++wire ser1_data_in;
++wire ser1_clk_in;
++
++wire sc2_int_clock_out;
++wire ser2_data_in;
++wire ser2_clk_in;
++
++assign ser1_data_in = ser2_data_out;
++assign ser1_clk_in  = ser2_clk_out;
++
++assign ser2_data_in = ser1_data_out;
++assign ser2_clk_in  = ser1_clk_out;
++
++wire speed1;
++wire SaveStateBus_rst1;
++
++
++
++cart_top cart1 (
++	.reset	     ( reset      ),
++
++	.clk_sys     ( clk_sys    ),
++	.ce_cpu      ( ce1_cpu    ),
++	.ce_cpu2x    ( ce1_cpu2x  ),
++	.speed       ( speed1     ),
++	.megaduck    ( megaduck   ),
++	.mapper_sel  ( mapper_sel ),
++
++	.cart_addr   ( cart1_addr  ),
++	.cart_a15    ( cart1_a15   ),
++	.cart_rd     ( cart1_rd    ),
++	.cart_wr     ( cart1_wr    ),
++	.cart_do     ( cart1_do    ),
++	.cart_di     ( cart1_di    ),
++	.cart_oe     ( cart1_oe    ),
++
++	.nCS         ( gb1_nCS        ),
++
++	.mbc_addr    ( mbc1_addr   ),
++
++	.dn_write    (             ),
++	.cart_ready  (             ),
++
++	.cram_rd     ( cram1_rd     ),
++	.cram_wr     ( cram1_wr     ),
++
++	.cart_download ( cart_download & ~rom_load_gb2),
++
++	.ram_mask_file (  ),
++	.ram_size      (  ),
++	.has_save      ( cart1_has_save ),
++
++	.isGBC_game    ( isGBC_game1   ),
++	.isSGB_game    (               ),
++
++	.ioctl_download ( 1'b0           ),
++	.ioctl_wr       ( ioctl_wr & ~rom_load_gb2),
++	.ioctl_addr     ( ioctl_addr     ),
++	.ioctl_dout     ( ioctl_dout     ),
++	.ioctl_wait     (                ),
++
++	.bk_wr          ( bk_wr1         ),
++	.bk_rtc_wr      ( 1'b0           ),
++	.bk_addr        ( bk_addr        ),
++	.bk_data        ( bk_data        ),
++	.bk_q           ( bk_q1          ),
++	.img_size       ( img_size       ),
++
++	.rom_di         ( rom1_do       ),
++
++	.joystick_analog_0 ( joystick_analog_0 ),
++
++	.ce_32k           ( ce_32k           ),
++	.RTC_time         ( RTC_time         ),
++	.RTC_timestampOut ( RTC_timestampOut ),
++	.RTC_savedtimeOut ( RTC_savedtimeOut ),
++	.RTC_inuse        ( RTC_inuse        ),
++
++	.SaveStateExt_Din ( 0  ),
++	.SaveStateExt_Adr ( 0  ),
++	.SaveStateExt_wren( 0 ),
++	.SaveStateExt_rst ( SaveStateBus_rst1  ),
++	.SaveStateExt_Dout(  ),
++	.savestate_load   ( 0   ),
++	.sleep_savestate  ( 0   ),
++
++	.Savestate_CRAMAddr     ( 0  ),
++	.Savestate_CRAMRWrEn    ( 0  ),
++	.Savestate_CRAMWriteData( 0  ),
++	.Savestate_CRAMReadData (    ),
++
++	.rumbling (rumbling1)
++);
++
++
++// the gameboy itself
++gb gb1 (
++	.reset	    ( reset      ),
++	
++	.clk_sys     ( clk_sys    ),
++	.ce          ( ce1_cpu    ),   // the whole gameboy runs on 4mhnz
++	.ce_n        ( ce1_cpu_n   ),  // 4MHz falling edge clock enable
++	.ce_2x       ( ce1_cpu2x  ),   // ~8MHz in dualspeed mode (GBC)
++	
++	.isGBC       ( isGBC      ),
++	.real_cgb_boot ( real_cgb_boot ),
++	.isSGB       ( 1'b0 ),
++	.megaduck    ( megaduck   ),
++	.extra_spr_en( extra_spr_en ),
++
++	.joy_p54     ( joy1_p54     ),
++	.joy_din     ( joy1_do      ),
++
++	// interface to the "external" game cartridge
++	.ext_bus_addr( cart1_addr  ),
++	.ext_bus_a15 ( cart1_a15   ),
++	.cart_rd     ( cart1_rd    ),
++	.cart_wr     ( cart1_wr    ),
++	.cart_do     ( cart1_do    ),
++	.cart_di     ( cart1_di    ),
++	.cart_oe     ( cart1_oe    ),
++
++	.nCS         ( gb1_nCS     ),
++
++	.boot_gba_en    ( boot_gba_en ),
++	.fast_boot_en   ( fast_boot_en ),
++
++	.cgb_boot_download ( cgb_boot_download ),
++	.dmg_boot_download ( dmg_boot_download ),
++	.sgb_boot_download ( sgb_boot_download ),
++	.ioctl_wr       ( ioctl_wr       ),
++	.ioctl_addr     ( ioctl_addr     ),
++	.ioctl_dout     ( ioctl_dout     ),
++
++	// audio
++	.audio_l 	 ( AUDIO_L1 ),
++	.audio_r 	 ( AUDIO_R1 ),
++	.audio_no_pops (audio_no_pops),
++	
++	// interface to the lcd
++	.lcd_clkena  ( lcd1_clkena ),
++	.lcd_data    ( lcd1_data   ),
++	.lcd_data_gb (            ),
++	.lcd_mode    ( lcd1_mode   ),
++	.lcd_on      ( lcd1_on     ),
++	.lcd_vsync   ( lcd1_vsync  ),
++	
++	.speed       ( speed1    ),
++	.DMA_on      (     ),
++	
++	// serial port
++	.sc_int_clock2  (sc1_int_clock_out),
++	.serial_clk_in  (ser1_clk_in),
++	.serial_data_in (ser1_data_in),
++	.serial_clk_out (ser1_clk_out),
++	.serial_data_out(ser1_data_out),
++	
++	// Palette download will disable cheats option (HPS doesn't distinguish downloads),
++	// so clear the cheats and disable second option (chheats enable/disable)
++	.gg_reset(1'b0),
++	.gg_en(1'b0),
++	.gg_code(0),
++	.gg_available(),
++	
++	// savestates
++	.increaseSSHeaderCount (1'b0),
++	.cart_ram_size   (8'd0),
++	.save_state      (1'b0),
++	.load_state      (1'b0),
++	.savestate_number(2'b00),
++	.sleep_savestate (),
++	
++	.SaveStateExt_Din (),
++	.SaveStateExt_Adr (),
++	.SaveStateExt_wren(),
++	.SaveStateExt_rst (SaveStateBus_rst1),
++	.SaveStateExt_Dout(0),
++	.SaveStateExt_load(),
++	
++	.Savestate_CRAMAddr     (),
++	.Savestate_CRAMRWrEn    (),
++	.Savestate_CRAMWriteData(),
++	.Savestate_CRAMReadData (0),
++	
++	.SAVE_out_Din(),            // data read from savestate
++	.SAVE_out_Dout(0),          // data written to savestate
++	.SAVE_out_Adr(),           // all addresses are DWORD addresses!
++	.SAVE_out_rnw(),            // read = 1, write = 0
++	.SAVE_out_ena(),            // one cycle high for each action
++	.SAVE_out_be(),            
++	.SAVE_out_done(1'b1),            // should be one cycle high when write is done or read value is valid
++	
++	.rewind_on(1'b0),
++	.rewind_active(1'b0)
++);
++
++wire [1:0] joy1_p54;
++wire [3:0] joy1_dir     = ~{ joy1[2], joy1[3], joy1[1], joy1[0] } | {4{joy1_p54[0]}};
++wire [3:0] joy1_buttons = ~{ joy1[7], joy1[6], joy1[5], joy1[4] } | {4{joy1_p54[1]}};
++wire [3:0] joy1_do      = joy1_dir & joy1_buttons;
++
++// core 2
++wire speed2;
++wire SaveStateBus_rst2;
++
++
++cart_top cart2 (
++	.reset	     ( reset      ),
++
++	.clk_sys     ( clk_sys    ),
++	.ce_cpu      ( ce2_cpu    ),
++	.ce_cpu2x    ( ce2_cpu2x  ),
++	.speed       ( speed2     ),
++	.megaduck    ( megaduck   ),
++	.mapper_sel  ( mapper_sel ),
++
++	.cart_addr   ( cart2_addr  ),
++	.cart_a15    ( cart2_a15   ),
++	.cart_rd     ( cart2_rd    ),
++	.cart_wr     ( cart2_wr    ),
++	.cart_do     ( cart2_do    ),
++	.cart_di     ( cart2_di    ),
++	.cart_oe     ( cart2_oe    ),
++
++	.nCS         ( gb2_nCS        ),
++
++	.mbc_addr    ( mbc2_addr   ),
++
++	.dn_write    (      ),
++	.cart_ready  (      ),
++
++	.cram_rd     ( cram2_rd     ),
++	.cram_wr     ( cram2_wr     ),
++
++	.cart_download ( cart_download ),
++
++	.ram_mask_file (  ),
++	.ram_size      (  ),
++	.has_save      ( cart2_has_save ),
++
++	.isGBC_game    ( isGBC_game2 ),
++	.isSGB_game    (             ),
++
++	.ioctl_download ( 1'b0           ),
++	.ioctl_wr       ( ioctl_wr       ),
++	.ioctl_addr     ( ioctl_addr     ),
++	.ioctl_dout     ( ioctl_dout     ),
++	.ioctl_wait     (  ),
++
++	.bk_wr          ( bk_wr2         ),
++	.bk_rtc_wr      ( 1'b0           ),
++	.bk_addr        ( bk_addr        ),
++	.bk_data        ( bk_data        ),
++	.bk_q           ( bk_q2          ),
++	.img_size       ( img_size       ),
++
++	.rom_di         ( rom2_do      ),
++
++	.joystick_analog_0 ( joystick_analog_1 ),
++
++	.ce_32k           ( ce_32k           ),
++	.RTC_time         ( RTC_time         ),
++	.RTC_timestampOut (  ),
++	.RTC_savedtimeOut (  ),
++	.RTC_inuse        (  ),
++
++	.SaveStateExt_Din ( 0  ),
++	.SaveStateExt_Adr ( 0  ),
++	.SaveStateExt_wren( 0 ),
++	.SaveStateExt_rst ( SaveStateBus_rst2  ),
++	.SaveStateExt_Dout(  ),
++	.savestate_load   ( 0   ),
++	.sleep_savestate  ( 0   ),
++
++	.Savestate_CRAMAddr     ( 0  ),
++	.Savestate_CRAMRWrEn    ( 0  ),
++	.Savestate_CRAMWriteData( 0  ),
++	.Savestate_CRAMReadData (    ),
++
++	.rumbling (rumbling2)
++);
++
++
++// the gameboy itself
++gb gb2 (
++	.reset	    ( reset      ),
++	
++	.clk_sys     ( clk_sys    ),
++	.ce          ( ce2_cpu    ),   // the whole gameboy runs on 4mhnz
++	.ce_n        ( ce2_cpu_n   ),  // 4MHz falling edge clock enable
++	.ce_2x       ( ce2_cpu2x  ),   // ~8MHz in dualspeed mode (GBC)
++	
++
++	.isGBC       ( isGBC      ),
++	.real_cgb_boot ( real_cgb_boot ),
++	.isSGB       ( 1'b0 ),
++	.megaduck    ( megaduck   ),
++	.extra_spr_en( extra_spr_en ),
++
++	.joy_p54     ( joy2_p54     ),
++	.joy_din     ( joy2_do      ),
++
++	// interface to the "external" game cartridge
++	.ext_bus_addr( cart2_addr  ),
++	.ext_bus_a15 ( cart2_a15   ),
++	.cart_rd     ( cart2_rd    ),
++	.cart_wr     ( cart2_wr    ),
++	.cart_do     ( cart2_do    ),
++	.cart_di     ( cart2_di    ),
++	.cart_oe     ( cart2_oe    ),
++
++	.nCS         ( gb2_nCS     ),
++
++	.boot_gba_en    ( boot_gba_en ),
++	.fast_boot_en   ( fast_boot_en ),
++
++	.cgb_boot_download ( cgb_boot_download ),
++	.dmg_boot_download ( dmg_boot_download ),
++	.sgb_boot_download ( sgb_boot_download ),
++	.ioctl_wr       ( ioctl_wr       ),
++	.ioctl_addr     ( ioctl_addr     ),
++	.ioctl_dout     ( ioctl_dout     ),
++
++	// audio
++	.audio_l 	 ( AUDIO_L2 ),
++	.audio_r 	 ( AUDIO_R2 ),
++	.audio_no_pops (audio_no_pops),
++	
++	// interface to the lcd
++	.lcd_clkena  ( lcd2_clkena ),
++	.lcd_data    ( lcd2_data   ),
++	.lcd_data_gb (            ),
++	.lcd_mode    ( lcd2_mode   ),
++	.lcd_on      ( lcd2_on     ),
++	.lcd_vsync   ( lcd2_vsync  ),
++	
++	.speed       ( speed2     ),
++	.DMA_on      (      ),
++	
++	// serial port
++	.sc_int_clock2  (sc2_int_clock_out),
++	.serial_clk_in  (ser2_clk_in),
++	.serial_data_in (ser2_data_in),
++	.serial_clk_out (ser2_clk_out),
++	.serial_data_out(ser2_data_out),
++	
++	// Palette download will disable cheats option (HPS doesn't distinguish downloads),
++	// so clear the cheats and disable second option (chheats enable/disable)
++	.gg_reset(1'b0),
++	.gg_en(1'b0),
++	.gg_code(0),
++	.gg_available(),
++	
++	// savestates
++	.increaseSSHeaderCount (1'b0),
++	.cart_ram_size   (8'd0),
++	.save_state      (1'b0),
++	.load_state      (1'b0),
++	.savestate_number(2'b00),
++	.sleep_savestate (),
++	
++	.SaveStateExt_Din (),
++	.SaveStateExt_Adr (),
++	.SaveStateExt_wren(),
++	.SaveStateExt_rst (SaveStateBus_rst2),
++	.SaveStateExt_Dout(0),
++	.SaveStateExt_load(),
++	
++	.Savestate_CRAMAddr     (),
++	.Savestate_CRAMRWrEn    (),
++	.Savestate_CRAMWriteData(),
++	.Savestate_CRAMReadData (0),
++	
++	.SAVE_out_Din(),            // data read from savestate
++	.SAVE_out_Dout(0),          // data written to savestate
++	.SAVE_out_Adr(),           // all addresses are DWORD addresses!
++	.SAVE_out_rnw(),            // read = 1, write = 0
++	.SAVE_out_ena(),            // one cycle high for each action
++	.SAVE_out_be(),            
++	.SAVE_out_done(1'b1),            // should be one cycle high when write is done or read value is valid
++	
++	.rewind_on(1'b0),
++	.rewind_active(1'b0)
++);
++
++wire [1:0] joy2_p54;
++wire [3:0] joy2_dir     = ~{ joy2[2], joy2[3], joy2[1], joy2[0] } | {4{joy2_p54[0]}};
++wire [3:0] joy2_buttons = ~{ joy2[7], joy2[6], joy2[5], joy2[4] } | {4{joy2_p54[1]}};
++wire [3:0] joy2_do      = joy2_dir & joy2_buttons;
++
++endmodule
+diff --git a/rtl/speedcontrol_shared.sv b/rtl/speedcontrol_shared.sv
+new file mode 100644
+index 0000000..1d46106
+--- /dev/null
++++ b/rtl/speedcontrol_shared.sv
+@@ -0,0 +1,80 @@
++// One clock-enable generator for both Game Boys (netplay, SPEC 11.1).
++//
++// Same enables and the same stall rule as speedcontrol.vhd, but one divider
++// for both cores: the enables are skipped while a ROM read of either core
++// waits for the SDRAM, while `hold` is 1 (the netplay freeze), and while either
++// pausevideo is 1. Both cores therefore see the same ce, ce_n and ce_2x on
++// every clk_sys, and SDRAM latency only changes wall-clock time, never the
++// order of events between the two cores. The divider restarts when reset
++// falls (the first clock after reset is a `ce`), so the phase after reset
++// does not depend on when reset was released. During reset it runs as
++// upstream (the ROM download's write handshake uses ce_2x).
++module speedcontrol_shared
++(
++	input      clk_sys,
++	input      reset,
++	input      romread1,
++	input      romack1,
++	input      romread2,
++	input      romack2,
++	input      pausevideo,
++	input      hold,
++	output reg ce    = 0,
++	output reg ce_n  = 0,
++	output reg ce_2x = 0
++);
++
++reg [2:0] clkdiv = 0;
++reg       wait1  = 0;
++reg       wait2  = 0;
++reg       reset_r = 1;
++
++always @(negedge clk_sys) begin
++	reg skip;
++
++	// a freeze right after reset keeps the restart pending
++	reset_r <= reset | (reset_r & (pausevideo | hold));
++
++	ce    <= 0;
++	ce_n  <= 0;
++	ce_2x <= 0;
++	skip   = 0;
++
++	clkdiv <= clkdiv + 3'd1;
++	if (clkdiv == 3'b000)     ce    <= 1;
++	if (clkdiv == 3'b100)     ce_n  <= 1;
++	if (clkdiv[1:0] == 2'b00) ce_2x <= 1;
++
++	if (reset) begin
++		wait1  <= 0;
++		wait2  <= 0;
++	end else if (reset_r) begin
++		// first clock after reset: phase 0, as clkdiv == 000
++		ce     <= 1;
++		ce_n   <= 0;
++		ce_2x  <= 1;
++		clkdiv <= 3'b001;
++	end else begin
++		if (!wait1) begin
++			if (romread1) wait1 <= 1;
++		end else if (romack1) wait1 <= 0;
++		else skip = 1;
++
++		if (!wait2) begin
++			if (romread2) wait2 <= 1;
++		end else if (romack2) wait2 <= 0;
++		else skip = 1;
++	end
++
++	if (pausevideo | hold) skip = 1;
++
++	if (skip) begin
++		ce    <= 0;
++		ce_n  <= 0;
++		ce_2x <= 0;
++		if (!reset && !reset_r && clkdiv == 3'b100) clkdiv <= 3'b001;
++		if (!reset && !reset_r && clkdiv == 3'b000) clkdiv <= 3'b101;
++	end
++end
++
++endmodule
+-- 
+2.43.0
+

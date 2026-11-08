@@ -1,0 +1,1423 @@
+From 52009f1565d35ac95f61bef8775da39d21c3cf28 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 7 Nov 2026 16:43:07 +0100
+Subject: [PATCH] netplay: Game Boy 2P (protocol v3: second ROM, boot ROMs and
+ RTC time in HELLO, CTRL[2] for the join)
+---
+ support/netplay/netplay.cpp           | 256 ++++++++++++++++++++++----
+ support/netplay/netplay.h             |   4 +-
+ support/netplay/netplay_proto.cpp     |  32 +++-
+ support/netplay/netplay_proto.h       |  52 ++++--
+ support/netplay/netplay_session.cpp   |  31 +++-
+ support/netplay/netplay_session.h     |  17 +-
+ support/netplay/test/Makefile         |   3 +
+ support/netplay/test/fake_fpga.h      |   3 +-
+ support/netplay/test/run_udp_test.sh  |   9 +-
+ support/netplay/test/test_netplay.cpp | 179 +++++++++++++++++-
+ support/netplay/test/udp_harness.cpp  | 102 ++++++++--
+ user_io.cpp                           |   2 +-
+ 12 files changed, 607 insertions(+), 83 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index d2b9d3f..32fa277 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -1,4 +1,4 @@
+-// netplay.cpp — NES and SNES lockstep netplay, Main_MiSTer integration (SPEC.md 7, 10)
++// netplay.cpp — NES, SNES and Game Boy 2P lockstep netplay, Main_MiSTer integration (SPEC.md 7, 10, 11)
+ //
+ // Threading: everything that touches SPI or the OSD (status bits, ROM reload,
+ // Info boxes) runs on the main thread in netplay_poll()/netplay_note_file().
+@@ -36,6 +36,7 @@
+ #include "../../shmem.h"
+ #include "../../file_io.h"
+ #include "../../menu.h"
++#include "../../spi.h"
+ #include "md5.h"
+ #include "../snes/snes.h"
+ 
+@@ -244,6 +245,8 @@ struct ServerReg
+ 	char room[17];           // host: its random id; join: the room's id or "*"
+ 	char core[16];
+ 	uint8_t md5[16];
++	bool two;                // Game Boy 2P with two games: md5b follows md5 (64 hex digits)
++	uint8_t md5b[16];
+ 	char game[81];
+ };
+ 
+@@ -320,6 +323,7 @@ public:
+ 		snprintf(game_, sizeof(game_), "%s", r.game);
+ 		md5_.clear();
+ 		for (int i = 0; i < 16; i++) { char x[3]; snprintf(x, sizeof(x), "%02x", r.md5[i]); md5_ += x; }
++		if (r.two) for (int i = 0; i < 16; i++) { char x[3]; snprintf(x, sizeof(x), "%02x", r.md5b[i]); md5_ += x; }
+ 		build_reg();
+ 		register_now(0);
+ 		return true;
+@@ -558,9 +562,10 @@ private:
+ 
+ // ---------------------------------------------------------------------------
+ // Recordings (.npr): "NPR2", rom md5[16], u8 delay, u32 frames, joy[frames], u32 crcs, crc[crcs]   (NES)
+-//                   "NPR3", rom md5[16], u8 delay, u8 system, u32 frames, u16 joy[frames], u32 crcs, crc[crcs]
++//                   "NPR3", rom md5[16], u8 delay, u8 system, [rom2 md5[16], u32 rtc_time], u32 frames, u16 joy[frames], u32 crcs, crc[crcs]
++//                   (SNES; Game Boy 2P with the bracketed fields)
+ 
+-static bool save_recording(const char *path, const Recording &r, const uint8_t *md5)
++static bool save_recording(const char *path, const Recording &r, const uint8_t *md5, const uint8_t *md5b)
+ {
+ 	// the folder may not exist yet (first recording)
+ 	std::string dir = path;
+@@ -570,19 +575,21 @@ static bool save_recording(const char *path, const Recording &r, const uint8_t *
+ 	FILE *f = fopen(path, "wb");
+ 	if (!f) return false;
+ 	uint32_t n = (uint32_t)r.joy.size(), m = (uint32_t)r.crc.size();
+-	bool wide = r.system == SYS_SNES;
++	bool wide = r.system != SYS_NES;
+ 	uint8_t sys = r.system;
+ 	std::vector<uint8_t> narrow;
+ 	if (!wide) for (uint16_t j : r.joy) narrow.push_back((uint8_t)j);
+ 	bool ok = fwrite(wide ? "NPR3" : "NPR2", 4, 1, f) == 1 && fwrite(md5, 16, 1, f) == 1
+-	       && fwrite(&r.delay, 1, 1, f) == 1 && (!wide || fwrite(&sys, 1, 1, f) == 1) && fwrite(&n, 4, 1, f) == 1
++	       && fwrite(&r.delay, 1, 1, f) == 1 && (!wide || fwrite(&sys, 1, 1, f) == 1)
++	       && (r.system != SYS_GB2P || (fwrite(md5b, 16, 1, f) == 1 && fwrite(&r.rtc_time, 4, 1, f) == 1))
++	       && fwrite(&n, 4, 1, f) == 1
+ 	       && (!n || (wide ? fwrite(r.joy.data(), 2 * n, 1, f) : fwrite(narrow.data(), n, 1, f)) == 1)
+ 	       && fwrite(&m, 4, 1, f) == 1 && (!m || fwrite(r.crc.data(), 4 * m, 1, f) == 1);
+ 	fclose(f);
+ 	return ok;
+ }
+ 
+-static bool load_recording(const char *path, Recording *r, uint8_t *md5)
++static bool load_recording(const char *path, Recording *r, uint8_t *md5, uint8_t *md5b)
+ {
+ 	FILE *f = fopen(path, "rb");
+ 	if (!f) return false;
+@@ -593,8 +600,10 @@ static bool load_recording(const char *path, Recording *r, uint8_t *md5)
+ 	bool wide = ok && magic[3] == '3';
+ 	ok = ok && fread(md5, 16, 1, f) == 1
+ 	       && fread(&r->delay, 1, 1, f) == 1 && r->delay >= 2 && r->delay <= 15
+-	       && (!wide || (fread(&sys, 1, 1, f) == 1 && sys == SYS_SNES))
++	       && (!wide || (fread(&sys, 1, 1, f) == 1 && (sys == SYS_SNES || sys == SYS_GB2P)))
++	       && (sys != SYS_GB2P || (fread(md5b, 16, 1, f) == 1 && fread(&r->rtc_time, 4, 1, f) == 1))
+ 	       && fread(&n, 4, 1, f) == 1 && n < 10000000;
++	if (sys != SYS_GB2P) memcpy(md5b, md5, 16);
+ 	r->system = (System)sys;
+ 	if (ok && wide) { r->joy.resize(n); ok = !n || fread(r->joy.data(), 2 * n, 1, f) == 1; }
+ 	else if (ok)
+@@ -617,6 +626,7 @@ static bool load_recording(const char *path, Recording *r, uint8_t *md5)
+ static std::atomic<bool>  dl_quit { false };
+ static std::string        games_root;         // the core's games folder (full path)
+ static std::string        core_name;          // set at core load (main thread)
++static std::string        srv_core;           // the core in the server's protocol: NES, SNES, GB2P
+ static std::string        index_path;         // netplay/index-<core>.txt (full path)
+ 
+ static Config            cfg;
+@@ -630,13 +640,27 @@ static std::atomic<bool> quit { false };
+ static bool is_game_ext(const char *ext)
+ {
+ 	if (core_sys == SYS_SNES) return !strcasecmp(ext, ".sfc") || !strcasecmp(ext, ".smc");
++	if (core_sys == SYS_GB2P) return !strcasecmp(ext, ".gb") || !strcasecmp(ext, ".gbc");
+ 	return !strcasecmp(ext, ".nes");
+ }
+ 
++// Largest game file: own copies (index) and server games
++static unsigned long max_game_size(bool download)
++{
++	switch (core_sys)
++	{
++	case SYS_SNES: return download ? (8u << 20) : (16u << 20);
++	case SYS_GB2P: return 8u << 20;
++	default:       return 4u << 20;
++	}
++}
++
+ static std::mutex        info_mtx;          // guards the fields below
+ static LocalInfo         rom_info;
+ static std::string       rom_path;
+ static unsigned char     rom_index = 0;
++static std::string       rom2_path;          // Game Boy 2P: gb2's game (= rom_path for one game)
++static unsigned char     rom2_index = 0;
+ static char              rom_opensave = 0;
+ static uint32_t          rom_seq = 0;        // bumps on every user ROM load
+ static Mode              rom_mode = M_OFF;   // session mode for that ROM (OSD, else netplay.ini)
+@@ -645,6 +669,7 @@ static std::string       rom_rec;            // full path of this ROM's recordin
+ 
+ static std::atomic<bool> reload_req { false };
+ static std::atomic<bool> reload_done { false };
++static std::atomic<uint32_t> reload_rtc { 0 };  // Game Boy 2P: the cart RTC's time for the reload
+ static bool              own_reload = false; // main thread only
+ 
+ static std::mutex        msg_mtx;
+@@ -700,7 +725,7 @@ static void *netplay_thread(void *)
+ 	Session  *s = nullptr;
+ 	Udp      *udp = nullptr;
+ 	Recording rec;
+-	uint8_t   md5[16] = {};
++	uint8_t   md5[16] = {}, md5b[16] = {};
+ 	char      rec_path[512] = "";   // this session's recording file
+ 	Mode      mode = M_OFF;         // this session's mode
+ 	uint32_t  seen_rom = 0, seen_msg = 0;
+@@ -723,7 +748,7 @@ static void *netplay_thread(void *)
+ 			{
+ 				s->stop(now, "Netplay: new ROM");
+ 				if (mode == M_RECORD && !saved && !rec.joy.empty())
+-					post_message(save_recording(rec_path, rec, md5) ? "Netplay: recording saved" : "Netplay: cannot save recording");
++					post_message(save_recording(rec_path, rec, md5, md5b) ? "Netplay: recording saved" : "Netplay: cannot save recording");
+ 				delete s;
+ 				s = nullptr;
+ 			}
+@@ -737,16 +762,18 @@ static void *netplay_thread(void *)
+ 			reload_done = false;
+ 
+ 			LocalInfo li;
+-			std::string room, path;
++			std::string room, path, path2;
+ 			{
+ 				std::lock_guard<std::mutex> g(info_mtx);
+ 				li = rom_info;
+ 				mode = rom_mode;
+ 				room = rom_room;
+ 				path = rom_path;
++				path2 = rom2_path;
+ 				snprintf(rec_path, sizeof(rec_path), "%s", rom_rec.c_str());
+ 			}
+ 			memcpy(md5, li.rom_md5, 16);
++			memcpy(md5b, li.rom2_md5, 16);
+ 
+ 			bool ok = mode != M_OFF;      // OSD "Off": no session for this ROM
+ 			if (mode == M_JOIN && !cfg.peer[0] && !cfg.server[0])
+@@ -760,9 +787,20 @@ static void *netplay_thread(void *)
+ 				r.host = mode == M_HOST;
+ 				if (r.host) random_id(r.room, sizeof(r.room));
+ 				else snprintf(r.room, sizeof(r.room), "%s", room.empty() ? "*" : room.c_str());
+-				snprintf(r.core, sizeof(r.core), "%s", core_name.c_str());
++				snprintf(r.core, sizeof(r.core), "%s", srv_core.c_str());
+ 				memcpy(r.md5, li.rom_md5, 16);
++				// two games (Game Boy 2P): md5 = rom_md5 + rom2_md5
++				r.two = core_sys == SYS_GB2P && memcmp(li.rom_md5, li.rom2_md5, 16);
++				memcpy(r.md5b, li.rom2_md5, 16);
+ 				game_name(path, r.game, sizeof(r.game));
++				if (r.two)
++				{
++					// "<game 1> + <game 2>" (SPEC.md 11.5)
++					char g2[81];
++					game_name(path2, g2, sizeof(g2));
++					std::string both = std::string(r.game) + " + " + g2;
++					snprintf(r.game, sizeof(r.game), "%.80s", both.c_str());
++				}
+ 				lobby_host(r.host ? r.room : "");
+ 				udp = new Udp();
+ 				if (!udp->open_server(cfg, r))
+@@ -782,9 +820,13 @@ static void *netplay_thread(void *)
+ 			}
+ 			else if (mode == M_REPLAY)
+ 			{
+-				uint8_t rmd5[16];
+-				if (!load_recording(rec_path, &rec, rmd5)) { post_message("Netplay: cannot read recording"); ok = false; }
+-				else if (memcmp(rmd5, li.rom_md5, 16)) { post_message("Netplay: recording is for another ROM"); ok = false; }
++				uint8_t rmd5[16], rmd5b[16];
++				if (!load_recording(rec_path, &rec, rmd5, rmd5b) || rec.system != core_sys) { post_message("Netplay: cannot read recording"); ok = false; }
++				else if (memcmp(rmd5, li.rom_md5, 16) || (core_sys == SYS_GB2P && memcmp(rmd5b, li.rom2_md5, 16)))
++				{
++					post_message("Netplay: recording is for another ROM");
++					ok = false;
++				}
+ 			}
+ 
+ 			if (ok)
+@@ -799,7 +841,11 @@ static void *netplay_thread(void *)
+ 		if (s)
+ 		{
+ 			s->step(now);
+-			if (s->reload_requested() && !reload_req && !reload_done) reload_req = true;
++			if (s->reload_requested() && !reload_req && !reload_done)
++			{
++				reload_rtc = s->rtc_time();       // before the request: the main thread reads it then
++				reload_req = true;
++			}
+ 			if (reload_done.exchange(false)) s->reload_done(now);
+ 			if (udp)
+ 				if (const char *n = udp->take_notice()) post_message(n);
+@@ -828,7 +874,7 @@ static void *netplay_thread(void *)
+ 			{
+ 				saved = true;
+ 				if (!rec.joy.empty())
+-					post_message(save_recording(rec_path, rec, md5) ? "Netplay: recording saved" : "Netplay: cannot save recording");
++					post_message(save_recording(rec_path, rec, md5, md5b) ? "Netplay: recording saved" : "Netplay: cannot save recording");
+ 			}
+ 		}
+ 
+@@ -838,7 +884,7 @@ static void *netplay_thread(void *)
+ 	if (s)
+ 	{
+ 		s->stop(now_ms(), "Netplay: stopped");
+-		if (mode == M_RECORD && !saved && !rec.joy.empty()) save_recording(rec_path, rec, md5);
++		if (mode == M_RECORD && !saved && !rec.joy.empty()) save_recording(rec_path, rec, md5, md5b);
+ 		delete s;
+ 	}
+ 	delete udp;
+@@ -1047,7 +1093,7 @@ static void index_dir(const std::string &dir, int depth, std::map<std::string, I
+ 		if (S_ISDIR(st.st_mode)) { index_dir(p, depth + 1, cache, now); continue; }
+ 		size_t dot = n.rfind('.');
+ 		if (!S_ISREG(st.st_mode) || dot == std::string::npos || !is_game_ext(n.c_str() + dot)) continue;
+-		if (st.st_size < 16 || st.st_size > (core_sys == SYS_SNES ? (16 << 20) : (4 << 20))) continue;
++		if (st.st_size < 16 || (unsigned long)st.st_size > max_game_size(false)) continue;
+ 		auto c = cache.find(p);
+ 		if (c != cache.end() && c->second.size == (long long)st.st_size && c->second.mtime == (long long)st.st_mtime)
+ 		{
+@@ -1132,8 +1178,8 @@ static void download_games(const std::string &key)
+ 	int got = 0, offered = 0;
+ 	std::string list;
+ 	// the server's games for this core: roms/<core>/ (NES also roms/ itself)
+-	std::string core_q = "&core=" + url_enc(core_name.c_str());
+-	unsigned long max_size = core_sys == SYS_SNES ? (8u << 20) : (4u << 20);
++	std::string core_q = "&core=" + url_enc(srv_core.c_str());
++	unsigned long max_size = max_game_size(true);
+ 	if (srv_mounted && http_get("/roms?" + key + core_q, &list, 1 << 20))
+ 	{
+ 		size_t total = 0;                                  // keep room in the 48 MB for room copies
+@@ -1230,7 +1276,7 @@ static void update_rooms(const std::string &list)
+ 			if (c == '\t') { if (++k >= 8) break; }
+ 			else if (f[k].size() < 100) f[k] += c;
+ 		}
+-		if (k != 6 || !is_hex(f[0], 8) || f[1] != "waiting" || strcasecmp(f[2].c_str(), core_name.c_str()) || !is_hex(f[3], 32)) continue;
++		if (k != 6 || !is_hex(f[0], 8) || f[1] != "waiting" || strcasecmp(f[2].c_str(), srv_core.c_str()) || !is_hex(f[3], 32)) continue;
+ 		if (f[0] == mine) continue;
+ 		count++;
+ 
+@@ -1263,7 +1309,7 @@ static void update_rooms(const std::string &list)
+ 		}
+ 		size_t sdot = src.rfind('.');
+ 		std::string ext = (sdot != std::string::npos && is_game_ext(src.c_str() + sdot)) ? src.substr(sdot)
+-		                : (core_sys == SYS_SNES ? ".sfc" : ".nes");
++		                : (core_sys == SYS_SNES ? ".sfc" : core_sys == SYS_GB2P ? ".gb" : ".nes");
+ 		want[entry] = Want { RoomFile { f[0], f[3] }, src, game + ext };
+ 	}
+ 
+@@ -1322,7 +1368,7 @@ static void *lobby_thread(void *)
+ 		{
+ 			last = now;
+ 			std::string list;
+-			if (http_get("/rooms?" + key + "&core=" + url_enc(core_name.c_str()), &list, 1 << 18) && !dl_quit)
++			if (http_get("/rooms?" + key + "&core=" + url_enc(srv_core.c_str()), &list, 1 << 18) && !dl_quit)
+ 				update_rooms(list);
+ 		}
+ 		usleep(100000);
+@@ -1412,12 +1458,13 @@ static bool room_of(const std::string &full, uint32_t seq, RoomFile *out)
+ 	return true;
+ }
+ 
+-// The loaded core: SYS_NES, SYS_SNES, or -1 for one without netplay
++// The loaded core: SYS_NES, SYS_SNES, SYS_GB2P, or -1 for one without netplay
+ static int netplay_system()
+ {
+ 	const char *n = user_io_get_core_name();
+ 	if (!strcasecmp(n, "NES")) return SYS_NES;
+ 	if (!strcasecmp(n, "SNES")) return SYS_SNES;
++	if (!strcasecmp(n, "GAMEBOY2P")) return SYS_GB2P;
+ 	return -1;
+ }
+ 
+@@ -1478,16 +1525,105 @@ static bool md5_file(const char *path, uint8_t out[16], uint8_t *hdr, size_t hdr
+ 
+ static void start_thread();
+ 
++// Game Boy 2P (SPEC.md 11.4), main thread only: the pair of games the core
++// holds, and the boot ROMs loaded since the core was (OSD index 4, 5, 6, or
++// boot*.rom at core load, index 0 with any extension bits).
++static std::string               gb_rom1, gb_rom2;
++static unsigned char             gb_idx1 = 0, gb_idx2 = 0;
++static std::map<unsigned char, std::string> gb_boot;   // index byte -> md5 (16 bytes)
++
++// md5 over {index, md5[16]} of each boot ROM in index order; zeros for none
++static void gb_boot_md5(uint8_t out[16])
++{
++	memset(out, 0, 16);
++	if (gb_boot.empty()) return;
++	MD5Context ctx;
++	MD5Init(&ctx);
++	for (const auto &b : gb_boot)
++	{
++		uint8_t i = b.first;
++		MD5Update(&ctx, &i, 1);
++		MD5Update(&ctx, (const unsigned char *)b.second.data(), 16);
++	}
++	MD5Final(out, &ctx);
++}
++
++// The cart RTC's time as the core gets it at core load: local time, computed
++// as user_io's send_rtc(2) does for this core
++static uint32_t local_unix_time()
++{
++	time_t t = time(nullptr);
++	struct tm g;
++	gmtime_r(&t, &g);
++	return (uint32_t)(t + (t - mktime(&g)));
++}
++
++static void send_timestamp(uint32_t t)
++{
++	spi_uio_cmd_cont(UIO_TIMESTAMP);
++	spi_w((uint16_t)t);
++	spi_w((uint16_t)(t >> 16));
++	DisableIO();
++}
++
++static bool has_ext(const std::string &name, const char *ext)
++{
++	size_t d = name.rfind('.');
++	return d != std::string::npos && !strcasecmp(name.c_str() + d, ext);
++}
++
++static void begin_session(const char *name, unsigned char index, char opensave);
++
+ void netplay_note_file(const char *name, unsigned char index, char opensave)
+ {
+-	if (!core_armed || own_reload || netplay_system() != core_sys) return;
++	if (own_reload) return;
++	// Game Boy 2P boot ROMs: also the ones Main loads from <core>.f4-f6 before
++	// netplay_start() (parse_config), so tracked before core_armed is set.
++	if (netplay_system() == SYS_GB2P)
++	{
++		unsigned char slot = index & 0x3F;
++		if (slot == 0 || (slot >= 4 && slot <= 6))
++		{
++			uint8_t d[16];
++			if (md5_file(name, d, nullptr, 0)) gb_boot[index] = std::string((const char *)d, 16);
++			else gb_boot.erase(index);
++			// a session already set up compared the old ones: start it again
++			if (core_armed && thread_running && !gb_rom1.empty())
++			{
++				char os;
++				{
++					std::lock_guard<std::mutex> g(info_mtx);
++					os = rom_opensave;
++				}
++				begin_session(gb_rom2.c_str(), gb_idx2, os);
++			}
++			return;
++		}
++	}
++	if (!core_armed || netplay_system() != core_sys) return;
+ 	// Only the game slot (OSD index 1) starts a session. NES: index 0 is
+ 	// boot0.rom, 2 the FDS BIOS, 3 a custom palette. SNES: 4 is an SPC file.
++	// Game Boy 2P: 3 is a palette.
+ 	if ((index & 0x3F) != 1) return;
+ 
+-	// OSD "Netplay" (NES [89:88], SNES [59:58]): 0 netplay.ini, 1 Off, 2 Host, 3 Join
++	// Game Boy 2P: with "Rom for second GB" ([6]) Off the game goes into both
++	// Game Boys, with it On only into gb2.
++	if (core_sys == SYS_GB2P)
++	{
++		if (!user_io_status_get("[6]")) { gb_rom1 = name; gb_idx1 = index; }
++		gb_rom2 = name;
++		gb_idx2 = index;
++	}
++	begin_session(name, index, opensave);
++}
++
++// A game load (or, Game Boy 2P, a boot ROM load): a new session with the current game(s)
++static void begin_session(const char *name, unsigned char index, char opensave)
++{
++
++	// OSD "Netplay" (NES [89:88], SNES [59:58], Game Boy 2P [47:46]): 0 netplay.ini, 1 Off, 2 Host, 3 Join
+ 	static const Mode osd_modes[4] = { M_OFF, M_OFF, M_HOST, M_JOIN };
+-	uint32_t osd = user_io_status_get(core_sys == SYS_SNES ? "[59:58]" : "[89:88]");
++	uint32_t osd = user_io_status_get(core_sys == SYS_SNES ? "[59:58]" : core_sys == SYS_GB2P ? "[47:46]" : "[89:88]");
+ 	Mode mode = osd ? osd_modes[osd & 3] : cfg.mode;
+ 	std::string room;
+ 	if (cfg.server[0])
+@@ -1508,20 +1644,34 @@ void netplay_note_file(const char *name, unsigned char index, char opensave)
+ 		}
+ 		else if (mode == M_JOIN) room = "*";      // the oldest waiting room with this game
+ 	}
++	if (core_sys == SYS_GB2P && gb_rom1.empty() && mode != M_OFF)
++	{
++		post_message("Netplay: load game 1 with Rom for second GB Off");
++		mode = M_OFF;
++	}
+ 	if (mode == M_OFF && !thread_running) return;   // nothing to stop, nothing to start
+ 
+ 	LocalInfo li {};
+ 	li.system = core_sys;
+ 	uint8_t hdr[16] = {};
+-	if (!md5_file(name, li.rom_md5, hdr, sizeof(hdr))) return;
++	if (core_sys == SYS_GB2P && !gb_rom1.empty())
++	{
++		if (!md5_file(gb_rom1.c_str(), li.rom_md5, nullptr, 0)) return;
++		if (gb_rom2 == gb_rom1) memcpy(li.rom2_md5, li.rom_md5, 16);
++		else if (!md5_file(gb_rom2.c_str(), li.rom2_md5, nullptr, 0)) return;
++	}
++	else if (!md5_file(name, li.rom_md5, hdr, sizeof(hdr))) return;
++	if (core_sys != SYS_GB2P) memcpy(li.rom2_md5, li.rom_md5, 16);
+ 	if (cfg.server[0])
+ 	{
+ 		std::lock_guard<std::mutex> g(cat_mtx);
+-		if (!catalog.empty() && !catalog.count(md5_hex(li.rom_md5)))
++		if (!catalog.empty() && (!catalog.count(md5_hex(li.rom_md5)) || !catalog.count(md5_hex(li.rom2_md5))))
+ 			post_message("Netplay: not the server's version of this game");
+ 	}
+ 	const char *dot = strrchr(name, '.');
+-	li.rom_region = core_sys == SYS_SNES ? snes_refused(name) : rom_region_from_header(hdr, sizeof(hdr), dot ? dot + 1 : "");
++	if (core_sys == SYS_SNES) li.rom_region = snes_refused(name);
++	else if (core_sys == SYS_GB2P) li.rom_region = has_ext(gb_rom1, ".bin") || has_ext(gb_rom2, ".bin");   // MegaDuck
++	else li.rom_region = rom_region_from_header(hdr, sizeof(hdr), dot ? dot + 1 : "");
+ 	core_build(li.core_build);
+ 
+ 	// .sav next to the other saves, same base name
+@@ -1532,6 +1682,18 @@ void netplay_note_file(const char *name, unsigned char index, char opensave)
+ 	sav += ".sav";
+ 	if (!md5_file(sav.c_str(), li.sav_md5, nullptr, 0)) memset(li.sav_md5, 0, 16);
+ 
++	if (core_sys == SYS_GB2P)
++	{
++		li.gb.system     = (uint8_t)user_io_status_get("[15:14]");
++		li.gb.mapper     = (uint8_t)user_io_status_get("[41:39]");
++		li.gb.extra_spr  = (uint8_t)user_io_status_get("[44]");
++		li.gb.gba_mode   = (uint8_t)user_io_status_get("[37]");
++		li.gb.fast_boot  = (uint8_t)user_io_status_get("[42]");
++		li.gb.audio_mode = (uint8_t)user_io_status_get("[43]");
++		li.gb.dupe_save  = (uint8_t)user_io_status_get("[11]");
++		gb_boot_md5(li.boot_md5);
++		li.rtc_time = local_unix_time();
++	}
+ 	if (core_sys == SYS_SNES)
+ 	{
+ 		li.snes.region      = (uint8_t)user_io_status_get("[15:14]");
+@@ -1555,8 +1717,10 @@ void netplay_note_file(const char *name, unsigned char index, char opensave)
+ 	{
+ 		std::lock_guard<std::mutex> g(info_mtx);
+ 		rom_info = li;
+-		rom_path = name;
+-		rom_index = index;
++		rom_path = core_sys == SYS_GB2P ? gb_rom1 : name;
++		rom_index = core_sys == SYS_GB2P ? gb_idx1 : index;
++		rom2_path = core_sys == SYS_GB2P ? gb_rom2 : name;
++		rom2_index = core_sys == SYS_GB2P ? gb_idx2 : index;
+ 		rom_opensave = opensave;
+ 		rom_mode = mode;
+ 		rom_room = room;
+@@ -1587,6 +1751,8 @@ void netplay_start(void)
+ 	cfg = Config();
+ 	load_config(&cfg);
+ 	core_name = user_io_get_core_name();
++	srv_core = core_sys == SYS_GB2P ? "GB2P" : core_name;
++	gb_rom1.clear(); gb_rom2.clear();   // gb_boot already holds the boot ROMs of this core load
+ 	core_armed = true;
+ 	if (cfg.server[0]) server_games_start();
+ }
+@@ -1594,6 +1760,7 @@ void netplay_start(void)
+ void netplay_stop(void)
+ {
+ 	core_armed = false;
++	gb_boot.clear();                    // the next core starts without them
+ 	server_games_stop();
+ 	if (!thread_running) return;
+ 	quit = true;
+@@ -1607,18 +1774,37 @@ void netplay_poll(void)
+ 
+ 	if (reload_req)
+ 	{
+-		std::string path;
+-		unsigned char index;
++		std::string path, path2;
++		unsigned char index, index2;
+ 		char opensave;
+ 		{
+ 			std::lock_guard<std::mutex> g(info_mtx);
+ 			path = rom_path;
+ 			index = rom_index;
++			path2 = rom2_path;
++			index2 = rom2_index;
+ 			opensave = rom_opensave;
+ 		}
+ 		own_reload = true;                 // keep netplay_note_file from starting a new session
++		if (core_sys == SYS_GB2P)
++		{
++			// SPEC.md 11.2, 11.4: the host's clock for the cart RTC before the
++			// .sav loads; game 1 into both Game Boys, then game 2 into gb2, the
++			// .sav of the last one mounted; "Rom for second GB" as it was.
++			send_timestamp(reload_rtc);
++			uint32_t second = user_io_status_get("[6]");
++			bool two = path2 != path;
++			user_io_status_set("[6]", 0);
++			user_io_file_tx(path.c_str(), index, two ? 0 : opensave);
++			if (two)
++			{
++				user_io_status_set("[6]", 1);
++				user_io_file_tx(path2.c_str(), index2, opensave);
++			}
++			user_io_status_set("[6]", second);
++		}
+ 		// same opensave as the user's load, so the .sav is mounted and loaded again
+-		user_io_file_tx(path.c_str(), index, opensave);
++		else user_io_file_tx(path.c_str(), index, opensave);
+ 		own_reload = false;
+ 		reload_done = true;                // before clearing the request, so the
+ 		reload_req = false;                // thread never sees both false and asks again
+diff --git a/support/netplay/netplay.h b/support/netplay/netplay.h
+index f5aba98..bad7f5d 100644
+--- a/support/netplay/netplay.h
++++ b/support/netplay/netplay.h
+@@ -1,9 +1,9 @@
+-// netplay.h — NES lockstep netplay, Main_MiSTer integration (SPEC.md 7)
++// netplay.h — NES, SNES and Game Boy 2P lockstep netplay, Main_MiSTer integration (SPEC.md 7, 10, 11)
+ 
+ #ifndef NETPLAY_H
+ #define NETPLAY_H
+ 
+-void netplay_start(void);                                // a core was loaded; arms only for NES
++void netplay_start(void);                                // a core was loaded; arms only for NES, SNES, GAMEBOY2P
+ void netplay_stop(void);                                 // core is about to change
+ void netplay_poll(void);                                 // main loop
+ void netplay_note_file(const char *name, unsigned char index, char opensave);   // from user_io_file_tx
+diff --git a/support/netplay/netplay_proto.cpp b/support/netplay/netplay_proto.cpp
+index df486b6..8bdb5ea 100644
+--- a/support/netplay/netplay_proto.cpp
++++ b/support/netplay/netplay_proto.cpp
+@@ -61,6 +61,17 @@ uint32_t pack_settings(const Settings &s)
+ 	     | (uint32_t)(s.debug_dots & 1) << 12;
+ }
+ 
++uint32_t pack_settings(const GbSettings &s)
++{
++	return (uint32_t)(s.system & 3)
++	     | (uint32_t)(s.mapper & 7) << 2
++	     | (uint32_t)(s.extra_spr & 1) << 5
++	     | (uint32_t)(s.gba_mode & 1) << 6
++	     | (uint32_t)(s.fast_boot & 1) << 7
++	     | (uint32_t)(s.audio_mode & 1) << 8
++	     | (uint32_t)(s.dupe_save & 1) << 9;
++}
++
+ uint32_t pack_settings(const SnesSettings &s)
+ {
+ 	return (uint32_t)(s.region & 3)
+@@ -85,7 +96,7 @@ const char *reject_text(uint8_t r)
+ 	case REJ_SETTINGS:  return "Different core settings";
+ 	case REJ_RAM_CLEAR: return "Set RAM Clear to $00 or $FF";
+ 	case REJ_CHEATS:    return "Turn cheats off";
+-	case REJ_SYSTEM:    return "Only NTSC/PAL cartridges";
++	case REJ_SYSTEM:    return "This system type is not supported";
+ 	case REJ_DELAY:     return "Delay must be 2-15";
+ 	case REJ_BUSY:      return "Host is busy";
+ 	case REJ_CHIP:      return "Game chip not supported in netplay";
+@@ -113,6 +124,13 @@ uint8_t check_local(const SnesSettings &, uint8_t rom_ok, uint8_t delay)
+ 	return REJ_OK;
+ }
+ 
++uint8_t check_local(const GbSettings &s, uint8_t rom_ok, uint8_t delay)
++{
++	if (delay < 2 || delay > 15) return REJ_DELAY;
++	if (s.system == 3 || rom_ok) return REJ_SYSTEM;     // MegaDuck (SPEC.md 11, out of scope)
++	return REJ_OK;
++}
++
+ uint8_t rom_region_from_header(const uint8_t *hdr, size_t len, const char *ext)
+ {
+ 	if (ext && (!strcasecmp(ext, "fds") || !strcasecmp(ext, "nsf"))) return 3;
+@@ -183,6 +201,12 @@ size_t encode(const Packet &p, uint8_t *buf, size_t cap, bool wide)
+ 		w.raw(p.hello.core_build, 16);
+ 		w.raw(p.hello.rom_md5, 16);
+ 		w.raw(p.hello.sav_md5, 16);
++		if (p.hello.version >= 3)
++		{
++			w.raw(p.hello.rom2_md5, 16);
++			w.raw(p.hello.boot_md5, 16);
++			w.u32(p.hello.rtc_time);
++		}
+ 		w.u32(p.hello.settings);
+ 		w.u8(p.hello.delay);
+ 		if (p.type == P_HELLO_ACK)
+@@ -239,6 +263,12 @@ bool decode(const uint8_t *buf, size_t len, Packet *p, bool wide)
+ 		r.raw(p->hello.core_build, 16);
+ 		r.raw(p->hello.rom_md5, 16);
+ 		r.raw(p->hello.sav_md5, 16);
++		if (p->hello.version >= 3)
++		{
++			r.raw(p->hello.rom2_md5, 16);
++			r.raw(p->hello.boot_md5, 16);
++			p->hello.rtc_time = r.u32();
++		}
+ 		p->hello.settings = r.u32();
+ 		p->hello.delay = r.u8();
+ 		if (p->type == P_HELLO_ACK)
+diff --git a/support/netplay/netplay_proto.h b/support/netplay/netplay_proto.h
+index ec7b68d..b3068a9 100644
+--- a/support/netplay/netplay_proto.h
++++ b/support/netplay/netplay_proto.h
+@@ -1,4 +1,4 @@
+-// netplay_proto.h — NES and SNES netplay: wire format and mailbox layout (SPEC.md 4, 7, 10)
++// netplay_proto.h — NES, SNES and Game Boy 2P netplay: wire format and mailbox layout (SPEC.md 4, 7, 10, 11)
+ //
+ // Pure data handling with no I/O, so it builds and is unit tested on x86.
+ 
+@@ -11,15 +11,17 @@
+ namespace netplay {
+ 
+ // ---------------------------------------------------------------------------
+-// The two systems. NES keeps protocol version 1 byte for byte (Mesen speaks it);
+-// SNES is version 2: a system byte in HELLO and 16-bit input samples.
++// The systems. NES keeps protocol version 1 byte for byte (Mesen speaks it);
++// SNES is version 2: a system byte in HELLO and 16-bit input samples. Game Boy
++// 2P is version 3: version 2 plus a second ROM, the boot ROMs and the RTC time
++// in HELLO (SPEC.md 11.5).
+ 
+-enum System : uint8_t { SYS_NES = 0, SYS_SNES = 1 };
++enum System : uint8_t { SYS_NES = 0, SYS_SNES = 1, SYS_GB2P = 2 };
+ 
+ // ---------------------------------------------------------------------------
+ // DDR3 mailbox, shared with rtl/netplay.sv of each core
+ 
+-constexpr uint32_t MB_PHYS       = 0x3C000000;   // NES
++constexpr uint32_t MB_PHYS       = 0x3C000000;   // NES and Game Boy 2P (SPEC.md 11.3)
+ constexpr uint32_t MB_PHYS_SNES  = 0x3FC00000;   // SNES (SPEC.md 10.3)
+ constexpr uint32_t MB_SIZE       = 0x4000;
+ 
+@@ -33,9 +35,10 @@ constexpr uint32_t MB_RING       = 256;
+ 
+ constexpr uint64_t MAGIC_VALUE   = 0x313030504E53454EULL;   // "NESNP001"
+ constexpr uint64_t MAGIC_SNES    = 0x3130504E53454E53ULL;   // "SNESNP01"
++constexpr uint64_t MAGIC_GB2P    = 0x3130504E50324247ULL;   // "GB2PNP01"
+ 
+ inline uint32_t mailbox_phys(System s) { return s == SYS_SNES ? MB_PHYS_SNES : MB_PHYS; }
+-inline uint64_t mailbox_magic(System s) { return s == SYS_SNES ? MAGIC_SNES : MAGIC_VALUE; }
++inline uint64_t mailbox_magic(System s) { return s == SYS_SNES ? MAGIC_SNES : s == SYS_GB2P ? MAGIC_GB2P : MAGIC_VALUE; }
+ 
+ enum FpgaState : uint8_t { FS_IDLE = 0, FS_ARMED = 1, FS_PRIME = 2, FS_RUN = 3, FS_ERROR = 4 };
+ enum FpgaError : uint8_t { FE_UNDERRUN = 1, FE_CTRL_DROP = 2, FE_RELOAD = 4 };
+@@ -54,15 +57,16 @@ inline uint32_t ring_off(uint32_t base, uint32_t frame) { return base + (frame &
+ // is not cleared between cores, and a stray word must never arm netplay.
+ constexpr uint32_t CTRL_MAGIC    = 0x4C525443;   // "CTRL"
+ 
+-inline uint64_t ctrl_word(bool enable, bool run, uint8_t session)
++// join: Game Boy 2P only, CTRL[2] = this MiSTer plays gb2 (rumble, SPEC.md 11.3)
++inline uint64_t ctrl_word(bool enable, bool run, uint8_t session, bool join = false)
+ {
+ 	if (!enable) return 0;
+-	return (uint64_t)CTRL_MAGIC << 32 | (uint64_t)session << 8 | (run ? 2u : 0u) | 1u;
++	return (uint64_t)CTRL_MAGIC << 32 | (uint64_t)session << 8 | (join ? 4u : 0u) | (run ? 2u : 0u) | 1u;
+ }
+ 
+ // INPUT[f]: both 32-bit halves carry the frame tag and session, so a torn
+ // 64-bit store is never mistaken for a valid entry.
+-//   NES:  {f[15:0], sess[7:0], joy[7:0]}     SNES: {f[11:0], sess[7:0], joy[11:0]}
++//   NES, GB2P: {f[15:0], sess[7:0], joy[7:0]}     SNES: {f[11:0], sess[7:0], joy[11:0]}
+ inline uint32_t entry_tag(System s, uint32_t frame, uint8_t session)
+ {
+ 	return s == SYS_SNES ? (frame & 0xFFF) << 20 | (uint32_t)session << 12
+@@ -106,6 +110,20 @@ struct Settings
+ 
+ uint32_t pack_settings(const Settings &s);
+ 
++// The Game Boy 2P core's settings that change emulation (SPEC.md 11.5)
++struct GbSettings
++{
++	uint8_t system;        // status [15:14] System: 0 Auto, 1 Gameboy, 2 Gameboy Color, 3 MegaDuck
++	uint8_t mapper;        // status [41:39] Mapper: 0 Auto, 1 WisdomTree, 2 Mani161, 3 MBC1, 4 MBC3
++	uint8_t extra_spr;     // status [44]
++	uint8_t gba_mode;      // status [37] GBC/GBA mode
++	uint8_t fast_boot;     // status [42]
++	uint8_t audio_mode;    // status [43] Accurate / No Pops
++	uint8_t dupe_save;     // status [11] Dupe Save to GB 2
++};
++
++uint32_t pack_settings(const GbSettings &s);
++
+ // The SNES core's settings that change emulation (SPEC.md 10.4)
+ struct SnesSettings
+ {
+@@ -136,7 +154,7 @@ enum Reject : uint8_t
+ 	REJ_DELAY,         // delay outside 2..15
+ 	REJ_BUSY,          // host already has a peer
+ 	REJ_CHIP,          // SNES: MSU-1, BS-X, a real-time clock or the SPC player
+-	REJ_OTHER_SYSTEM,  // the peer runs the other console
++	REJ_OTHER_SYSTEM,  // the peer runs another console
+ };
+ 
+ const char *reject_text(uint8_t r);
+@@ -145,6 +163,8 @@ const char *reject_text(uint8_t r);
+ uint8_t check_local(const Settings &s, uint8_t rom_region, uint8_t delay);
+ // SNES: rom_ok 0 = supported, 1 = refused chip (REJ_CHIP)
+ uint8_t check_local(const SnesSettings &s, uint8_t rom_ok, uint8_t delay);
++// Game Boy 2P: rom_ok 0 = supported, 1 = MegaDuck (REJ_SYSTEM)
++uint8_t check_local(const GbSettings &s, uint8_t rom_ok, uint8_t delay);
+ 
+ // rom_region from the iNES header: 0 NTSC, 1 PAL, 2 Dendy/multi, 3 Vs. or not iNES.
+ uint8_t rom_region_from_header(const uint8_t *hdr, size_t len, const char *ext);
+@@ -159,7 +179,10 @@ void recording_path(char *out, size_t cap, const char *file, const char *rom);
+ constexpr uint32_t PKT_MAGIC     = 0x31504E4E;   // "NNP1"
+ constexpr uint8_t  PROTO_VERSION = 1;            // NES
+ constexpr uint8_t  PROTO_VERSION_SNES = 2;       // SNES: HELLO carries the system, inputs are u16
+-inline uint8_t proto_version(System s) { return s == SYS_SNES ? PROTO_VERSION_SNES : PROTO_VERSION; }
++constexpr uint8_t  PROTO_VERSION_GB2P = 3;       // Game Boy 2P: version 2 + rom2_md5, boot_md5, rtc_time
++inline uint8_t proto_version(System s) { return s == SYS_SNES ? PROTO_VERSION_SNES : s == SYS_GB2P ? PROTO_VERSION_GB2P : PROTO_VERSION; }
++// 16-bit input samples on the wire (all but NES)
++inline bool wide_input(System s) { return s != SYS_NES; }
+ constexpr int      MAX_HISTORY   = 16;            // inputs per INPUT packet
+ constexpr int      MAX_PACKET    = 128;
+ 
+@@ -172,6 +195,9 @@ struct Hello
+ 	uint8_t  core_build[16];
+ 	uint8_t  rom_md5[16];
+ 	uint8_t  sav_md5[16];
++	uint8_t  rom2_md5[16]; // version >= 3 only: gb2's ROM (the same as rom_md5 for one game)
++	uint8_t  boot_md5[16]; // version >= 3 only: the loaded boot ROMs, zeros for none
++	uint32_t rtc_time;     // version >= 3 only: the cart RTC's start time (the host's counts)
+ 	uint32_t settings;
+ 	uint8_t  delay;
+ 	uint8_t  accept;       // ACK only
+@@ -182,7 +208,7 @@ struct InputRun
+ {
+ 	uint32_t first_frame;
+ 	uint8_t  count;
+-	uint16_t joy[MAX_HISTORY];   // u8 on the wire for NES, u16 for SNES
++	uint16_t joy[MAX_HISTORY];   // u8 on the wire for NES, u16 for SNES and Game Boy 2P
+ };
+ 
+ struct CrcReport
+@@ -205,7 +231,7 @@ struct Packet
+ };
+ 
+ // Returns the encoded length, or 0 if the packet does not fit.
+-// wide: 16-bit input samples (SNES); NES packets are unchanged.
++// wide: 16-bit input samples (SNES, Game Boy 2P); NES packets are unchanged.
+ size_t encode(const Packet &p, uint8_t *buf, size_t cap, bool wide = false);
+ 
+ // Returns false for anything malformed; never reads past len.
+diff --git a/support/netplay/netplay_session.cpp b/support/netplay/netplay_session.cpp
+index 961b184..68b974d 100644
+--- a/support/netplay/netplay_session.cpp
++++ b/support/netplay/netplay_session.cpp
+@@ -96,6 +96,9 @@ void Session::send_hello(uint8_t type, uint8_t accept, uint8_t reason, uint8_t v
+ 	memcpy(p.hello.core_build, info_.core_build, 16);
+ 	memcpy(p.hello.rom_md5, info_.rom_md5, 16);
+ 	memcpy(p.hello.sav_md5, info_.sav_md5, 16);
++	memcpy(p.hello.rom2_md5, info_.rom2_md5, 16);
++	memcpy(p.hello.boot_md5, info_.boot_md5, 16);
++	p.hello.rtc_time = info_.rtc_time;
+ 	p.hello.settings = packed_settings();
+ 	p.hello.delay = delay_;
+ 	p.hello.accept = accept;
+@@ -105,19 +108,26 @@ void Session::send_hello(uint8_t type, uint8_t accept, uint8_t reason, uint8_t v
+ 
+ uint32_t Session::packed_settings() const
+ {
+-	return sys() == SYS_SNES ? pack_settings(info_.snes) : pack_settings(info_.settings);
++	switch (sys())
++	{
++	case SYS_SNES: return pack_settings(info_.snes);
++	case SYS_GB2P: return pack_settings(info_.gb);
++	default:       return pack_settings(info_.settings);
++	}
+ }
+ 
+ uint8_t Session::compare_peer(const Hello &h) const
+ {
+-	if (h.version != PROTO_VERSION && h.version != PROTO_VERSION_SNES) return REJ_PROTOCOL;
++	if (h.version < PROTO_VERSION || h.version > PROTO_VERSION_GB2P) return REJ_PROTOCOL;
+ 	uint8_t peer_sys = h.version >= 2 ? h.system : (uint8_t)SYS_NES;
+ 	if (peer_sys != sys()) return REJ_OTHER_SYSTEM;
+ 	if (h.version != proto_version(sys())) return REJ_PROTOCOL;
+ 	if (memcmp(h.core_build, info_.core_build, 16)) return REJ_CORE;
+ 	if (memcmp(h.rom_md5, info_.rom_md5, 16)) return REJ_ROM;
++	if (sys() == SYS_GB2P && memcmp(h.rom2_md5, info_.rom2_md5, 16)) return REJ_ROM;
+ 	if (memcmp(h.sav_md5, info_.sav_md5, 16)) return REJ_SAV;
+ 	if (h.settings != packed_settings()) return REJ_SETTINGS;
++	if (sys() == SYS_GB2P && memcmp(h.boot_md5, info_.boot_md5, 16)) return REJ_SETTINGS;
+ 	return REJ_OK;
+ }
+ 
+@@ -148,6 +158,7 @@ void Session::step(uint64_t now)
+ 		}
+ 		{
+ 			uint8_t r = sys() == SYS_SNES ? check_local(info_.snes, info_.rom_region, delay_)
++			          : sys() == SYS_GB2P ? check_local(info_.gb, info_.rom_region, delay_)
+ 			                              : check_local(info_.settings, info_.rom_region, delay_);
+ 			if (r != REJ_OK)
+ 			{
+@@ -245,9 +256,10 @@ void Session::handle_packet(uint64_t now, const Packet &p)
+ 			if (r == REJ_OK && (p.hello.delay < 2 || p.hello.delay > 15)) r = REJ_DELAY;
+ 			if (r != REJ_OK)
+ 			{
+-				// in the peer's own format, so a version 1 peer (NES, Mesen)
+-				// can read why instead of timing out
+-				send_hello(P_HELLO_ACK, 0, r, p.hello.version == PROTO_VERSION ? PROTO_VERSION : 0);
++				// in the peer's own format, so a version 1 peer (NES, Mesen) or
++				// an older build can read why instead of timing out
++				uint8_t v = p.hello.version;
++				send_hello(P_HELLO_ACK, 0, r, v >= PROTO_VERSION && v <= PROTO_VERSION_GB2P ? v : 0);
+ 				say("Netplay: player 2 rejected: %s", reject_text(r));
+ 				return;
+ 			}
+@@ -270,6 +282,7 @@ void Session::handle_packet(uint64_t now, const Packet &p)
+ 			net_->lock_peer();
+ 			sess_ = p.session;
+ 			delay_ = p.hello.delay;          // the host's delay wins
++			rtc_time_ = p.hello.rtc_time;    // and its clock (Game Boy 2P cart RTC)
+ 			t_rx_ = now;
+ 			arm(now);
+ 		}
+@@ -323,6 +336,10 @@ void Session::handle_packet(uint64_t now, const Packet &p)
+ 
+ void Session::arm(uint64_t now)
+ {
++	if (mode_ != M_JOIN) rtc_time_ = info_.rtc_time;
++	// a replay starts the cart RTC where the recording did
++	if (mode_ == M_REPLAY && rec_ && sys() == SYS_GB2P) rtc_time_ = rec_->rtc_time;
++	if (mode_ == M_RECORD && rec_) rec_->rtc_time = rtc_time_;
+ 	for (uint32_t i = 0; i < MB_RING; i++)
+ 	{
+ 		// INVALID_WORD, not 0: a zero CRC word decodes as a valid CRC[0] = 0.
+@@ -330,7 +347,7 @@ void Session::arm(uint64_t now)
+ 		mb_.wr(MB_CRC + i * 8, INVALID_WORD);
+ 		mb_.wr(MB_INPUT + i * 8, INVALID_WORD);
+ 	}
+-	mb_.wr(MB_CTRL, ctrl_word(true, false, sess_));
++	mb_.wr(MB_CTRL, ctrl_word(true, false, sess_, plays_gb2()));
+ 	phase_ = PH_ARM;
+ 	t_phase_ = now;
+ 	say("Netplay: arming core");
+@@ -346,7 +363,7 @@ void Session::reload_done(uint64_t now)
+ 
+ void Session::start_run(uint64_t now)
+ {
+-	mb_.wr(MB_CTRL, ctrl_word(true, true, sess_));
++	mb_.wr(MB_CTRL, ctrl_word(true, true, sess_, plays_gb2()));
+ 	phase_ = PH_RUN;
+ 	t_rx_ = now;
+ 	t_input_ = 0;
+diff --git a/support/netplay/netplay_session.h b/support/netplay/netplay_session.h
+index 8a26cd1..1d5dbea 100644
+--- a/support/netplay/netplay_session.h
++++ b/support/netplay/netplay_session.h
+@@ -1,4 +1,4 @@
+-// netplay_session.h — NES and SNES netplay session engine (SPEC.md 3, 4, 7, 10)
++// netplay_session.h — NES, SNES and Game Boy 2P netplay session engine (SPEC.md 3, 4, 7, 10, 11)
+ //
+ // Single-threaded and free of OS calls: the mailbox is a plain pointer and
+ // the network sits behind Transport, so the whole engine runs in the x86
+@@ -50,9 +50,14 @@ struct LocalInfo
+ 	uint8_t  core_build[16];
+ 	uint8_t  rom_md5[16];
+ 	uint8_t  sav_md5[16];
++	uint8_t  rom2_md5[16];      // Game Boy 2P: gb2's ROM (= rom_md5 for one game)
++	uint8_t  boot_md5[16];      // Game Boy 2P: the loaded boot ROMs, zeros for none
++	uint32_t rtc_time;          // Game Boy 2P: this side's time for the cart RTC
+ 	Settings settings;          // NES
+ 	SnesSettings snes;          // SNES
+-	uint8_t  rom_region;        // NES: see rom_region_from_header(); SNES: 0 supported, 1 refused chip
++	GbSettings gb;              // Game Boy 2P
++	uint8_t  rom_region;        // NES: see rom_region_from_header(); SNES: 0 supported, 1 refused chip;
++	                            // Game Boy 2P: 0 supported, 1 MegaDuck
+ };
+ 
+ // Record/replay data: one controller sample and one CRC per frame.
+@@ -60,6 +65,7 @@ struct Recording
+ {
+ 	uint8_t               delay = 0;   // input delay the recording was made with
+ 	System                system = SYS_NES;
++	uint32_t              rtc_time = 0;   // Game Boy 2P: the cart RTC's start time
+ 	std::vector<uint16_t> joy;
+ 	std::vector<uint32_t> crc;
+ };
+@@ -100,6 +106,9 @@ public:
+ 	uint16_t stalls()      const { return stalls_; }
+ 	uint8_t  session_id()  const { return sess_; }
+ 	uint8_t  delay()       const { return delay_; }
++	// Game Boy 2P: the cart RTC's start time both sides use (the host's), valid
++	// once the session has armed; the main thread sends it before the reload.
++	uint32_t rtc_time()    const { return rtc_time_; }
+ 
+ private:
+ 	static constexpr uint32_t WIN = 1024;   // frames of history kept per stream
+@@ -119,7 +128,8 @@ private:
+ 	void run(uint64_t now);
+ 	void put_crc(Slot32 *ring, uint32_t f, uint32_t v, uint64_t now);
+ 	System sys() const { return info_.system; }
+-	bool   wide() const { return info_.system == SYS_SNES; }
++	bool   wide() const { return wide_input(info_.system); }
++	bool   plays_gb2() const { return info_.system == SYS_GB2P && mode_ == M_JOIN; }
+ 	uint32_t packed_settings() const;
+ 
+ 	Mode       mode_;
+@@ -134,6 +144,7 @@ private:
+ 	LocalInfo  info_ {};
+ 	uint8_t    sess_ = 0;
+ 	uint8_t    seed_;
++	uint32_t   rtc_time_ = 0;
+ 	bool       failed_ = false;
+ 	bool       reload_req_ = false;
+ 	bool       peer_started_ = false;
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index daf16eb..ce73670 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -14,6 +14,9 @@ test: test_netplay udp_harness
+ 	NP_OSD=1 ./run_udp_test.sh
+ 	NP_SYSTEM=snes ./run_udp_test.sh
+ 	NP_SYSTEM=snes NP_OSD=1 ./run_udp_test.sh
++	NP_SYSTEM=gb2p ./run_udp_test.sh
++	NP_SYSTEM=gb2p NP_TWO=1 ./run_udp_test.sh
++	NP_SYSTEM=gb2p NP_TWO=1 NP_OSD=1 ./run_udp_test.sh
+ 	@srv=../../../../server/build/netplay-server-linux-amd64; \
+ 	if [ -x $$srv ]; then srv=$$(cd $$(dirname $$srv) && pwd)/$$(basename $$srv); \
+ 	  NP_SERVER_BIN=$$srv ./run_udp_test.sh && \
+diff --git a/support/netplay/test/fake_fpga.h b/support/netplay/test/fake_fpga.h
+index 87983bd..b9213e1 100644
+--- a/support/netplay/test/fake_fpga.h
++++ b/support/netplay/test/fake_fpga.h
+@@ -25,6 +25,7 @@ struct FakeFpga
+ 	System   sys = SYS_NES;
+ 	uint32_t frame_ms = 16;
+ 	uint8_t  state = FS_IDLE, error = 0, sess = 0;
++	bool     join = false;                  // Game Boy 2P: CTRL[2] latched when armed
+ 	uint32_t frame = 0;
+ 	uint16_t stalls = 0;
+ 	bool     have0 = false, have1 = false;
+@@ -85,7 +86,7 @@ struct FakeFpga
+ 		switch (state)
+ 		{
+ 		case FS_IDLE:
+-			if (en) { state = FS_ARMED; sess = (uint8_t)(ctrl >> 8); frame = 0; error = 0; stalls = 0; have0 = have1 = false; status(); }
++			if (en) { state = FS_ARMED; sess = (uint8_t)(ctrl >> 8); join = (ctrl >> 2) & 1; frame = 0; error = 0; stalls = 0; have0 = have1 = false; status(); }
+ 			break;
+ 		case FS_ARMED:
+ 			if (!en) { state = FS_IDLE; status(); }
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+index 8292903..02e2c9e 100755
+--- a/support/netplay/test/run_udp_test.sh
++++ b/support/netplay/test/run_udp_test.sh
+@@ -7,7 +7,12 @@ frames="${1:-600}"
+ tmp="$(mktemp -d)"
+ mkdir -p "$tmp/host" "$tmp/join"
+ # NP_SYSTEM=snes: the SNES core (game in roms/SNES on the server, .sfc)
+-if [ "${NP_SYSTEM:-}" = snes ]; then sysdir=SNES; ext=sfc; else sysdir=; ext=nes; fi
++# NP_SYSTEM=gb2p: Game Boy 2P (roms/GB, .gb), NP_TWO=1 with two games
++case "${NP_SYSTEM:-}" in
++	snes) sysdir=SNES; ext=sfc ;;
++	gb2p) sysdir=GB; ext=gb ;;
++	*)    sysdir=; ext=nes ;;
++esac
+ 
+ # NP_SERVER_BIN: meet through a real netplay-server, which also hands out the game
+ if [ -n "${NP_SERVER_BIN:-}" ]; then
+@@ -33,7 +38,7 @@ h=$(grep RESULT "$tmp/host.log"); j=$(grep RESULT "$tmp/join.log")
+ echo "host: $h"
+ echo "join: $j"
+ hd=${h##*digest=}; jd=${j##*digest=}
+-label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_OSD:+ (OSD mode)}${NP_SERVER_BIN:+ (server${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}"
++label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_TWO:+ (two games)}${NP_OSD:+ (OSD mode)}${NP_SERVER_BIN:+ (server${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}"
+ ok=0
+ [ $hr -eq 0 ] && [ $jr -eq 0 ] && [ -n "$hd" ] && [ "$hd" = "$jd" ] && ok=1
+ # through a server: the path the session took, and the names
+diff --git a/support/netplay/test/test_netplay.cpp b/support/netplay/test/test_netplay.cpp
+index 5ddd7d7..aca3cf0 100644
+--- a/support/netplay/test/test_netplay.cpp
++++ b/support/netplay/test/test_netplay.cpp
+@@ -76,8 +76,10 @@ static LocalInfo make_info(System sys = SYS_NES)
+ 	li.system = sys;
+ 	li.snes.wram = 1;
+ 	li.snes.aram = 3;
+-	memcpy(li.core_build, sys == SYS_SNES ? "SNES_20261103___" : "NES_20261030____", 16);
++	memcpy(li.core_build, sys == SYS_SNES ? "SNES_20261103___" : sys == SYS_GB2P ? "GAMEBOY2P_261107" : "NES_20261030____", 16);
+ 	memset(li.rom_md5, 0xAB, 16);
++	memset(li.rom2_md5, 0xCD, 16);
++	li.rtc_time = 1800000000u;
+ 	li.settings.ram_clear = 1;
+ 	li.settings.cheats_off = 1;
+ 	li.settings.sys_type = 0;
+@@ -600,6 +602,175 @@ static void test_snes_settings()
+ 	y = x; y.region = 2; CHECK(pack_settings(x) != pack_settings(y));
+ }
+ 
++// ---------------------------------------------------------------------------
++// Game Boy 2P (SPEC.md 11)
++
++static void test_gb2p_words()
++{
++	printf("gb2p: mailbox words and CTRL\n");
++	CHECK(input_word(SYS_GB2P, 7, 0x5A, 0x81, 0x42) == input_word(7, 0x5A, 0x81, 0x42));   // as NES
++	CHECK(input_word(SYS_GB2P, 7, 0x5A, 0x181, 0) == input_word(7, 0x5A, 0x81, 0));       // 8 bits
++	CHECK(mailbox_phys(SYS_GB2P) == 0x3C000000);
++	CHECK(mailbox_magic(SYS_GB2P) == 0x3130504E50324247ULL);   // "GB2PNP01" as rtl/netplay.sv
++	CHECK(ctrl_word(true, true, 9, true) == (0x4C525443ULL << 32 | 9 << 8 | 7));
++	CHECK(ctrl_word(true, false, 9) == (0x4C525443ULL << 32 | 9 << 8 | 1));
++	CHECK(ctrl_word(false, true, 9, true) == 0);
++}
++
++static void test_gb2p_packets()
++{
++	printf("gb2p: packets\n");
++	uint8_t buf[MAX_PACKET];
++	Packet h {}, q;
++	h.type = P_HELLO_ACK; h.session = 3; h.hello.version = PROTO_VERSION_GB2P; h.hello.system = SYS_GB2P;
++	memset(h.hello.rom_md5, 1, 16); memset(h.hello.sav_md5, 2, 16);
++	memset(h.hello.rom2_md5, 3, 16); memset(h.hello.boot_md5, 4, 16);
++	h.hello.rtc_time = 0x89ABCDEF; h.hello.settings = 0x155; h.hello.delay = 5; h.hello.accept = 1;
++	size_t n = encode(h, buf, sizeof(buf));
++	CHECK(n == 4 + 2 + 1 + 1 + 48 + 32 + 4 + 4 + 1 + 2 && buf[7] == SYS_GB2P);
++	// rom2_md5, boot_md5, rtc_time right after sav_md5
++	CHECK(buf[56] == 3 && buf[72] == 4 && buf[88] == 0xEF && buf[91] == 0x89);
++	CHECK(decode(buf, n, &q) && q.hello.version == 3 && q.hello.system == SYS_GB2P
++	      && q.hello.rom2_md5[15] == 3 && q.hello.boot_md5[0] == 4 && q.hello.rtc_time == 0x89ABCDEF
++	      && q.hello.settings == 0x155 && q.hello.delay == 5 && q.hello.accept == 1);
++	CHECK(!decode(buf, n - 1, &q));               // truncated
++	h.hello.version = PROTO_VERSION_SNES;         // a version 2 HELLO has none of them
++	CHECK(encode(h, buf, sizeof(buf)) == 4 + 2 + 1 + 1 + 48 + 4 + 1 + 2);
++
++	Packet p {};
++	p.type = P_INPUT; p.session = 7; p.input.first_frame = 9; p.input.count = 2;
++	p.input.joy[0] = 0xFF; p.input.joy[1] = 0x01;
++	n = encode(p, buf, sizeof(buf), wide_input(SYS_GB2P));
++	CHECK(n == 4 + 2 + 4 + 1 + 2 * 2);            // u16 samples, as SNES
++}
++
++static void test_gb2p_settings()
++{
++	printf("gb2p: settings\n");
++	GbSettings s {};
++	CHECK(check_local(s, 0, 3) == REJ_OK);
++	s.system = 2; CHECK(check_local(s, 0, 3) == REJ_OK);
++	s.system = 3; CHECK(check_local(s, 0, 3) == REJ_SYSTEM);    // MegaDuck
++	s.system = 0; CHECK(check_local(s, 1, 3) == REJ_SYSTEM);    // a .bin (MegaDuck) cart
++	CHECK(check_local(s, 0, 16) == REJ_DELAY);
++	GbSettings base {};
++	uint32_t seen[8];
++	GbSettings v[7] = {};
++	v[0].system = 1; v[1].mapper = 4; v[2].extra_spr = 1; v[3].gba_mode = 1;
++	v[4].fast_boot = 1; v[5].audio_mode = 1; v[6].dupe_save = 1;
++	seen[7] = pack_settings(base);
++	for (int i = 0; i < 7; i++)
++	{
++		seen[i] = pack_settings(v[i]);
++		CHECKM(seen[i] != seen[7], "setting %d does not change the packed value", i);
++		for (int j = 0; j < i; j++) CHECK(seen[i] != seen[j]);
++	}
++}
++
++static void test_gb2p_session()
++{
++	printf("gb2p: session over a lossy link\n");
++	Pair P(3, Timing(), SYS_GB2P, SYS_GB2P);
++	LocalInfo jb = make_info(SYS_GB2P);
++	jb.rtc_time = 1700000000u;                    // the join's clock is off: the host's wins
++	P.b.set_local(jb);
++	rng_state = 777;
++	P.net.loss_pct = 5; P.net.delay_ms = 30; P.net.jitter_ms = 10;
++	bool ok = P.run_until([&] { return P.fa.frame >= 2000 && P.fb.frame >= 2000; }, 120000);
++	CHECKM(ok, "did not reach 2000 frames: A %s / B %s", P.a.message(), P.b.message());
++	check_same_inputs(P, 3);
++	int wrong = 0;
++	for (size_t f = 3; f < 1900; f++)
++		if (P.fa.seen[f].first != P.fa.posted[f - 3] || P.fa.seen[f].second != P.fb.posted[f - 3]) wrong++;
++	CHECKM(wrong == 0, "%d frames with wrong port or delay", wrong);
++	CHECKM(!P.fa.join && P.fb.join, "CTRL[2]: host %d join %d", P.fa.join, P.fb.join);
++	CHECKM(P.a.rtc_time() == 1800000000u && P.b.rtc_time() == 1800000000u, "rtc host %u join %u", P.a.rtc_time(), P.b.rtc_time());
++}
++
++static void test_gb2p_rejects()
++{
++	printf("gb2p: second ROM, boot ROM, other console\n");
++	{
++		Pair P(3, Timing(), SYS_GB2P, SYS_GB2P);
++		LocalInfo jb = make_info(SYS_GB2P);
++		jb.rom2_md5[0] ^= 1;
++		P.b.set_local(jb);
++		P.run_until([&] { return P.b.failed(); }, 20000);
++		CHECKM(P.b.failed() && strstr(P.b.message(), "Different ROM"), "rom2: %s", P.b.message());
++	}
++	{
++		Pair P(3, Timing(), SYS_GB2P, SYS_GB2P);
++		LocalInfo jb = make_info(SYS_GB2P);
++		jb.boot_md5[3] = 9;
++		P.b.set_local(jb);
++		P.run_until([&] { return P.b.failed(); }, 20000);
++		CHECKM(P.b.failed() && strstr(P.b.message(), "settings"), "boot: %s", P.b.message());
++	}
++	{
++		Pair P(3, Timing(), SYS_GB2P, SYS_GB2P);
++		LocalInfo jb = make_info(SYS_GB2P);
++		jb.gb.dupe_save = 1;
++		P.b.set_local(jb);
++		P.run_until([&] { return P.b.failed(); }, 20000);
++		CHECKM(P.b.failed() && strstr(P.b.message(), "settings"), "settings: %s", P.b.message());
++	}
++	for (System other : { SYS_NES, SYS_SNES })
++	{
++		// GB2P host, older-protocol join: refused in the join's own format
++		Pair P(3, Timing(), SYS_GB2P, other);
++		int acks = 0, own_format = 0;
++		size_t want = other == SYS_NES ? 4 + 2 + 1 + 48 + 4 + 1 + 2 : 4 + 2 + 1 + 1 + 48 + 4 + 1 + 2;
++		P.net.drop_if = [&](int from, const uint8_t *b, size_t n) {
++			if (from == 0 && n > 6 && b[4] == P_HELLO_ACK) { acks++; if (n == want && b[n - 1] == REJ_OTHER_SYSTEM) own_format++; }
++			return false;
++		};
++		P.run_until([&] { return P.b.failed(); }, 20000);
++		CHECKM(acks > 0 && acks == own_format, "join %d: %d of %d refusals in its format", other, own_format, acks);
++		CHECKM(P.b.failed() && strstr(P.b.message(), "another console"), "join %d: %s", other, P.b.message());
++	}
++	{
++		Pair P(3, Timing(), SYS_SNES, SYS_GB2P);       // the other way round
++		P.run_until([&] { return P.b.failed(); }, 20000);
++		CHECKM(P.b.failed() && strstr(P.b.message(), "another console"), "SNES host: %s", P.b.message());
++		CHECK(P.fa.frame == 0 && P.fb.frame == 0);
++	}
++}
++
++static void test_gb2p_record_replay()
++{
++	printf("gb2p: record and replay\n");
++	Recording rec;
++	rec.system = SYS_GB2P;
++	FakeFpga f1(0, SYS_GB2P);
++	Session r(M_RECORD, 4, f1.mb, nullptr, &rec, 9);
++	r.set_local(make_info(SYS_GB2P));
++	uint64_t now = 0;
++	while (f1.frame < 600 && now < 60000)
++	{
++		now++;
++		f1.step(now); r.step(now);
++		if (r.reload_requested() && now % 40 == 0) r.reload_done(now);
++	}
++	r.stop(now, "done");
++	CHECK(f1.frame >= 600 && !f1.join && rec.crc.size() >= 590 && r.rtc_time() == 1800000000u && rec.rtc_time == 1800000000u);
++
++	FakeFpga f2(0, SYS_GB2P);
++	f2.pad = [](uint64_t) { return (uint16_t)0x55; };   // the recording replaces the pad
++	Session p(M_REPLAY, 2, f2.mb, nullptr, &rec, 9);
++	LocalInfo later = make_info(SYS_GB2P);
++	later.rtc_time = 1900000000u;                 // replayed later: the recording's clock wins
++	p.set_local(later);
++	now = 0;
++	while (p.phase() != PH_DONE && now < 60000)
++	{
++		now++;
++		f2.step(now); p.step(now);
++		if (p.reload_requested() && now % 40 == 0) p.reload_done(now);
++	}
++	CHECKM(!p.failed() && strstr(p.message(), "replay OK"), "replay: %s", p.message());
++	CHECKM(p.rtc_time() == 1800000000u, "replay rtc %u", p.rtc_time());
++}
++
+ int main()
+ {
+ 	test_packets();
+@@ -625,6 +796,12 @@ int main()
+ 	test_snes_vs_nes();
+ 	test_nes_join_snes_host();
+ 	test_snes_settings();
++	test_gb2p_words();
++	test_gb2p_packets();
++	test_gb2p_settings();
++	test_gb2p_session();
++	test_gb2p_rejects();
++	test_gb2p_record_replay();
+ 
+ 	if (g_fail) { printf("FAIL: %d of %d checks\n", g_fail, g_checks); return 1; }
+ 	printf("PASS: %d checks\n", g_checks);
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index 9f2735c..fa7c8de 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -18,6 +18,8 @@
+ 
+ #include "../netplay.h"
+ #include "../../../file_io.h"
++#include "../../../spi.h"
++#include "../../../user_io.h"
+ #include "fake_fpga.h"
+ 
+ using namespace netplay;
+@@ -25,13 +27,19 @@ using namespace netplay;
+ static FakeFpga   *fpga;
+ static std::string workdir;
+ static int         reloads = 0;
+-// NP_SYSTEM=snes: the SNES core (SPEC.md 10), else NES
+-static bool        snes = false;
++// NP_SYSTEM=snes: the SNES core (SPEC.md 10); NP_SYSTEM=gb2p: Game Boy 2P (SPEC.md 11); else NES
++static bool        snes = false, gb2p = false;
++// NP_TWO=1 (gb2p): two games, game.gb into both Game Boys, then game2.gb into gb2
++static bool        two = false;
++static uint32_t    status6 = 0;             // GB2P "Rom for second GB"
++static std::string loads;                   // what the reloads sent, in order
++static uint32_t    timestamp = 0;           // last UIO_TIMESTAMP
++static int         spi_cmd = -1, spi_words = 0;
+ 
+ // --- stubs for the MiSTer functions netplay.cpp uses ------------------------
+ 
+-char *user_io_get_core_name(int) { static char n[] = "NES", sn[] = "SNES"; return snes ? sn : n; }
+-char *user_io_get_core_path(const char *, int) { static char p[] = "games/NES", sp[] = "games/SNES"; return snes ? sp : p; }
++char *user_io_get_core_name(int) { static char n[] = "NES", sn[] = "SNES", g[] = "GAMEBOY2P"; return gb2p ? g : snes ? sn : n; }
++char *user_io_get_core_path(const char *, int) { static char p[] = "games/NES", sp[] = "games/SNES", g[] = "games/GAMEBOY2P"; return gb2p ? g : snes ? sp : p; }
+ 
+ // The RAM folder for server games is a plain folder here (no root needed).
+ extern "C" int mount(const char *, const char *, const char *, unsigned long, const void *) { return 0; }
+@@ -39,26 +47,48 @@ extern "C" int umount2(const char *, int) { return 0; }
+ 
+ char *user_io_get_confstr(int index)
+ {
+-	static char a[] = "NES", sa[] = "SNES", b[] = "V,v261030";
+-	return index == 0 ? (snes ? sa : a) : index == 1 ? b : nullptr;
++	static char a[] = "NES", sa[] = "SNES", ga[] = "GAMEBOY2P", b[] = "V,v261030";
++	return index == 0 ? (gb2p ? ga : snes ? sa : a) : index == 1 ? b : nullptr;
+ }
+ 
+-static uint32_t osd_netplay = 0;            // NES [89:88], SNES [59:58]: 0 = netplay.ini, 2 Host, 3 Join
++static uint32_t osd_netplay = 0;            // NES [89:88], SNES [59:58], GB2P [47:46]: 0 = netplay.ini, 2 Host, 3 Join
+ 
+ uint32_t user_io_status_get(const char *opt, int)
+ {
+-	if (!strcmp(opt, snes ? "[59:58]" : "[89:88]")) return osd_netplay;
++	if (!strcmp(opt, gb2p ? "[47:46]" : snes ? "[59:58]" : "[89:88]")) return osd_netplay;
++	if (gb2p) return !strcmp(opt, "[6]") ? status6 : 0;
+ 	if (snes && (!strcmp(opt, "[22:21]") || !strcmp(opt, "[45:44]"))) return 1;   // WRAM/ARAM 00FF
+ 	if (!strcmp(opt, "[66:65]")) return 1;   // RAM Clear $00
+ 	if (!strcmp(opt, "[20]")) return 1;      // cheats off
+ 	return 0;
+ }
+ 
++void user_io_status_set(const char *opt, uint32_t value, int)
++{
++	if (gb2p && !strcmp(opt, "[6]")) status6 = value;
++	else { printf("[harness] unexpected status_set %s\n", opt); reloads += 100; }
++}
++
++// SPI: only UIO_TIMESTAMP with two words is expected (GB2P, before the reload)
++uint16_t spi_uio_cmd_cont(uint16_t cmd) { spi_cmd = cmd; spi_words = 0; timestamp = 0; return 0; }
++uint16_t fpga_spi(uint16_t w) { if (spi_cmd == UIO_TIMESTAMP && spi_words < 2) timestamp |= (uint32_t)w << (16 * spi_words); spi_words++; return 0; }
++void DisableIO()
++{
++	if (spi_cmd != UIO_TIMESTAMP || spi_words != 2) { printf("[harness] unexpected SPI command %d (%d words)\n", spi_cmd, spi_words); reloads += 100; }
++	else printf("[harness] timestamp %u\n", timestamp);
++	spi_cmd = -1;
++}
++
+ int user_io_file_tx(const char *name, unsigned char index, char opensave, char, char, uint32_t)
+ {
+ 	reloads++;
+ 	printf("[harness] reload %s index %u opensave %d\n", name, index, opensave);
+-	if (!opensave) { printf("[harness] reload without opensave: .sav would not load\n"); reloads += 100; }
++	const char *b = strrchr(name, '/');
++	if (gb2p) loads += std::string(loads.empty() ? "" : ",") + (b ? b + 1 : name) + ":" + std::to_string(status6) + ":" + std::to_string(opensave);
++	if (gb2p && !timestamp) { printf("[harness] reload before the timestamp\n"); reloads += 100; }
++	// GB2P with two games: the first load (game 1, both Game Boys) mounts no .sav
++	bool sav_expected = !(gb2p && two && status6 == 0);
++	if (!opensave && sav_expected) { printf("[harness] reload without opensave: .sav would not load\n"); reloads += 100; }
+ 	netplay_note_file(name, index, opensave);   // like the real one: must be ignored
+ 	return 1;
+ }
+@@ -74,7 +104,7 @@ void Info(const char *message, int, int, int, int) { printf("[osd] %s\n", messag
+ 
+ void *shmem_map(uint32_t phys, uint32_t)
+ {
+-	if (phys != mailbox_phys(snes ? SYS_SNES : SYS_NES)) { printf("[harness] wrong mailbox address %08x\n", phys); return nullptr; }
++	if (phys != mailbox_phys(gb2p ? SYS_GB2P : snes ? SYS_SNES : SYS_NES)) { printf("[harness] wrong mailbox address %08x\n", phys); return nullptr; }
+ 	return fpga->own;
+ }
+ 
+@@ -96,19 +126,22 @@ static uint64_t now_ms()
+ 	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+ }
+ 
+-static void make_rom(const char *path)            // same bytes on both sides
++static void make_rom(const char *path, int salt = 0)   // same bytes on both sides
+ {
+ 	FILE *f = fopen(path, "wb");
+ 	uint8_t hdr[16] = {'N', 'E', 'S', 0x1A, 2, 1};
+-	if (!snes) fwrite(hdr, 16, 1, f);
+-	for (int i = 0; i < 40960; i++) fputc((i * 7) & 0xFF, f);
++	if (!snes && !gb2p) fwrite(hdr, 16, 1, f);
++	for (int i = 0; i < 40960; i++) fputc((i * 7 + salt) & 0xFF, f);
+ 	fclose(f);
+ }
+ 
+ int main(int argc, char **argv)
+ {
+ 	snes = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "snes");
+-	const char *sysdir = snes ? "SNES" : "NES", *ext = snes ? ".sfc" : ".nes";
++	gb2p = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "gb2p");
++	two = gb2p && getenv("NP_TWO") != nullptr;
++	const char *sysdir = gb2p ? "GAMEBOY2P" : snes ? "SNES" : "NES", *ext = gb2p ? ".gb" : snes ? ".sfc" : ".nes";
++	if (argc == 4 && !strcmp(argv[1], "makerom")) { make_rom(argv[2], atoi(argv[3])); return 0; }
+ 	if (argc == 3 && !strcmp(argv[1], "makerom")) { make_rom(argv[2]); return 0; }
+ 	if (argc != 4) { fprintf(stderr, "usage: udp_harness <host|join> <workdir> <frames>\n"); return 2; }
+ 	bool host = !strcmp(argv[1], "host");
+@@ -158,8 +191,17 @@ int main(int argc, char **argv)
+ 		}
+ 	}
+ 	else make_rom(getFullPath(game.c_str()));
++	std::string game2 = std::string("game2") + ext;
++	if (two && !server) make_rom(getFullPath(game2.c_str()), 1);
+ 
+-	fpga = new FakeFpga(host ? 0 : 1, snes ? SYS_SNES : SYS_NES);
++	fpga = new FakeFpga(host ? 0 : 1, gb2p ? SYS_GB2P : snes ? SYS_SNES : SYS_NES);
++	if (gb2p)
++	{
++		// a boot ROM Main remembers (GAMEBOY2P.f4) loads before netplay_start()
++		// NP_BOOTSALT=n: another boot ROM here (the handshake must refuse it)
++		make_rom(getFullPath("cgb_boot.bin"), getenv("NP_BOOTSALT") ? atoi(getenv("NP_BOOTSALT")) : 4);
++		netplay_note_file("cgb_boot.bin", 4, 0);
++	}
+ 	netplay_start();
+ 	if (server)                                // wait for the download
+ 	{
+@@ -200,8 +242,22 @@ int main(int argc, char **argv)
+ 		printf("[harness] room file: %s\n", pick.c_str());
+ 		game = std::string("games/") + sysdir + "/_Netplay/Rooms/" + pick;
+ 	}
++	if (gb2p)
++	{
++		// boot ROMs: core load (boot1.rom, index 0x40) and the OSD's DMG boot (5)
++		make_rom(getFullPath("boot1.rom"), 5);
++		make_rom(getFullPath("dmg_boot.bin"), 6);
++		netplay_note_file("boot1.rom", 0x40, 0);
++		netplay_note_file("dmg_boot.bin", 5, 0);
++	}
+ 	netplay_note_file("palette.pal", 3, 0);    // a custom palette must not start a session
++	if (gb2p) status6 = 0;
+ 	netplay_note_file(game.c_str(), 1, 1);
++	if (two)
++	{
++		status6 = 1;                           // game 2 into gb2
++		netplay_note_file(game2.c_str(), 0x41, 1);
++	}
+ 
+ 	uint64_t t0 = now_ms();
+ 	while (fpga->frame < want && now_ms() - t0 < 60000)
+@@ -224,6 +280,18 @@ int main(int argc, char **argv)
+ 		digest = (digest ^ p.first) * 1099511628211ULL;
+ 		digest = (digest ^ p.second) * 1099511628211ULL;
+ 	}
+-	printf("RESULT frames=%u stalls=%u reloads=%d digest=%016llx\n", reached, fpga->stalls, reloads, (unsigned long long)digest);
+-	return (reached >= want && reloads == 1) ? 0 : 1;
++	int want_reloads = two ? 2 : 1;
++	bool gb_ok = true;
++	if (gb2p)
++	{
++		// the reloads: game 1 with [6]=0, game 2 with [6]=1 and the .sav, [6] restored
++		std::string expect = two ? "game.gb:0:0,game2.gb:1:1" : "game.gb:0:1";
++		if (loads != expect) { printf("[harness] reloads %s, expected %s\n", loads.c_str(), expect.c_str()); gb_ok = false; }
++		if (status6 != (two ? 1u : 0u)) { printf("[harness] [6] not restored\n"); gb_ok = false; }
++		if (fpga->join != !host) { printf("[harness] CTRL[2] %d on the %s\n", fpga->join, host ? "host" : "join"); gb_ok = false; }
++		// the timestamp joins the digest: both sides must send the host's
++		digest = (digest ^ timestamp) * 1099511628211ULL;
++	}
++	printf("RESULT frames=%u stalls=%u reloads=%d timestamp=%u digest=%016llx\n", reached, fpga->stalls, reloads, timestamp, (unsigned long long)digest);
++	return (reached >= want && reloads == want_reloads && gb_ok) ? 0 : 1;
+ }
+diff --git a/user_io.cpp b/user_io.cpp
+index 76dab75..f3f3ad4 100644
+--- a/user_io.cpp
++++ b/user_io.cpp
+@@ -1648,7 +1648,7 @@ void user_io_init(const char *path, const char *xml)
+ 				if (is_next()) next_enet_start();
+ 				// before the boot ROMs: the Sun-2's ID PROM goes in while it is held in reset
+ 				if (is_sun_family()) sun_enet_start();
+-				netplay_start();   // NES and SNES only; reads netplay.ini
++				netplay_start();   // NES, SNES and Game Boy 2P only; reads netplay.ini
+ 				if (is_hp9k_family()) hp9k_enet_start();
+ 				if (is_sgi_family()) sgi_enet_start();
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,194 @@
+From d8608f19b9b9037752def28789868aac42e8d949 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 7 Nov 2026 04:28:19 +0100
+Subject: [PATCH 3/4] npsim: ROM type from the file extension, boot ROM
+ required, button scripts, screenshots
+
+The download index now follows the menu ("FS1,GBCGB BIN": .gb is 0x41), so
+.gb files run in DMG mode; before, every ROM ran in GBC mode. The sim stops
+when build/cgb_boot.hex is missing (it is read relative to npsim/; without it
+the boot ROM was all zeros). --script FILE holds buttons per emulated frame,
+--shot writes both screens of side A as PPM.
+---
+ npsim/gb2p_sim.cpp | 81 +++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 80 insertions(+), 1 deletion(-)
+
+diff --git a/npsim/gb2p_sim.cpp b/npsim/gb2p_sim.cpp
+index af3bd1e..909ef39 100644
+--- a/npsim/gb2p_sim.cpp
++++ b/npsim/gb2p_sim.cpp
+@@ -10,10 +10,15 @@
+ //
+ //   gb2p_sim ROM [--frames N] [--seed S] [--unshared] [--no-freeze] [--no-jitter]
+ //            [--offset CYCLES] [--p1 HEX] [--p2 HEX] [--sys 0|1|2] [--quiet]
++//            [--script FILE] [--shot FRAME[,FRAME...] --shot-prefix PATH]
+ //
+ // --unshared runs the upstream per-core speedcontrol (no freezes possible) as a
+ // control: with link traffic it is expected to differ.
+ // --p1/--p2: buttons held by player 1/2 the whole run (bit 4 = A).
++// --script: lines "FRAME P1 P2" (hex buttons, held from that emulated frame of
++//           the side's own core 1 on; # starts a comment). Overrides --p1/--p2.
++// --shot:   writes side A's two screens at those frames as PATH-fFRAME-gbN.ppm.
++// Buttons: bit 0 right, 1 left, 2 up, 3 down, 4 A, 5 B, 6 select, 7 start.
+ // Exit 0 and "PASS" when no sample differs.
+ #include "Vgb2p_side.h"
+ #include "verilated.h"
+@@ -22,6 +27,8 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <deque>
++#include <map>
++#include <set>
+ #include <random>
+ #include <string>
+ #include <vector>
+@@ -67,10 +74,41 @@ struct Side {
+ 	uint64_t frozen_cycles = 0, freezes = 0;
+ 	std::mt19937_64 rng;
+ 	uint8_t  p1 = 0, p2 = 0;
++	uint8_t  index = 0x41;          // menu "FS1,GBCGB BIN": bits 7:6 = extension (0 GBC, 1 GB, 2 BIN)
+ 	std::string serial_out;       // bytes core 1 writes to SB before starting a transfer
+ 	uint8_t  last_sb = 0;
+ 	bool     sb_wr_seen = false;
+ 	uint64_t cart_exec = 0;
++	const std::map<uint64_t, std::pair<uint8_t, uint8_t>> *script = nullptr;
++	uint16_t lcd[2][160 * 144] = {};
++	uint32_t lcd_ptr[2] = {0, 0};
++	bool     lcd_off_old[2] = {true, true};
++
++	void lcd_track(int core) {
++		bool on = core ? m->lcd2_on : m->lcd1_on;
++		int mode = core ? m->lcd2_mode : m->lcd1_mode;
++		bool off = !on || mode == 1;
++		if (off != lcd_off_old[core]) lcd_ptr[core] = 0;
++		lcd_off_old[core] = off;
++		bool ce = core ? m->ce2_cpu : m->ce1_cpu;
++		bool en = core ? m->lcd2_clkena : m->lcd1_clkena;
++		if (ce && en && lcd_ptr[core] < 160 * 144) lcd[core][lcd_ptr[core]++] = core ? m->lcd2_data : m->lcd1_data;
++	}
++
++	void write_shot(const std::string &path, int core) {
++		FILE *f = fopen(path.c_str(), "wb");
++		if (!f) { perror(path.c_str()); return; }
++		bool dmg = true;
++		for (uint16_t v : lcd[core]) if (v > 3) dmg = false;
++		fprintf(f, "P6\n160 144\n255\n");
++		for (uint16_t v : lcd[core]) {
++			uint8_t rgb[3];
++			if (dmg) rgb[0] = rgb[1] = rgb[2] = 255 - 85 * (v & 3);
++			else { rgb[0] = (v & 31) << 3; rgb[1] = ((v >> 5) & 31) << 3; rgb[2] = ((v >> 10) & 31) << 3; }
++			fwrite(rgb, 1, 3, f);
++		}
++		fclose(f);
++	}
+ 
+ 	Sample take(int core) {
+ 		Sample s{};
+@@ -103,7 +141,7 @@ struct Side {
+ 		switch (dl_state) {
+ 		case 0:
+ 			m->reset_in = 1;
+-			if (cycles >= start_at) { dl_state = 1; m->ioctl_download = 1; m->ioctl_index = 1; }
++			if (cycles >= start_at) { dl_state = 1; m->ioctl_download = 1; m->ioctl_index = index; }
+ 			break;
+ 		case 1:
+ 			if (!m->ioctl_wait) {
+@@ -120,6 +158,10 @@ struct Side {
+ 			break;
+ 		}
+ 		bool running = dl_state == 3;
++		if (script) {
++			auto it = script->upper_bound(ce1 / CE_PER_FRAME);
++			if (it != script->begin()) { --it; p1 = it->second.first; p2 = it->second.second; }
++		}
+ 		m->joy1 = running ? p1 : 0;
+ 		m->joy2 = running ? p2 : 0;
+ 		if (jitter) m->jitter = (rng() % 3) == 0;
+@@ -135,6 +177,7 @@ struct Side {
+ 		if (collect && running) {
+ 			if (m->ce1_cpu | m->ce1_cpu_n | m->ce1_cpu2x) { q[0].push_back(take(0)); n[0]++; }
+ 			if (m->ce2_cpu | m->ce2_cpu_n | m->ce2_cpu2x) { q[1].push_back(take(1)); n[1]++; }
++			lcd_track(0); lcd_track(1);
+ 			if (m->ce1_cpu) {
+ 				ce1++;
+ 				if (!m->cpu1_rd_n && m->cpu1_addr >= 0x100 && m->cpu1_addr < 0x8000) cart_exec++;
+@@ -171,6 +214,10 @@ int main(int argc, char **argv) {
+ 	uint64_t frames = 60, seed = 1, offset = 12345;
+ 	bool shared = true, freeze = true, jitter = true, quiet = false;
+ 	int p1 = 0, p2 = 0, sys = 0;
++	std::map<uint64_t, std::pair<uint8_t, uint8_t>> script;
++	bool use_script = false;
++	std::set<uint64_t> shots;
++	std::string shot_prefix = "shot";
+ 	for (int i = 2; i < argc; i++) {
+ 		std::string a = argv[i];
+ 		auto next = [&]() { if (i + 1 >= argc) { fprintf(stderr, "%s needs a value\n", a.c_str()); exit(2); } return argv[++i]; };
+@@ -184,19 +231,46 @@ int main(int argc, char **argv) {
+ 		else if (a == "--p2") p2 = strtol(next(), 0, 16);
+ 		else if (a == "--sys") sys = atoi(next());
+ 		else if (a == "--quiet") quiet = true;
++		else if (a == "--script") {
++			FILE *f = fopen(next(), "r");
++			if (!f) { perror("script"); return 2; }
++			char line[256];
++			while (fgets(line, sizeof line, f)) {
++				if (char *h = strchr(line, '#')) *h = 0;
++				unsigned long long fr; unsigned a1, a2;
++				if (sscanf(line, "%llu %x %x", &fr, &a1, &a2) == 3) script[fr] = {(uint8_t)a1, (uint8_t)a2};
++			}
++			fclose(f);
++			use_script = true;
++		}
++		else if (a == "--shot") {
++			std::string v = next();
++			size_t p = 0;
++			while (p < v.size()) { shots.insert(strtoull(v.c_str() + p, 0, 0)); p = v.find(',', p); if (p == std::string::npos) break; p++; }
++		}
++		else if (a == "--shot-prefix") shot_prefix = next();
+ 		else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
+ 	}
+ 	if (!shared) freeze = false;
+ 
++	// the CGB boot ROM is read from build/cgb_boot.hex (relative): run from npsim/
++	if (FILE *f = fopen("build/cgb_boot.hex", "r")) fclose(f);
++	else { fprintf(stderr, "build/cgb_boot.hex not found: run from the npsim directory\n"); return 2; }
+ 	auto *ctx = new VerilatedContext;
+ 	Side A, B;
+ 	A.m = new Vgb2p_side{ctx, "A"}; A.name = "A";
+ 	B.m = new Vgb2p_side{ctx, "B"}; B.name = "B";
+ 	for (Side *s : {&A, &B}) {
+ 		s->rom = load(rom);
++		{
++			std::string r = rom, ext = r.size() >= 4 ? r.substr(r.size() - 4) : "";
++			for (auto &ch : ext) ch = tolower(ch);
++			s->index = ext == ".gbc" ? 0x01 : ext == ".bin" ? 0x81 : 0x41;
++		}
+ 		s->m->shared_ce = shared; s->m->sys_select = sys; s->m->rom_load_gb2 = 0;
+ 		s->m->reset_in = 1; s->m->hold = 0; s->m->jitter = 0;
+ 		s->p1 = p1; s->p2 = p2;
++		if (use_script) s->script = &script;
+ 		s->eval_half(0, 0);
+ 	}
+ 	B.start_at = offset;
+@@ -230,6 +304,10 @@ int main(int argc, char **argv) {
+ 			}
+ 		}
+ 		uint64_t f = A.ce1 / CE_PER_FRAME;
++		if (f != last_frame && shots.count(f)) {
++			for (int c = 0; c < 2; c++)
++				A.write_shot(shot_prefix + "-f" + std::to_string(f) + "-gb" + std::to_string(c + 1) + ".ppm", c);
++		}
+ 		if (!quiet && f != last_frame && f % 30 == 0) {
+ 			printf("frame %llu: compared %llu + %llu samples, B frozen %llu cycles in %llu freezes\n",
+ 			       (unsigned long long)f, (unsigned long long)compared[0], (unsigned long long)compared[1],
+@@ -239,6 +317,7 @@ int main(int argc, char **argv) {
+ 		last_frame = f;
+ 	}
+ 	if (!A.serial_out.empty()) printf("serial (A, core 1): %s\n", A.serial_out.c_str());
++	printf("A: %s mode\n", A.m->isGBC_out ? "GBC" : "DMG");
+ 	printf("A core 1: last CPU address %04x, %llu samples in the cartridge's code (>= 0x100)\n", A.m->cpu1_addr, (unsigned long long)A.cart_exec);
+ 	printf("PASS: %llu frames, %llu + %llu samples identical; B: %llu freezes (%llu cycles), "
+ 	       "jitter %s, start offset %llu, %s clock enable\n",
+-- 
+2.43.0
+

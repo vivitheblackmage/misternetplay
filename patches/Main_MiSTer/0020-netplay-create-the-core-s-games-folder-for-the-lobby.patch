@@ -1,0 +1,46 @@
+From a137afa1729bf33bdb9020cf35f7c0b1cdbbffc6 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 7 Nov 2026 19:00:51 +0100
+Subject: [PATCH] netplay: create the core's games folder for the lobby when it
+ does not exist yet
+---
+ support/netplay/netplay.cpp          | 5 +++++
+ support/netplay/test/udp_harness.cpp | 6 ++----
+ 2 files changed, 7 insertions(+), 4 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index ae9b00a..7021775 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -1424,6 +1424,11 @@ static void server_games_start()
+ 	np_dir = games_root + "/_Netplay";
+ 	games_dir = np_dir + "/Server games";
+ 	rooms_dir = np_dir + "/Rooms";
++	// the core's games folder may not exist yet (a core never used before,
++	// e.g. GAMEBOY2P on a friend's MiSTer): create the whole path
++	for (size_t i = 1; i < games_root.size(); i++)
++		if (games_root[i] == '/') mkdir(games_root.substr(0, i).c_str(), 0755);
++	mkdir(games_root.c_str(), 0755);
+ 	mkdir(np_dir.c_str(), 0755);
+ 	umount2(np_dir.c_str(), MNT_DETACH);          // a RAM folder left over from a crash
+ 	srv_mounted = !mount("tmpfs", np_dir.c_str(), "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=48m,mode=0755");
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index 9c7bb14..8224e0c 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -172,10 +172,8 @@ int main(int argc, char **argv)
+ 	std::string game = std::string("game") + ext;
+ 	if (server)
+ 	{
+-		std::string d = getFullPath("games");
+-		mkdir(d.c_str(), 0755);
+-		d += std::string("/") + sysdir;
+-		mkdir(d.c_str(), 0755);
++		// no games/<core> folder here: netplay_start() must create it (a core
++		// never used before on a friend's MiSTer)
+ 		game = std::string("games/") + sysdir + "/_Netplay/Server games/game" + ext;
+ 		// NP_SAV: the same battery save on both sides, under the game's name. A
+ 		// join from Rooms must look for it there too, or the host refuses it.
+-- 
+2.43.0
+

@@ -8,7 +8,7 @@
 # Main_MiSTer (rebuilt here, it is quick) and the server (server/build.sh when
 # Docker runs, else the existing builds must be newer than the Go files).
 # The binaries stay out of git (releases/ is ignored); the tag <version> in this
-# repo and in NES_MiSTer, SNES_MiSTer and Main_MiSTer marks their source.
+# repo and in NES_MiSTer, SNES_MiSTer, Gameboy2P_MiSTer and Main_MiSTer marks their source.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,15 +23,16 @@ fail() { echo "not released: $*"; exit 1; }
 # SOURCE.txt: where the binaries come from (the public repo's tag, the upstreams)
 write_source() {
 	{
-		echo "NES and SNES netplay $ver, $(date '+%Y-%m-%d')"
+		echo "NES, SNES and Game Boy 2P netplay $ver, $(date '+%Y-%m-%d')"
 		echo
 		echo "Source code: https://github.com/vivitheblackmage/misternetplay, tag $ver"
 		echo "  NES core:    github.com/MiSTer-devel/NES_MiSTer  $(sed -n 's/^NES_BASE=\(.......\).*/\1/p' setup.sh) + patches/NES_MiSTer ($(ls patches/NES_MiSTer/*.patch | wc -l) patches)"
 		echo "  SNES core:   github.com/MiSTer-devel/SNES_MiSTer $(sed -n 's/^SNES_BASE=\(.......\).*/\1/p' setup.sh) + patches/SNES_MiSTer ($(ls patches/SNES_MiSTer/*.patch | wc -l) patches)"
+		echo "  Game Boy 2P: github.com/pomstazlesa/Gameboy2PUW_MiSTer $(sed -n 's/^GB2P_BASE=\(.......\).*/\1/p' setup.sh) + patches/Gameboy2P_MiSTer ($(ls patches/Gameboy2P_MiSTer/*.patch | wc -l) patches)"
 		echo "  Main binary: github.com/MiSTer-devel/Main_MiSTer $(sed -n 's/^MAIN_BASE=\(.......\).*/\1/p' setup.sh) + patches/Main_MiSTer ($(ls patches/Main_MiSTer/*.patch | wc -l) patches)"
 		echo "  Server, tools, NetPong: in the repository itself."
 		echo
-		echo "./setup.sh at that tag recreates both source trees. Licence GPL-3.0."
+		echo "./setup.sh at that tag recreates the source trees. Licence GPL-3.0."
 	} > "$1"
 }
 clean() {   # $1 repo dir; the miniz ChangeLog shows as modified from line endings and is ignored
@@ -42,14 +43,15 @@ clean() {   # $1 repo dir; the miniz ChangeLog shows as modified from line endin
 clean .
 clean NES_MiSTer
 clean SNES_MiSTer
+clean Gameboy2P_MiSTer
 clean Main_MiSTer
-for r in . NES_MiSTer SNES_MiSTer Main_MiSTer; do
+for r in . NES_MiSTer SNES_MiSTer Gameboy2P_MiSTer Main_MiSTer; do
 	git -C "$r" rev-parse -q --verify "refs/tags/$ver" >/dev/null && fail "tag $ver exists in $r"
 done
 
 # patches/ must be what the repos' netplay branches hold
-for r in NES_MiSTer SNES_MiSTer Main_MiSTer; do
-	case $r in NES_MiSTer) var=NES_BASE;; SNES_MiSTer) var=SNES_BASE;; *) var=MAIN_BASE;; esac
+for r in NES_MiSTer SNES_MiSTer Gameboy2P_MiSTer Main_MiSTer; do
+	case $r in NES_MiSTer) var=NES_BASE;; SNES_MiSTer) var=SNES_BASE;; Gameboy2P_MiSTer) var=GB2P_BASE;; *) var=MAIN_BASE;; esac
 	base=$(sed -n "s/^$var=\(.*\)/\1/p" setup.sh)
 	n_repo=$(git -C "$r" rev-list --count "$base..HEAD")
 	n_patch=$(ls patches/"$r"/*.patch | wc -l)
@@ -58,10 +60,10 @@ done
 
 # core: the .rbf must be newer than every tracked source file (not the ones
 # Quartus itself rewrites at the end of a build: .qsf, .cdf, pin dump)
-for core in NES SNES; do
-	rbf=${core}_MiSTer/output_files/$core.rbf
+for core in NES SNES Gameboy2P; do
+	case $core in Gameboy2P) rbf=Gameboy2P_MiSTer/output_files/Gameboy.rbf;; *) rbf=${core}_MiSTer/output_files/$core.rbf;; esac
 	[ -f "$rbf" ] || fail "no $rbf (CORE=$core tools/quartus_build.sh)"
-	newest=$(cd ${core}_MiSTer && git ls-files -z -- . ':!*.md' ':!sim/*' ':!*.qsf' ':!*.cdf' ':!*pin_model_dump.txt' | xargs -0 stat -c '%Y %n' | sort -n | tail -1)
+	newest=$(cd ${core}_MiSTer && git ls-files -z -- . ':!*.md' ':!sim/*' ':!npsim/*' ':!*.qsf' ':!*.cdf' ':!*pin_model_dump.txt' | xargs -0 stat -c '%Y %n' | sort -n | tail -1)
 	[ "${newest%% *}" -le "$(stat -c %Y "$rbf")" ] || fail "$rbf is older than ${newest#* } (rebuild with CORE=$core tools/quartus_build.sh)"
 done
 
@@ -82,6 +84,7 @@ tools/make_kit.sh >/dev/null
 mkdir -p "$out/server"
 cp NES_MiSTer/output_files/NES.rbf "$out/NES_netplay.rbf"
 cp SNES_MiSTer/output_files/SNES.rbf "$out/SNES_netplay.rbf"
+cp Gameboy2P_MiSTer/output_files/Gameboy.rbf "$out/GAMEBOY2P_netplay.rbf"
 cp Main_MiSTer/bin/MiSTer "$out/MiSTer_online"
 cp dist/netplay-kit.zip "$out/"
 cp server/build/netplay-server* server/build/install-linux.sh server/README.md "$out/server/"
@@ -96,7 +99,7 @@ if [ -x tools/check_private.sh ]; then
 	tools/check_private.sh "$out" || { rm -rf "$out"; fail "private data in the release (see above)"; }
 fi
 
-for r in . NES_MiSTer SNES_MiSTer Main_MiSTer; do git -C "$r" tag -a "$ver" -m "NES and SNES netplay $ver"; done
+for r in . NES_MiSTer SNES_MiSTer Gameboy2P_MiSTer Main_MiSTer; do git -C "$r" tag -a "$ver" -m "NES, SNES and Game Boy 2P netplay $ver"; done
 echo "releases/$ver:"
 (cd "$out" && find . -type f | sort | sed 's|^\./|  |')
-echo "Tagged $ver in this repo, NES_MiSTer, SNES_MiSTer and Main_MiSTer."
+echo "Tagged $ver in this repo, NES_MiSTer, SNES_MiSTer, Gameboy2P_MiSTer and Main_MiSTer."

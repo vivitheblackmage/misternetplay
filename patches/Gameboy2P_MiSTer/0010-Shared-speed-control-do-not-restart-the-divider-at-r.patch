@@ -1,0 +1,62 @@
+From 3ef3bd8cb0466cd4b1af8f7c1988897e2a101ca7 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 7 Nov 2026 23:32:13 +0100
+Subject: [PATCH] Shared speed control: do not restart the divider at reset
+ fall, wait for its ce phase (keeps the SDRAM phase; bad sound after some
+ resets)
+---
+ rtl/speedcontrol_shared.sv | 24 +++++++++++++-----------
+ 1 file changed, 13 insertions(+), 11 deletions(-)
+
+diff --git a/rtl/speedcontrol_shared.sv b/rtl/speedcontrol_shared.sv
+index 1d46106..9c65d62 100644
+--- a/rtl/speedcontrol_shared.sv
++++ b/rtl/speedcontrol_shared.sv
+@@ -5,10 +5,15 @@
+ // waits for the SDRAM, while `hold` is 1 (the netplay freeze), and while either
+ // pausevideo is 1. Both cores therefore see the same ce, ce_n and ce_2x on
+ // every clk_sys, and SDRAM latency only changes wall-clock time, never the
+-// order of events between the two cores. The divider restarts when reset
+-// falls (the first clock after reset is a `ce`), so the phase after reset
+-// does not depend on when reset was released. During reset it runs as
+-// upstream (the ROM download's write handshake uses ce_2x).
++// order of events between the two cores. After reset falls, no enable is
++// given until the divider itself reaches its `ce` phase (clkdiv 000), so the
++// first enable after reset is always a `ce` (deterministic for netplay) and
++// the divider keeps running as upstream: its phase mod 4, and with it ce_2x,
++// stays locked to the SDRAM controller's divider (the waits below keep it
++// too). Restarting the divider at reset fall instead put ROM reads at a
++// random SDRAM phase on every reset: slower than real time, bad sound.
++// During reset it runs as upstream (the ROM download's write handshake uses
++// ce_2x).
+ module speedcontrol_shared
+ (
+ 	input      clk_sys,
+@@ -32,8 +37,7 @@ reg       reset_r = 1;
+ always @(negedge clk_sys) begin
+ 	reg skip;
+ 
+-	// a freeze right after reset keeps the restart pending
+-	reset_r <= reset | (reset_r & (pausevideo | hold));
++	if (reset) reset_r <= 1;
+ 
+ 	ce    <= 0;
+ 	ce_n  <= 0;
+@@ -49,11 +53,9 @@ always @(negedge clk_sys) begin
+ 		wait1  <= 0;
+ 		wait2  <= 0;
+ 	end else if (reset_r) begin
+-		// first clock after reset: phase 0, as clkdiv == 000
+-		ce     <= 1;
+-		ce_n   <= 0;
+-		ce_2x  <= 1;
+-		clkdiv <= 3'b001;
++		// wait for the divider's own ce phase; a freeze keeps waiting
++		if (clkdiv == 3'b000 && !(pausevideo | hold)) reset_r <= 0;
++		else skip = 1;
+ 	end else begin
+ 		if (!wait1) begin
+ 			if (romread1) wait1 <= 1;
+-- 
+2.43.0
+

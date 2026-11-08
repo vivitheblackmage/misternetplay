@@ -1,0 +1,488 @@
+From 4a11861edd51d368fefca18678a7cf7981f562ad Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 7 Nov 2026 18:03:07 +0100
+Subject: [PATCH] netplay: Game Boy 2P through the server (two-game rooms,
+ names with extension) and the game extensions in the settings
+---
+ support/netplay/netplay.cpp           | 149 +++++++++++++++++++-------
+ support/netplay/netplay_proto.cpp     |   4 +-
+ support/netplay/netplay_proto.h       |   2 +
+ support/netplay/test/Makefile         |   6 +-
+ support/netplay/test/run_udp_test.sh  |  11 +-
+ support/netplay/test/test_netplay.cpp |  11 +-
+ support/netplay/test/udp_harness.cpp  |  36 +++++--
+ 7 files changed, 160 insertions(+), 59 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 32fa277..ae9b00a 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -247,7 +247,7 @@ struct ServerReg
+ 	uint8_t md5[16];
+ 	bool two;                // Game Boy 2P with two games: md5b follows md5 (64 hex digits)
+ 	uint8_t md5b[16];
+-	char game[81];
++	char game[200];          // Game Boy 2P with two games: "<game 1> + <game 2>"
+ };
+ 
+ class Udp : public Transport
+@@ -545,8 +545,8 @@ private:
+ 	bool server_ = false, host_ = false, registered_ = false, left_ = false;
+ 	sockaddr_in srv_ {};
+ 	uint64_t t_reg_ = 0;
+-	char reg_[400] = {}, key_[64] = {}, room_[17] = {};
+-	char name_[17] = {}, local_[32] = {}, core_[16] = {}, game_[81] = {};
++	char reg_[600] = {}, key_[64] = {}, room_[17] = {};
++	char name_[17] = {}, local_[32] = {}, core_[16] = {}, game_[200] = {};
+ 	std::string md5_;
+ 	bool session_rx_ = false;              // a session packet arrived: the pairing is settled
+ 
+@@ -703,13 +703,15 @@ static void random_id(char *out, size_t cap)
+ 	snprintf(out, cap, "%08x", v);
+ }
+ 
+-// The game's name for the lobby: the file name without folder and extension
++// The game's name for the lobby: the file name without folder and extension.
++// Game Boy 2P keeps the extension: it picks GBC or DMG mode, so a join's room
++// files must have the host's (SPEC.md 11.5).
+ static void game_name(const std::string &path, char *out, size_t cap)
+ {
+ 	size_t s = path.rfind('/');
+ 	std::string n = path.substr(s == std::string::npos ? 0 : s + 1);
+ 	size_t d = n.rfind('.');
+-	if (d != std::string::npos && d) n.resize(d);
++	if (d != std::string::npos && d && core_sys != SYS_GB2P) n.resize(d);
+ 	size_t k = 0;
+ 	for (unsigned char c : n)
+ 		if (c >= 0x20 && c < 0x7F && k + 1 < cap) out[k++] = (char)c;
+@@ -798,8 +800,8 @@ static void *netplay_thread(void *)
+ 					// "<game 1> + <game 2>" (SPEC.md 11.5)
+ 					char g2[81];
+ 					game_name(path2, g2, sizeof(g2));
+-					std::string both = std::string(r.game) + " + " + g2;
+-					snprintf(r.game, sizeof(r.game), "%.80s", both.c_str());
++					std::string both = std::string(r.game).substr(0, 80) + " + " + g2;
++					snprintf(r.game, sizeof(r.game), "%s", both.c_str());
+ 				}
+ 				lobby_host(r.host ? r.room : "");
+ 				udp = new Udp();
+@@ -1166,7 +1168,9 @@ static std::mutex         cat_mtx;                // catalog, srv_games
+ static std::map<std::string, std::string> catalog;    // md5 hex -> name (server games and bring-your-own)
+ static std::map<std::string, std::string> srv_games;  // md5 hex -> file in games_dir
+ 
+-struct RoomFile { std::string id, md5; };
++// A room: its id and md5 (Game Boy 2P with two games: 64 hex digits), and the
++// file names in its folder (file2 only for two games)
++struct RoomFile { std::string id, md5, file1, file2; };
+ static std::mutex                       lobby_mtx;    // the fields below
+ static std::map<std::string, RoomFile>  room_files;   // file name in rooms_dir -> room
+ static std::string                      pinned_entry; // the room (entry in rooms_dir) of the session we joined
+@@ -1252,7 +1256,7 @@ static void remove_entry(const std::string &full)
+ // Make rooms_dir match the server's list of waiting rooms.
+ static void update_rooms(const std::string &list)
+ {
+-	struct Want { RoomFile room; std::string src, file; };
++	struct Want { RoomFile room; std::string src, src2; };
+ 	std::map<std::string, Want> want;               // entry name -> what it should be
+ 	std::string mine, pinned;
+ 	{
+@@ -1274,43 +1278,69 @@ static void update_rooms(const std::string &list)
+ 		for (char c : line)
+ 		{
+ 			if (c == '\t') { if (++k >= 8) break; }
+-			else if (f[k].size() < 100) f[k] += c;
++			else if (f[k].size() < 200) f[k] += c;
+ 		}
+-		if (k != 6 || !is_hex(f[0], 8) || f[1] != "waiting" || strcasecmp(f[2].c_str(), srv_core.c_str()) || !is_hex(f[3], 32)) continue;
++		bool two = core_sys == SYS_GB2P && is_hex(f[3], 64);
++		if (k != 6 || !is_hex(f[0], 8) || f[1] != "waiting" || strcasecmp(f[2].c_str(), srv_core.c_str()) || !(two || is_hex(f[3], 32))) continue;
+ 		if (f[0] == mine) continue;
+ 		count++;
+ 
+ 		char nm[17];
+ 		clean_name(f[4].c_str(), nm, sizeof(nm));
+-		std::string game = clean_file(f[5], 80);
++		std::string game = clean_file(f[5], two ? 170 : 80);
+ 		if (game.empty()) game = "game";
+ 		std::string base = clean_file(std::string(*nm ? nm : "player") + " - " + game, 70);
+-		std::string src;
++		// Game Boy 2P with two games: "<game 1> + <game 2>" and md5 + md5 (SPEC.md 11.5)
++		std::string md5a = f[3].substr(0, 32), md5b = two ? f[3].substr(32) : "";
++		std::string game1 = game, game2;
++		if (two)
+ 		{
+-			std::lock_guard<std::mutex> g(cat_mtx);
+-			auto s = srv_games.find(f[3]);
+-			if (s != srv_games.end()) src = s->second;
+-		}
+-		if (src.empty())
+-		{
+-			std::lock_guard<std::mutex> g(idx_mtx);
+-			auto s = idx_by_md5.find(f[3]);
+-			if (s != idx_by_md5.end()) src = s->second;
++			size_t plus = game.rfind(" + ");
++			game1 = plus != std::string::npos && plus ? clean_file(game.substr(0, plus), 80) : "game 1";
++			game2 = plus != std::string::npos ? clean_file(game.substr(plus + 3), 80) : "game 2";
++			if (game1.empty()) game1 = "game 1";
++			if (game2.empty() || game2 == game1) game2 = game1 + " (2)";
+ 		}
+-		if (!src.empty() && copy_failed.count(f[3])) src.clear();
+-		// The room is a folder with the game under the host's file name, so the
+-		// core's .sav is saves/<core>/<game>.sav on both sides.
++		auto find_src = [](const std::string &md5) {
++			std::string src;
++			{
++				std::lock_guard<std::mutex> g(cat_mtx);
++				auto s = srv_games.find(md5);
++				if (s != srv_games.end()) src = s->second;
++			}
++			if (src.empty())
++			{
++				std::lock_guard<std::mutex> g(idx_mtx);
++				auto s = idx_by_md5.find(md5);
++				if (s != idx_by_md5.end()) src = s->second;
++			}
++			if (!src.empty() && copy_failed.count(md5)) src.clear();
++			return src;
++		};
++		std::string src = find_src(md5a), src2 = two ? find_src(md5b) : "";
++		bool missing = src.empty() || (two && src2.empty());
++		// The room is a folder with the game(s) under the host's file names, so
++		// the core's .sav is saves/<core>/<game>.sav on both sides.
+ 		std::string entry;
+ 		for (int n = 1; n < 10; n++)
+ 		{
+ 			std::string b = n == 1 ? base : base + " (" + std::to_string(n) + ")";
+-			entry = src.empty() ? b + " (missing game)" : b;
++			entry = missing ? b + " (missing game)" : b;
+ 			if (!want.count(entry)) break;
+ 		}
+-		size_t sdot = src.rfind('.');
+-		std::string ext = (sdot != std::string::npos && is_game_ext(src.c_str() + sdot)) ? src.substr(sdot)
+-		                : (core_sys == SYS_SNES ? ".sfc" : core_sys == SYS_GB2P ? ".gb" : ".nes");
+-		want[entry] = Want { RoomFile { f[0], f[3] }, src, game + ext };
++		auto ext_of = [](const std::string &path) {
++			size_t d = path.rfind('.');
++			if (d != std::string::npos && is_game_ext(path.c_str() + d)) return path.substr(d);
++			return std::string(core_sys == SYS_SNES ? ".sfc" : core_sys == SYS_GB2P ? ".gb" : ".nes");
++		};
++		if (missing) src.clear(), src2.clear();
++		// Game Boy 2P names carry the host's extension; others get the local one
++		auto file_of = [&](const std::string &g, const std::string &s) {
++			size_t d = g.rfind('.');
++			if (core_sys == SYS_GB2P && d != std::string::npos && d && is_game_ext(g.c_str() + d)) return g;
++			return g + ext_of(s);
++		};
++		want[entry] = Want { RoomFile { f[0], f[3], file_of(game1, src), two ? file_of(game2, src2) : "" }, src, src2 };
+ 	}
+ 
+ 	// remove what is no longer wanted (or no longer the same room)
+@@ -1343,9 +1373,14 @@ static void update_rooms(const std::string &list)
+ 		if (now.count(w.first)) continue;
+ 		std::string full = rooms_dir + "/" + w.first;
+ 		if (mkdir(full.c_str(), 0755)) continue;
+-		if (!w.second.src.empty() && !copy_file(w.second.src, full + "/" + w.second.file))
++		const RoomFile &rf = w.second.room;
++		bool fail1 = !w.second.src.empty() && !copy_file(w.second.src, full + "/" + rf.file1);
++		bool fail2 = !fail1 && !w.second.src2.empty() && !copy_file(w.second.src2, full + "/" + rf.file2);
++		if (fail1 || fail2)
+ 		{
+-			copy_failed.insert(w.second.room.md5);   // RAM folder full: show it as missing from now on
++			// RAM folder full: show it as missing from now on
++			copy_failed.insert(rf.md5.substr(0, 32));
++			if (rf.md5.size() == 64) copy_failed.insert(rf.md5.substr(32));
+ 			remove_entry(full);
+ 			continue;
+ 		}
+@@ -1572,6 +1607,13 @@ static bool has_ext(const std::string &name, const char *ext)
+ 	return d != std::string::npos && !strcasecmp(name.c_str() + d, ext);
+ }
+ 
++// The OSD index byte the core gets for a game file: slot 1, extension number
++// from "FS1,GBCGB BIN" (GBC 0, GB 1, BIN 2) in bits 7:6
++static unsigned char gb_index(const std::string &name)
++{
++	return has_ext(name, ".gbc") ? 0x01 : has_ext(name, ".bin") ? 0x81 : 0x41;
++}
++
+ static void begin_session(const char *name, unsigned char index, char opensave);
+ 
+ void netplay_note_file(const char *name, unsigned char index, char opensave)
+@@ -1618,8 +1660,11 @@ void netplay_note_file(const char *name, unsigned char index, char opensave)
+ }
+ 
+ // A game load (or, Game Boy 2P, a boot ROM load): a new session with the current game(s)
+-static void begin_session(const char *name, unsigned char index, char opensave)
++static void begin_session(const char *name_in, unsigned char index, char opensave)
+ {
++	// a copy: name_in may point into gb_rom2, which this function changes
++	std::string name_copy = name_in;
++	const char *name = name_copy.c_str();
+ 
+ 	// OSD "Netplay" (NES [89:88], SNES [59:58], Game Boy 2P [47:46]): 0 netplay.ini, 1 Off, 2 Host, 3 Join
+ 	static const Mode osd_modes[4] = { M_OFF, M_OFF, M_HOST, M_JOIN };
+@@ -1636,7 +1681,21 @@ static void begin_session(const char *name, unsigned char index, char opensave)
+ 			std::lock_guard<std::mutex> g(info_mtx);
+ 			seq = rom_seq + 1;               // this load's rom_seq, below
+ 		}
+-		if (osd != 1 && room_of(full, seq, &rf)) { mode = M_JOIN; room = rf.id; }
++		if (osd != 1 && room_of(full, seq, &rf))
++		{
++			mode = M_JOIN;
++			room = rf.id;
++			// Game Boy 2P: whichever file was loaded, the session plays the room's pair
++			if (core_sys == SYS_GB2P)
++			{
++				std::string dir = name_copy.substr(0, name_copy.rfind('/') + 1);
++				const std::string &f2 = rf.file2.empty() ? rf.file1 : rf.file2;
++				gb_rom1 = dir + rf.file1;
++				gb_rom2 = dir + f2;
++				gb_idx1 = gb_index(rf.file1);
++				gb_idx2 = gb_index(f2);
++			}
++		}
+ 		else if (osd != 1 && in_rooms(full))
+ 		{
+ 			post_message("Netplay: that room is gone");
+@@ -1656,9 +1715,15 @@ static void begin_session(const char *name, unsigned char index, char opensave)
+ 	uint8_t hdr[16] = {};
+ 	if (core_sys == SYS_GB2P && !gb_rom1.empty())
+ 	{
+-		if (!md5_file(gb_rom1.c_str(), li.rom_md5, nullptr, 0)) return;
+-		if (gb_rom2 == gb_rom1) memcpy(li.rom2_md5, li.rom_md5, 16);
+-		else if (!md5_file(gb_rom2.c_str(), li.rom2_md5, nullptr, 0)) return;
++		bool ok1 = md5_file(gb_rom1.c_str(), li.rom_md5, nullptr, 0);
++		if (ok1 && gb_rom2 == gb_rom1) memcpy(li.rom2_md5, li.rom_md5, 16);
++		else if (!ok1 || !md5_file(gb_rom2.c_str(), li.rom2_md5, nullptr, 0))
++		{
++			// e.g. game 1 was in a room folder that is gone by now
++			post_message(ok1 ? "Netplay: cannot read game 2" : "Netplay: cannot read game 1, load it again");
++			if (!ok1) gb_rom1.clear();
++			return;
++		}
+ 	}
+ 	else if (!md5_file(name, li.rom_md5, hdr, sizeof(hdr))) return;
+ 	if (core_sys != SYS_GB2P) memcpy(li.rom2_md5, li.rom_md5, 16);
+@@ -1674,9 +1739,11 @@ static void begin_session(const char *name, unsigned char index, char opensave)
+ 	else li.rom_region = rom_region_from_header(hdr, sizeof(hdr), dot ? dot + 1 : "");
+ 	core_build(li.core_build);
+ 
+-	// .sav next to the other saves, same base name
+-	const char *base = strrchr(name, '/');
+-	std::string sav = std::string("saves/") + core_name + "/" + (base ? base + 1 : name);
++	// .sav next to the other saves, same base name (Game Boy 2P: of the last
++	// game loaded, gb2's, as the core mounts it)
++	const char *savname = core_sys == SYS_GB2P && !gb_rom2.empty() ? gb_rom2.c_str() : name;
++	const char *base = strrchr(savname, '/');
++	std::string sav = std::string("saves/") + core_name + "/" + (base ? base + 1 : savname);
+ 	size_t d = sav.rfind('.');
+ 	if (d != std::string::npos) sav.resize(d);
+ 	sav += ".sav";
+@@ -1691,6 +1758,8 @@ static void begin_session(const char *name, unsigned char index, char opensave)
+ 		li.gb.fast_boot  = (uint8_t)user_io_status_get("[42]");
+ 		li.gb.audio_mode = (uint8_t)user_io_status_get("[43]");
+ 		li.gb.dupe_save  = (uint8_t)user_io_status_get("[11]");
++		li.gb.ext1       = gb_idx1 >> 6;
++		li.gb.ext2       = gb_idx2 >> 6;
+ 		gb_boot_md5(li.boot_md5);
+ 		li.rtc_time = local_unix_time();
+ 	}
+diff --git a/support/netplay/netplay_proto.cpp b/support/netplay/netplay_proto.cpp
+index 8bdb5ea..23558df 100644
+--- a/support/netplay/netplay_proto.cpp
++++ b/support/netplay/netplay_proto.cpp
+@@ -69,7 +69,9 @@ uint32_t pack_settings(const GbSettings &s)
+ 	     | (uint32_t)(s.gba_mode & 1) << 6
+ 	     | (uint32_t)(s.fast_boot & 1) << 7
+ 	     | (uint32_t)(s.audio_mode & 1) << 8
+-	     | (uint32_t)(s.dupe_save & 1) << 9;
++	     | (uint32_t)(s.dupe_save & 1) << 9
++	     | (uint32_t)(s.ext1 & 3) << 10
++	     | (uint32_t)(s.ext2 & 3) << 12;
+ }
+ 
+ uint32_t pack_settings(const SnesSettings &s)
+diff --git a/support/netplay/netplay_proto.h b/support/netplay/netplay_proto.h
+index b3068a9..19dfd4c 100644
+--- a/support/netplay/netplay_proto.h
++++ b/support/netplay/netplay_proto.h
+@@ -120,6 +120,8 @@ struct GbSettings
+ 	uint8_t fast_boot;     // status [42]
+ 	uint8_t audio_mode;    // status [43] Accurate / No Pops
+ 	uint8_t dupe_save;     // status [11] Dupe Save to GB 2
++	uint8_t ext1, ext2;    // extension number of game 1 and 2 (index byte bits 7:6: GBC 0, GB 1, BIN 2):
++	                       // with System Auto the extension picks GBC or DMG mode
+ };
+ 
+ uint32_t pack_settings(const GbSettings &s);
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index ce73670..3f3cf7b 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -25,7 +25,11 @@ test: test_netplay udp_harness
+ 	  NP_SERVER_BIN=$$srv NP_SAV=1 ./run_udp_test.sh && \
+ 	  NP_SYSTEM=snes NP_SERVER_BIN=$$srv ./run_udp_test.sh && \
+ 	  NP_SYSTEM=snes NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
+-	  NP_SYSTEM=snes NP_SERVER_BIN=$$srv NP_SAV=1 ./run_udp_test.sh; \
++	  NP_SYSTEM=snes NP_SERVER_BIN=$$srv NP_SAV=1 ./run_udp_test.sh && \
++	  NP_SYSTEM=gb2p NP_SERVER_BIN=$$srv ./run_udp_test.sh && \
++	  NP_SYSTEM=gb2p NP_TWO=1 NP_SERVER_BIN=$$srv ./run_udp_test.sh && \
++	  NP_SYSTEM=gb2p NP_TWO=1 NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
++	  NP_SYSTEM=gb2p NP_TWO=1 NP_SERVER_BIN=$$srv NP_SAV=1 ./run_udp_test.sh; \
+ 	else echo "SKIP udp (server): build it with server/build.sh"; fi
+ 
+ test_netplay: $(ENGINE) test_netplay.cpp $(HDRS)
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+index 02e2c9e..4a5b9e3 100755
+--- a/support/netplay/test/run_udp_test.sh
++++ b/support/netplay/test/run_udp_test.sh
+@@ -18,6 +18,7 @@ esac
+ if [ -n "${NP_SERVER_BIN:-}" ]; then
+ 	mkdir -p "$tmp/srv/roms/$sysdir"
+ 	"$bin" makerom "$tmp/srv/roms/$sysdir/game.$ext"
++	[ -n "${NP_TWO:-}" ] && "$bin" makerom "$tmp/srv/roms/$sysdir/game2.$ext" 1
+ 	printf 'port=47846\nkey=testkey\nroms=roms\n' > "$tmp/srv/netplay-server.ini"
+ 	"$NP_SERVER_BIN" -config "$tmp/srv/netplay-server.ini" > "$tmp/server.log" 2>&1 &
+ 	sp=$!
+@@ -54,7 +55,13 @@ if [ $ok -eq 1 ] && [ -n "${NP_SERVER_BIN:-}" ]; then
+ 	grep -q "playing with Joinor" "$tmp/host.log" || { echo "host: name of join missing"; ok=0; }
+ 	grep -q "playing with Par..Host" "$tmp/join.log" || { echo "join: name of host missing"; ok=0; }
+ 	if [ -z "${NP_AUTOJOIN:-}" ]; then
+-		grep -q "room file: Par..Host - game/game.$ext" "$tmp/join.log" || { echo "join: room file name"; ok=0; }
++		# Game Boy 2P room names keep the extension (it picks GBC or DMG mode)
++		if [ "${NP_SYSTEM:-}" = gb2p ]; then g1=game.$ext g2=game2.$ext; else g1=game g2=game2; fi
++		if [ -n "${NP_TWO:-}" ]; then
++			grep -qE "room file: Par..Host - $g1 \+ $g2/game2?\.$ext" "$tmp/join.log" || { echo "join: room file name"; ok=0; }
++		else
++			grep -q "room file: Par..Host - $g1/game.$ext" "$tmp/join.log" || { echo "join: room file name"; ok=0; }
++		fi
+ 	fi
+ fi
+ if [ $ok -eq 1 ]; then
+@@ -63,5 +70,5 @@ if [ $ok -eq 1 ]; then
+ 	exit 0
+ fi
+ echo "FAIL $label (logs in $tmp)"
+-tail -20 "$tmp/host.log" "$tmp/join.log" ${NP_SERVER_BIN:+"$tmp/server.log"}
++tail -n 20 "$tmp/host.log" "$tmp/join.log" ${NP_SERVER_BIN:+"$tmp/server.log"}
+ exit 1
+diff --git a/support/netplay/test/test_netplay.cpp b/support/netplay/test/test_netplay.cpp
+index aca3cf0..c3afa32 100644
+--- a/support/netplay/test/test_netplay.cpp
++++ b/support/netplay/test/test_netplay.cpp
+@@ -654,15 +654,16 @@ static void test_gb2p_settings()
+ 	s.system = 0; CHECK(check_local(s, 1, 3) == REJ_SYSTEM);    // a .bin (MegaDuck) cart
+ 	CHECK(check_local(s, 0, 16) == REJ_DELAY);
+ 	GbSettings base {};
+-	uint32_t seen[8];
+-	GbSettings v[7] = {};
++	uint32_t seen[10];
++	GbSettings v[9] = {};
+ 	v[0].system = 1; v[1].mapper = 4; v[2].extra_spr = 1; v[3].gba_mode = 1;
+ 	v[4].fast_boot = 1; v[5].audio_mode = 1; v[6].dupe_save = 1;
+-	seen[7] = pack_settings(base);
+-	for (int i = 0; i < 7; i++)
++	v[7].ext1 = 1; v[8].ext2 = 1;                 // .gb (DMG) vs .gbc (GBC) with System Auto
++	seen[9] = pack_settings(base);
++	for (int i = 0; i < 9; i++)
+ 	{
+ 		seen[i] = pack_settings(v[i]);
+-		CHECKM(seen[i] != seen[7], "setting %d does not change the packed value", i);
++		CHECKM(seen[i] != seen[9], "setting %d does not change the packed value", i);
+ 		for (int j = 0; j < i; j++) CHECK(seen[i] != seen[j]);
+ 	}
+ }
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index fa7c8de..9c7bb14 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -185,14 +185,16 @@ int main(int argc, char **argv)
+ 			mkdir(sv.c_str(), 0755);
+ 			sv += std::string("/") + sysdir;
+ 			mkdir(sv.c_str(), 0755);
+-			FILE *s = fopen((sv + "/game.sav").c_str(), "wb");
++			// two games: the .sav is gb2's game's, whichever file a join loads
++			FILE *s = fopen((sv + (two ? "/game2.sav" : "/game.sav")).c_str(), "wb");
+ 			for (int i = 0; i < 8192; i++) fputc((i * 13) & 0xFF, s);
+ 			fclose(s);
+ 		}
+ 	}
+ 	else make_rom(getFullPath(game.c_str()));
+ 	std::string game2 = std::string("game2") + ext;
+-	if (two && !server) make_rom(getFullPath(game2.c_str()), 1);
++	if (two && server) game2 = std::string("games/") + sysdir + "/_Netplay/Server games/game2" + ext;
++	else if (two) make_rom(getFullPath(game2.c_str()), 1);
+ 
+ 	fpga = new FakeFpga(host ? 0 : 1, gb2p ? SYS_GB2P : snes ? SYS_SNES : SYS_NES);
+ 	if (gb2p)
+@@ -207,8 +209,9 @@ int main(int argc, char **argv)
+ 	{
+ 		uint64_t t = now_ms();
+ 		struct stat st;
+-		while (stat(getFullPath(game.c_str()), &st) && now_ms() - t < 10000) { netplay_poll(); usleep(10000); }
+-		if (stat(getFullPath(game.c_str()), &st)) { printf("[harness] no game from the server\n"); return 1; }
++		auto missing = [&] { return stat(getFullPath(game.c_str()), &st) || (two && stat(getFullPath(game2.c_str()), &st)); };
++		while (missing() && now_ms() - t < 10000) { netplay_poll(); usleep(10000); }
++		if (missing()) { printf("[harness] no game from the server\n"); return 1; }
+ 		netplay_poll();
+ 	}
+ 	if (server && !host && !autojoin)          // pick the host's room
+@@ -229,8 +232,8 @@ int main(int argc, char **argv)
+ 					{
+ 						while (dirent *x = readdir(g))
+ 						{
+-							size_t l = strlen(x->d_name);
+-							if (l > 4 && !strcmp(x->d_name + l - 4, ext)) pick = std::string(e->d_name) + "/" + x->d_name;
++							size_t l = strlen(x->d_name), el = strlen(ext);
++							if (l > el && !strcmp(x->d_name + l - el, ext)) pick = std::string(e->d_name) + "/" + x->d_name;
+ 						}
+ 						closedir(g);
+ 					}
+@@ -239,6 +242,15 @@ int main(int argc, char **argv)
+ 			}
+ 		}
+ 		if (pick.empty()) { printf("[harness] no room in the lobby\n"); return 1; }
++		// two games: wait until both files are in the room's folder
++		for (uint64_t t = now_ms(); two && now_ms() - t < 5000; usleep(10000))
++		{
++			netplay_poll();
++			std::string dir = rooms + "/" + pick.substr(0, pick.rfind('/'));
++			int n = 0;
++			if (DIR *g = opendir(dir.c_str())) { while (dirent *x = readdir(g)) if (x->d_name[0] != '.') n++; closedir(g); }
++			if (n >= 2) break;
++		}
+ 		printf("[harness] room file: %s\n", pick.c_str());
+ 		game = std::string("games/") + sysdir + "/_Netplay/Rooms/" + pick;
+ 	}
+@@ -252,12 +264,16 @@ int main(int argc, char **argv)
+ 	}
+ 	netplay_note_file("palette.pal", 3, 0);    // a custom palette must not start a session
+ 	if (gb2p) status6 = 0;
+-	netplay_note_file(game.c_str(), 1, 1);
+-	if (two)
++	// the index byte Main sends: slot 1, extension number in bits 7:6 (GB2P "GBCGB BIN": .gb = 1)
++	netplay_note_file(game.c_str(), gb2p ? 0x41 : 1, 1);
++	// two games: game 2 into gb2; a join from a room loads only one file of it
++	bool from_room = server && !host && !autojoin;
++	if (two && !from_room)
+ 	{
+-		status6 = 1;                           // game 2 into gb2
++		status6 = 1;
+ 		netplay_note_file(game2.c_str(), 0x41, 1);
+ 	}
++	uint32_t status6_user = status6;
+ 
+ 	uint64_t t0 = now_ms();
+ 	while (fpga->frame < want && now_ms() - t0 < 60000)
+@@ -287,7 +303,7 @@ int main(int argc, char **argv)
+ 		// the reloads: game 1 with [6]=0, game 2 with [6]=1 and the .sav, [6] restored
+ 		std::string expect = two ? "game.gb:0:0,game2.gb:1:1" : "game.gb:0:1";
+ 		if (loads != expect) { printf("[harness] reloads %s, expected %s\n", loads.c_str(), expect.c_str()); gb_ok = false; }
+-		if (status6 != (two ? 1u : 0u)) { printf("[harness] [6] not restored\n"); gb_ok = false; }
++		if (status6 != status6_user) { printf("[harness] [6] not restored\n"); gb_ok = false; }
+ 		if (fpga->join != !host) { printf("[harness] CTRL[2] %d on the %s\n", fpga->join, host ? "host" : "join"); gb_ok = false; }
+ 		// the timestamp joins the digest: both sides must send the host's
+ 		digest = (digest ^ timestamp) * 1099511628211ULL;
+-- 
+2.43.0
+

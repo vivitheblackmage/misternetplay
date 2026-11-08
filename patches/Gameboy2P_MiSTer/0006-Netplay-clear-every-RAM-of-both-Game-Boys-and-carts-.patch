@@ -1,0 +1,215 @@
+From eb54523ebbae1f264f91e277139505a61c877e0e Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 7 Nov 2026 20:33:57 +0100
+Subject: [PATCH] Netplay: clear every RAM of both Game Boys and carts when a
+ session starts (games that read RAM before writing it, e.g. Tennis)
+---
+ rtl/gb.v            | 38 +++++++++++++++++++++----------------
+ rtl/gb2p_machine.sv | 46 +++++++++++++++++++++++++++++++++++----------
+ 2 files changed, 58 insertions(+), 26 deletions(-)
+
+diff --git a/rtl/gb.v b/rtl/gb.v
+index 75621dd..2be24b0 100644
+--- a/rtl/gb.v
++++ b/rtl/gb.v
+@@ -21,6 +21,8 @@
+ 
+ module gb (
+    input reset,
++   input        ram_clr,        // netplay: write 0 to every RAM at ram_clr_addr (port B)
++   input [16:0] ram_clr_addr,
+    
+ 	input clk_sys,
+ 	input ce,
+@@ -132,6 +134,10 @@ wire [7:0] Savestate_RAMWriteData;
+ wire [7:0] Savestate_RAMReadData_WRAM, Savestate_RAMReadData_VRAM, Savestate_RAMReadData_ORAM, Savestate_RAMReadData_ZRAM;
+ wire [19:0] Savestate_RAMAddr;
+ wire [4:0] Savestate_RAMRWrEn;
++// netplay (SPEC.md 11.2): the RAM clear uses the savestate port of each RAM
++wire [19:0] ss_ram_addr = ram_clr ? {3'd0, ram_clr_addr} : Savestate_RAMAddr;
++wire  [4:0] ss_ram_wren = ram_clr ? 5'b01111 : Savestate_RAMRWrEn;
++wire  [7:0] ss_ram_data = ram_clr ? 8'd0 : Savestate_RAMWriteData;
+ 
+ localparam SAVESTATE_MODULES    = 8;
+ wire [63:0] SaveStateBus_wired_or[0:SAVESTATE_MODULES-1];
+@@ -727,9 +733,9 @@ video video (
+ 	.extra_spr_en( extra_spr_en  ),
+ 	.extra_wait  ( (isGBC & hdma_rd) | dma_rd | sel_vram ),
+    
+-   .Savestate_OAMRAMAddr      (Savestate_RAMAddr[7:0]),
+-   .Savestate_OAMRAMRWrEn     (Savestate_RAMRWrEn[2]),
+-   .Savestate_OAMRAMWriteData (Savestate_RAMWriteData),
++   .Savestate_OAMRAMAddr      (ss_ram_addr[7:0]),
++   .Savestate_OAMRAMRWrEn     (ss_ram_wren[2]),
++   .Savestate_OAMRAMWriteData (ss_ram_data),
+    .Savestate_OAMRAMReadData  (Savestate_RAMReadData_ORAM),
+ 	
+ 	.SaveStateBus_Din  (SaveStateBus_Din ), 
+@@ -764,9 +770,9 @@ dpram #(13) vram0 (
+ 	.q_a       (vram_do  ),
+ 	
+ 	.clock_b   (clk_sys),
+-	.address_b (Savestate_RAMAddr[12:0]),
+-	.wren_b    (Savestate_RAMRWrEn[1] & !Savestate_RAMAddr[13]),
+-	.data_b    (Savestate_RAMWriteData),
++	.address_b (ss_ram_addr[12:0]),
++	.wren_b    (ss_ram_wren[1] & !ss_ram_addr[13]),
++	.data_b    (ss_ram_data),
+ 	.q_b       (Savestate_RAMReadData_VRAM0)
+ );
+ 
+@@ -779,13 +785,13 @@ dpram #(13) vram1 (
+ 	.q_a       (vram1_do  ),
+ 	
+ 	.clock_b   (clk_sys),
+-	.address_b (Savestate_RAMAddr[12:0]),
+-	.wren_b    (Savestate_RAMRWrEn[1] & Savestate_RAMAddr[13]),
+-	.data_b    (Savestate_RAMWriteData),
++	.address_b (ss_ram_addr[12:0]),
++	.wren_b    (ss_ram_wren[1] & ss_ram_addr[13]),
++	.data_b    (ss_ram_data),
+ 	.q_b       (Savestate_RAMReadData_VRAM1)
+ );
+ 
+-assign Savestate_RAMReadData_VRAM = Savestate_RAMAddr[13] ? Savestate_RAMReadData_VRAM1 : Savestate_RAMReadData_VRAM0;
++assign Savestate_RAMReadData_VRAM = ss_ram_addr[13] ? Savestate_RAMReadData_VRAM1 : Savestate_RAMReadData_VRAM0;
+ 
+ //GBC VRAM banking
+ 
+@@ -847,9 +853,9 @@ dpram #(7) zpram (
+ 	.q_a       (zpram_do     ),
+ 	
+ 	.clock_b   (clk_sys),
+-	.address_b (Savestate_RAMAddr[6:0]),
+-	.wren_b    (Savestate_RAMRWrEn[3]),
+-	.data_b    (Savestate_RAMWriteData),
++	.address_b (ss_ram_addr[6:0]),
++	.wren_b    (ss_ram_wren[3]),
++	.data_b    (ss_ram_data),
+ 	.q_b       (Savestate_RAMReadData_ZRAM)
+ );
+ 
+@@ -882,9 +888,9 @@ dpram #(15) wram (
+ 	.q_a       (wram_do),
+ 	
+ 	.clock_b   (clk_sys),
+-	.address_b (Savestate_RAMAddr[14:0]),
+-	.wren_b    (Savestate_RAMRWrEn[0]),
+-	.data_b    (Savestate_RAMWriteData),
++	.address_b (ss_ram_addr[14:0]),
++	.wren_b    (ss_ram_wren[0]),
++	.data_b    (ss_ram_data),
+ 	.q_b       (Savestate_RAMReadData_WRAM)
+ );
+ 
+diff --git a/rtl/gb2p_machine.sv b/rtl/gb2p_machine.sv
+index 317fcc8..5b8c6a2 100644
+--- a/rtl/gb2p_machine.sv
++++ b/rtl/gb2p_machine.sv
+@@ -129,6 +129,13 @@ wire [31:0] RTC_timestampOut;
+ wire [47:0] RTC_savedtimeOut;
+ wire RTC_inuse;
+ 
++// netplay RAM clear (below); its cart RAM writes are not game writes: no autosave
++reg        ram_clr = 0;
++reg [16:0] ram_clr_addr = 0;
++wire cram1_wr_raw, cram2_wr_raw;
++assign cram1_wr = cram1_wr_raw & ~ram_clr;
++assign cram2_wr = cram2_wr_raw & ~ram_clr;
++
+ //////////////////////////////// CE ////////////////////////////////////
+ 
+ wire ces_cpu, ces_cpu_n, ces_cpu2x;
+@@ -207,6 +214,21 @@ always @(posedge clk_sys) begin
+ 	rtc_clr    <= rtc_emu & reset & ~rtc_hold_r;
+ end
+ 
++// Netplay: the same pulse starts a clear of every RAM in both Game Boys and
++// both carts (WRAM, HRAM, VRAM, OAM, cart RAM), 2^17 clk_sys, through their
++// savestate ports. Upstream leaves them as the last game left them, so a game
++// that reads RAM before writing it would start differently on two MiSTers. A
++// .sav loaded during the same reset then fills the cart RAM as usual.
++always @(posedge clk_sys) begin
++	if (rtc_clr) begin
++		ram_clr      <= 1;
++		ram_clr_addr <= 0;
++	end else if (ram_clr) begin
++		ram_clr_addr <= ram_clr_addr + 1'd1;
++		if (&ram_clr_addr) ram_clr <= 0;
++	end
++end
++
+ /////////////////////////////  Serial link  ///////////////////////////////
+ 
+ wire sc1_int_clock_out;
+@@ -254,7 +276,7 @@ cart_top cart1 (
+ 	.cart_ready  (             ),
+ 
+ 	.cram_rd     ( cram1_rd     ),
+-	.cram_wr     ( cram1_wr     ),
++	.cram_wr     ( cram1_wr_raw ),
+ 
+ 	.cart_download ( cart_download & ~rom_load_gb2),
+ 
+@@ -296,11 +318,11 @@ cart_top cart1 (
+ 	.SaveStateExt_rst ( SaveStateBus_rst1  ),
+ 	.SaveStateExt_Dout(  ),
+ 	.savestate_load   ( 0   ),
+-	.sleep_savestate  ( 0   ),
++	.sleep_savestate  ( ram_clr ),
+ 
+-	.Savestate_CRAMAddr     ( 0  ),
+-	.Savestate_CRAMRWrEn    ( 0  ),
+-	.Savestate_CRAMWriteData( 0  ),
++	.Savestate_CRAMAddr     ( {3'd0, ram_clr_addr} ),
++	.Savestate_CRAMRWrEn    ( ram_clr ),
++	.Savestate_CRAMWriteData( 8'd0 ),
+ 	.Savestate_CRAMReadData (    ),
+ 
+ 	.rumbling (rumbling1)
+@@ -309,6 +331,8 @@ cart_top cart1 (
+ 
+ // the gameboy itself
+ gb gb1 (
++	.ram_clr      ( ram_clr      ),
++	.ram_clr_addr ( ram_clr_addr ),
+ 	.reset	    ( reset      ),
+ 	
+ 	.clk_sys     ( clk_sys    ),
+@@ -444,7 +468,7 @@ cart_top cart2 (
+ 	.cart_ready  (      ),
+ 
+ 	.cram_rd     ( cram2_rd     ),
+-	.cram_wr     ( cram2_wr     ),
++	.cram_wr     ( cram2_wr_raw ),
+ 
+ 	.cart_download ( cart_download ),
+ 
+@@ -486,11 +510,11 @@ cart_top cart2 (
+ 	.SaveStateExt_rst ( SaveStateBus_rst2  ),
+ 	.SaveStateExt_Dout(  ),
+ 	.savestate_load   ( 0   ),
+-	.sleep_savestate  ( 0   ),
++	.sleep_savestate  ( ram_clr ),
+ 
+-	.Savestate_CRAMAddr     ( 0  ),
+-	.Savestate_CRAMRWrEn    ( 0  ),
+-	.Savestate_CRAMWriteData( 0  ),
++	.Savestate_CRAMAddr     ( {3'd0, ram_clr_addr} ),
++	.Savestate_CRAMRWrEn    ( ram_clr ),
++	.Savestate_CRAMWriteData( 8'd0 ),
+ 	.Savestate_CRAMReadData (    ),
+ 
+ 	.rumbling (rumbling2)
+@@ -499,6 +523,8 @@ cart_top cart2 (
+ 
+ // the gameboy itself
+ gb gb2 (
++	.ram_clr      ( ram_clr      ),
++	.ram_clr_addr ( ram_clr_addr ),
+ 	.reset	    ( reset      ),
+ 	
+ 	.clk_sys     ( clk_sys    ),
+-- 
+2.43.0
+

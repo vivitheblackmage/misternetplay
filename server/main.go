@@ -1,4 +1,4 @@
-// netplay-server: a private lobby and relay for MiSTer NES and SNES netplay.
+// netplay-server: a private lobby and relay for MiSTer NES, SNES and Game Boy 2P netplay.
 //
 // Both MiSTers connect out to this server (UDP), so only the machine running
 // it needs a forwarded port. A host opens a room with a game; the others see
@@ -123,7 +123,8 @@ type library struct {
 }
 
 // coreDirs: where a core's games are. roms/<core>/; for NES (and a client that
-// names no core, as before SNES) also the games directly in roms/.
+// names no core, as before SNES) also the games directly in roms/; Game Boy 2P
+// (core GB2P) roms/GB/.
 func (l *library) coreDirs(core string) []string {
 	clean := strings.Map(func(c rune) rune {
 		if (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' {
@@ -133,6 +134,9 @@ func (l *library) coreDirs(core string) []string {
 	}, core)
 	if clean == "" || strings.EqualFold(clean, "NES") {
 		return []string{l.dir, filepath.Join(l.dir, "NES")}
+	}
+	if strings.EqualFold(clean, "GB2P") {
+		return []string{filepath.Join(l.dir, "GB")}
 	}
 	return []string{filepath.Join(l.dir, clean), filepath.Join(l.dir, strings.ToUpper(clean))}
 }
@@ -208,7 +212,7 @@ func readCatalog(path string) []romInfo {
 func makeCatalog(dir string) {
 	l := &library{dir: dir, cache: map[string]romInfo{}}
 	fmt.Printf("# catalog.txt from %s\n", dir)
-	for _, r := range append(l.list("NES"), l.list("SNES")...) {
+	for _, r := range append(append(l.list("NES"), l.list("SNES")...), l.list("GB2P")...) {
 		fmt.Printf("%s %s\n", r.md5, r.name)
 	}
 }
@@ -344,7 +348,7 @@ func main() {
 	go r.sweep()
 
 	log.Printf("netplay-server on port %d (UDP + TCP), %d games in %s, %d in %s",
-		c.Port, len(lib.list("NES"))+len(lib.list("SNES")), c.Roms, len(readCatalog(c.Catalog)), c.Catalog)
+		c.Port, len(lib.list("NES"))+len(lib.list("SNES"))+len(lib.list("GB2P")), c.Roms, len(readCatalog(c.Catalog)), c.Catalog)
 	log.Printf("game lists in a browser: http://localhost:%d/?key=%s", c.Port, c.Key)
 	log.Printf("MiSTer netplay.ini:  server=<this address>:%d   key=%s   name=<player>", c.Port, c.Key)
 	r.run()

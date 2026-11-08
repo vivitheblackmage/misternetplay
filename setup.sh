@@ -2,6 +2,7 @@
 # Sets up the netplay workspace next to this script:
 #   NES_MiSTer/   your fork (or upstream), branch "netplay" with the core patch
 #   SNES_MiSTer/  your fork (or upstream), branch "netplay" with the core patch
+#   Gameboy2P_MiSTer/  Gameboy2PUW_MiSTer (pomstazlesa), branch "netplay" (work in progress)
 #   Main_MiSTer/  your fork (or upstream), branch "netplay" with the HPS patch
 #
 # Use your own forks so you can push:
@@ -11,11 +12,13 @@ set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 NES_URL="${NES_URL:-https://github.com/MiSTer-devel/NES_MiSTer.git}"
 SNES_URL="${SNES_URL:-https://github.com/MiSTer-devel/SNES_MiSTer.git}"
+GB2P_URL="${GB2P_URL:-https://github.com/pomstazlesa/Gameboy2PUW_MiSTer.git}"
 MAIN_URL="${MAIN_URL:-https://github.com/MiSTer-devel/Main_MiSTer.git}"
 
 # The patches were written against these upstream commits.
 NES_BASE=49a0a662e244469ca77b2155746a066df704ffae
 SNES_BASE=4c2b74661b4c4c44eefb6b13743fcaf988bc8063
+GB2P_BASE=83e167f8fbcf76559951125d58a8104fc019308b
 MAIN_BASE=08271656799ede50358de1248f6ee878dd7ce5c4
 
 setup_repo() {
@@ -39,6 +42,7 @@ setup_repo() {
 
 setup_repo NES_MiSTer  "$NES_URL"  "$NES_BASE"  NES_MiSTer
 setup_repo SNES_MiSTer "$SNES_URL" "$SNES_BASE" SNES_MiSTer
+setup_repo Gameboy2P_MiSTer "$GB2P_URL" "$GB2P_BASE" Gameboy2P_MiSTer
 setup_repo Main_MiSTer "$MAIN_URL" "$MAIN_BASE" Main_MiSTer
 
 echo

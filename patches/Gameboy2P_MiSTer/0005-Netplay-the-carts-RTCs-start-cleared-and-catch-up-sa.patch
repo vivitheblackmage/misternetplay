@@ -1,0 +1,309 @@
+From fe79efeb8acee3b7c0cf421ac17eddc2d678a9b4 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 7 Nov 2026 17:36:47 +0100
+Subject: [PATCH] Netplay: the carts' RTCs start cleared and catch up saved
+ time per emulated cycle; RTC test ROMs
+---
+ npsim/make_rtctest.py | 65 +++++++++++++++++++++++++++++++++++++++++++
+ rtl/cart.v            |  4 +++
+ rtl/gb2p_machine.sv   | 13 +++++++++
+ rtl/mappers/huc3.v    | 16 ++++++++++-
+ rtl/mappers/mappers.v |  7 +++++
+ rtl/mappers/mbc3.v    | 22 ++++++++++++++-
+ rtl/mappers/tama.v    | 14 ++++++++++
+ 7 files changed, 139 insertions(+), 2 deletions(-)
+ create mode 100644 npsim/make_rtctest.py
+
+diff --git a/npsim/make_rtctest.py b/npsim/make_rtctest.py
+new file mode 100644
+index 0000000..34da62e
+--- /dev/null
++++ b/npsim/make_rtctest.py
+@@ -0,0 +1,65 @@
++#!/usr/bin/env python3
++"""Builds the MBC3 real-time-clock test ROMs for the netplay simulation.
++
++Every frame, at the start of VBlank, the program latches the MBC3 clock, reads
++seconds, minutes and days (low), mixes them into one byte and writes it to
++BGP (the picture) and sends it over the link cable (the link lines are in the
++netplay CRC). The frame where the seconds tick shows the clock's sub-second
++phase, so two MiSTers whose clocks did not start alike give different CRCs.
++
++rtcdirty.gb first sets the clock to 37 s and 200 days, as a game played before
++the session would leave it; rtctest.gb has NOPs there. With --dirty
++rtcdirty.gb the netplay session must still match (SPEC.md 11.2).
++The boot ROM requires the Nintendo logo in the header. It is not part of this
++file: it is copied from another ROM given on the command line.
++usage: make_rtctest.py logo_source.gb rtctest.gb rtcdirty.gb"""
++import sys
++
++def build(logo, dirty):
++	rom = bytearray(0x8000)
++	rom[0x100:0x104] = bytes([0x00, 0xC3, 0x50, 0x01])     # nop; jp $0150
++	rom[0x104:0x134] = logo
++	rom[0x134:0x13F] = b"RTCTEST\0\0\0\0"
++	rom[0x147] = 0x10                                      # MBC3+TIMER+RAM+BATTERY
++	rom[0x148] = 0x00                                      # 32 KB ROM
++	rom[0x149] = 0x02                                      # 8 KB RAM
++	setclock = bytes([
++		0x3E, 0x08, 0xEA, 0x00, 0x40,    # ld a,$08; ld ($4000),a   RTC seconds
++		0x3E, 0x25, 0xEA, 0x00, 0xA0,    # ld a,37;  ld ($A000),a
++		0x3E, 0x0B, 0xEA, 0x00, 0x40,    # ld a,$0B; ld ($4000),a   days, low
++		0x3E, 0xC8, 0xEA, 0x00, 0xA0,    # ld a,200; ld ($A000),a
++		0x3E, 0x0C, 0xEA, 0x00, 0x40,    # ld a,$0C; ld ($4000),a   days high, halt
++		0xAF, 0xEA, 0x00, 0xA0,          # xor a;    ld ($A000),a   running
++	])
++	head = bytes([
++		0xF3,                            # di
++		0x31, 0xFE, 0xFF,                # ld sp,$FFFE
++		0x3E, 0x0A, 0xEA, 0x00, 0x00,    # ld a,$0A; ld ($0000),a   RAM and RTC on
++	]) + (setclock if dirty else bytes(len(setclock)))
++	loop = bytes([
++		0xF0, 0x44, 0xFE, 0x90, 0x20, 0xFA,    # wait for LY = 144
++		0xF0, 0x44, 0xFE, 0x90, 0x28, 0xFA,    # and until it leaves 144
++		0xAF, 0xEA, 0x00, 0x60,                # xor a; ld ($6000),a     latch 0
++		0x3C, 0xEA, 0x00, 0x60,                # inc a; ld ($6000),a     latch 1
++		0x3E, 0x08, 0xEA, 0x00, 0x40, 0xFA, 0x00, 0xA0, 0x47,   # b = seconds
++		0x3E, 0x09, 0xEA, 0x00, 0x40, 0xFA, 0x00, 0xA0, 0x4F,   # c = minutes
++		0x3E, 0x0B, 0xEA, 0x00, 0x40, 0xFA, 0x00, 0xA0, 0x5F,   # e = days, low
++		0x79, 0x07, 0x07, 0xA8, 0xAB,          # a = rlc2(c) ^ b ^ e
++		0xE0, 0x47,                            # ldh ($47),a   BGP
++		0xE0, 0x01,                            # ldh ($01),a   SB
++		0x3E, 0x81, 0xE0, 0x02,                # ldh ($02),$81 start, internal clock
++		0xF0, 0x02, 0xCB, 0x7F, 0x20, 0xFA,    # until the byte is sent
++	])
++	back = -(len(loop) + 2)
++	code = head + loop + bytes([0x18, back & 0xFF])   # jr loop
++	rom[0x150:0x150 + len(code)] = code
++	x = 0
++	for b in rom[0x134:0x14D]:
++		x = (x - b - 1) & 0xFF
++	rom[0x14D] = x
++	return rom
++
++src, clean, dirty = sys.argv[1:4]
++logo = open(src, "rb").read()[0x104:0x134]
++open(clean, "wb").write(build(logo, False))
++open(dirty, "wb").write(build(logo, True))
+diff --git a/rtl/cart.v b/rtl/cart.v
+index 4d61b47..992729e 100644
+--- a/rtl/cart.v
++++ b/rtl/cart.v
+@@ -53,6 +53,8 @@ module cart_top (
+ 	input  [15:0] joystick_analog_0,
+ 
+ 	input         ce_32k,
++	input         rtc_emu,   // netplay: the RTC counts emulated time only
++	input         rtc_clr,   // netplay: clear the RTC (one cycle)
+ 	input  [32:0] RTC_time,
+ 	output [31:0] RTC_timestampOut,
+ 	output [47:0] RTC_savedtimeOut,
+@@ -135,6 +137,8 @@ mappers mappers (
+ 	.joystick_analog_0 ( joystick_analog_0 ),
+ 
+ 	.ce_32k            ( ce_32k           ),
++	.rtc_emu           ( rtc_emu          ),
++	.rtc_clr           ( rtc_clr          ),
+ 	.RTC_time          ( RTC_time         ),
+ 	.RTC_timestampOut  ( RTC_timestampOut ),
+ 	.RTC_savedtimeOut  ( RTC_savedtimeOut ),
+diff --git a/rtl/gb2p_machine.sv b/rtl/gb2p_machine.sv
+index a1eeafd..317fcc8 100644
+--- a/rtl/gb2p_machine.sv
++++ b/rtl/gb2p_machine.sv
+@@ -198,6 +198,15 @@ always @(posedge clk_sys) begin
+ 		ce_32k <= !ce_32k_div;
+ end
+ 
++// Netplay: the carts' RTCs start from a known state (SPEC.md 11.2). One pulse
++// when reset rises with rtc_emu; a .sav loaded during that reset then sets the
++// RTC registers as usual.
++reg rtc_hold_r = 0, rtc_clr = 0;
++always @(posedge clk_sys) begin
++	rtc_hold_r <= rtc_emu & reset;
++	rtc_clr    <= rtc_emu & reset & ~rtc_hold_r;
++end
++
+ /////////////////////////////  Serial link  ///////////////////////////////
+ 
+ wire sc1_int_clock_out;
+@@ -274,6 +283,8 @@ cart_top cart1 (
+ 	.joystick_analog_0 ( joystick_analog_0 ),
+ 
+ 	.ce_32k           ( ce_32k           ),
++	.rtc_emu          ( rtc_emu          ),
++	.rtc_clr          ( rtc_clr          ),
+ 	.RTC_time         ( RTC_time         ),
+ 	.RTC_timestampOut ( RTC_timestampOut ),
+ 	.RTC_savedtimeOut ( RTC_savedtimeOut ),
+@@ -462,6 +473,8 @@ cart_top cart2 (
+ 	.joystick_analog_0 ( joystick_analog_1 ),
+ 
+ 	.ce_32k           ( ce_32k           ),
++	.rtc_emu          ( rtc_emu          ),
++	.rtc_clr          ( rtc_clr          ),
+ 	.RTC_time         ( RTC_time         ),
+ 	.RTC_timestampOut (  ),
+ 	.RTC_savedtimeOut (  ),
+diff --git a/rtl/mappers/huc3.v b/rtl/mappers/huc3.v
+index 3f525ca..556077e 100644
+--- a/rtl/mappers/huc3.v
++++ b/rtl/mappers/huc3.v
+@@ -9,6 +9,8 @@ module huc3 (
+ 	inout [63:0]  savestate_back_b,
+ 
+ 	input         ce_32k,
++	input         rtc_emu,   // netplay: catch up saved time per emulated cycle
++	input         rtc_clr,   // netplay: clear the RTC (one cycle)
+ 	input [32:0]  RTC_time,
+ 	inout [31:0]  RTC_timestampOut_b,
+ 	inout [47:0]  RTC_savedtimeOut_b,
+@@ -117,7 +119,8 @@ reg        RTC_saveLoaded;
+ 
+ wire       rtc_subseconds_end = &rtc_subseconds;
+ reg [31:0] diffSeconds;
+-wire       diffSeconds_fast_count = (diffSeconds > 0);
++// netplay (rtc_emu): one second per emulated cycle, so both sides catch up alike
++wire       diffSeconds_fast_count = (diffSeconds > 0) && (~rtc_emu || ce_cpu);
+ 
+ always @(posedge clk_sys) begin
+ 	if (ce_32k) rtc_subseconds <= rtc_subseconds + 1'b1;
+@@ -216,6 +219,17 @@ always @(posedge clk_sys) begin
+ 		RTC_timestampOut <= RTC_time[31:0];
+ 	end
+ 
++	if (rtc_clr) begin
++		rtc_subseconds <= 0;
++		rtc_seconds    <= 0;
++		rtc_minutes    <= 0;
++		rtc_days       <= 0;
++		rtc_index      <= 0;
++		rtc_flags      <= 0;
++		rtc_out        <= 0;
++		diffSeconds    <= 0;
++	end
++
+ end
+ 
+ wire [1:0] ram_bank = ram_bank_reg & ram_mask[1:0];
+diff --git a/rtl/mappers/mappers.v b/rtl/mappers/mappers.v
+index 0fddb13..54a17b3 100644
+--- a/rtl/mappers/mappers.v
++++ b/rtl/mappers/mappers.v
+@@ -31,6 +31,8 @@ module mappers(
+ 	input  [15:0] joystick_analog_0,
+ 
+ 	input         ce_32k,
++	input         rtc_emu,   // netplay: the RTC counts emulated time only
++	input         rtc_clr,   // netplay: clear the RTC (one cycle)
+ 	input  [32:0] RTC_time,
+ 	output [31:0] RTC_timestampOut,
+ 	output [47:0] RTC_savedtimeOut,
+@@ -179,6 +181,8 @@ mbc3 map_mbc3 (
+ 	.savestate_back_b  ( savestate_back_b ),
+ 
+ 	.ce_32k            ( ce_32k            ),
++	.rtc_emu           ( rtc_emu           ),
++	.rtc_clr           ( rtc_clr           ),
+ 	.RTC_time          ( RTC_time         ),
+ 	.RTC_timestampOut_b( RTC_timestampOut_b ),
+ 	.RTC_savedtimeOut_b( RTC_savedtimeOut_b ),
+@@ -397,6 +401,8 @@ huc3 map_huc3 (
+ 	.savestate_back_b  ( savestate_back2_b ),
+ 
+ 	.ce_32k            ( ce_32k           ),
++	.rtc_emu           ( rtc_emu          ),
++	.rtc_clr           ( rtc_clr          ),
+ 	.RTC_time          ( RTC_time         ),
+ 	.RTC_timestampOut_b( RTC_timestampOut_b ),
+ 	.RTC_savedtimeOut_b( RTC_savedtimeOut_b ),
+@@ -472,6 +478,7 @@ tama map_tama (
+ 	.clk_sys          ( clk_sys ),
+ 	.ce_cpu           ( ce ),
+ 	.ce_32k           ( ce_32k   ),
++	.rtc_clr          ( rtc_clr  ),
+ 
+ 	.savestate_load   ( savestate_load ),
+ 	.savestate_data   ( savestate_data2 ),
+diff --git a/rtl/mappers/mbc3.v b/rtl/mappers/mbc3.v
+index 65000c8..d57daaa 100644
+--- a/rtl/mappers/mbc3.v
++++ b/rtl/mappers/mbc3.v
+@@ -11,6 +11,8 @@ module mbc3 (
+ 	inout      [15:0] savestate_back_b,
+ 
+ 	input             ce_32k,
++	input             rtc_emu,   // netplay: catch up saved time per emulated cycle
++	input             rtc_clr,   // netplay: clear the RTC (one cycle)
+ 	input      [32:0] RTC_time,
+ 	inout      [31:0] RTC_timestampOut_b,
+ 	inout      [47:0] RTC_savedtimeOut_b,
+@@ -171,7 +173,8 @@ reg rtc_latch;
+ reg RTC_saveLoaded_1;
+ reg RTC_timestampNew_1; 
+ reg [31:0] diffSeconds;
+-wire       diffSeconds_fast_count = (diffSeconds > 0 && ~rtc_change);
++// netplay (rtc_emu): one second per emulated cycle, so both sides catch up alike
++wire       diffSeconds_fast_count = (diffSeconds > 0 && ~rtc_change && (~rtc_emu || ce_cpu));
+ 
+ reg reset_1;
+ 
+@@ -290,6 +293,23 @@ always @(posedge clk_sys) begin
+ 		end
+ 
+ 	end
++
++	if (rtc_clr) begin
++		rtc_subseconds     <= 0;
++		rtc_seconds        <= 0;
++		rtc_minutes        <= 0;
++		rtc_hours          <= 0;
++		rtc_days           <= 0;
++		rtc_overflow       <= 0;
++		rtc_halt           <= 0;
++		rtc_seconds_latch  <= 0;
++		rtc_minutes_latch  <= 0;
++		rtc_hours_latch    <= 0;
++		rtc_days_latch     <= 0;
++		rtc_overflow_latch <= 0;
++		rtc_latch          <= 0;
++		diffSeconds        <= 0;
++	end
+ end
+ 
+ assign rtc_return = 
+diff --git a/rtl/mappers/tama.v b/rtl/mappers/tama.v
+index 4b655ea..539ec40 100644
+--- a/rtl/mappers/tama.v
++++ b/rtl/mappers/tama.v
+@@ -4,6 +4,7 @@ module tama (
+ 	input         clk_sys,
+ 	input         ce_cpu,
+ 	input         ce_32k,
++	input         rtc_clr,   // netplay: clear the RTC (one cycle)
+ 
+ 	input         savestate_load,
+ 	input [63:0]  savestate_data,
+@@ -277,6 +278,19 @@ always @(posedge clk_sys) begin
+ 			end
+ 		end
+ 	end
++
++	if (rtc_clr) begin
++		rtc_subseconds <= 0;
++		rtc_seconds    <= 0;
++		rtc_minutes    <= 0;
++		rtc_hours      <= 0;
++		rtc_days       <= 0;
++		rtc_month      <= 0;
++		rtc_year       <= 0;
++		rtc_24hours    <= 0;
++		rtc_index      <= 0;
++		rtc_leap_year  <= 0;
++	end
+ end
+ 
+ // 0x0000-0x3FFF = Bank 0
+-- 
+2.43.0
+

@@ -1,0 +1,109 @@
+From 254991447157e92adbd4e2fcf1ff6d92e5bd5f1e Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sun, 8 Nov 2026 00:58:57 +0100
+Subject: [PATCH] SDRAM: port 2 takes port 1's read of the same word (the
+ shared clock ran 1% slow, bad sound); writes forget the last addresses
+---
+ rtl/sdram.sv | 51 ++++++++++++++++++++++++++++++++++++++++++++-------
+ 1 file changed, 44 insertions(+), 7 deletions(-)
+
+diff --git a/rtl/sdram.sv b/rtl/sdram.sv
+index 4dff061..b0eb757 100644
+--- a/rtl/sdram.sv
++++ b/rtl/sdram.sv
+@@ -129,6 +129,14 @@ reg channel = 0;
+ 
+ reg [23:0] addr_last;
+ reg [23:0] addr2_last;
++// netplay (SPEC.md 11.1): both Game Boys run on one clock enable, so with one
++// game they often read the same word at the same time. Port 2 then takes port
++// 1's data (the word port 1 read last, or the read port 1 starts now) instead
++// of a read of its own in the next cycle, which stopped both cores and made
++// them run ~1% slow (bad sound). The *_ok bits make a write (ROM download)
++// forget the last addresses, so no read returns a word from before it.
++reg        last_ok = 0, last2_ok = 0;
++reg        share2 = 0;
+ 
+ always @(posedge clk) begin
+ 	reg [12:0] addr_r;
+@@ -158,17 +166,28 @@ always @(posedge clk) begin
+ 			
+ 		end
+ 		mode <= 0;
++		last_ok  = 0;
++		last2_ok = 0;
++		share2  <= 0;
+ 	end else begin
+ 
+ 		// normal operation
+ 		if(stage == STATE_CMD_START) begin
+-         ack  <= 1'b0;
+-         ack2 <= 1'b0;
++         ack    <= 1'b0;
++         ack2   <= 1'b0;
++         share2 <= 1'b0;
+          
+-         if(oe  && (addr_last  == addr )) ack  <= 1'b1;
+-         if(oe2 && (addr2_last == addr2)) ack2 <= 1'b1;
++         if(oe  && last_ok  && (addr_last  == addr )) ack  <= 1'b1;
++         if(oe2 && last2_ok && (addr2_last == addr2)) ack2 <= 1'b1;
++         // port 2 wants the word port 1 read last: its data is in dout
++         else if(oe2 && last_ok && (addr2 == addr_last)) begin
++            dout2    <= dout;
++            ack2     <= 1'b1;
++            addr2_last = addr2;
++            last2_ok   = 1;
++         end
+          
+-			if(we || (oe & (addr_last != addr))) begin
++			if(we || (oe & !(last_ok && (addr_last == addr)))) begin
+ 
+ 				mode    <= {we, oe};
+             channel <= 1'b0;
+@@ -181,9 +200,22 @@ always @(posedge clk) begin
+ 				din_r   <= din;
+ 				addr_r  <= { we ? ~ds : 2'b00, 2'b10, addr[22], addr[7:0] };  // auto precharge
+             
+-            if (oe) addr_last = addr;
++            if (we) begin
++               last_ok  = 0;
++               last2_ok = 0;
++            end
++            else if (oe) begin
++               addr_last = addr;
++               last_ok   = 1;
++               // port 2 wants the same word: it gets this read's data too
++               if (oe2 && !(last2_ok && (addr2_last == addr2)) && (addr2 == addr)) begin
++                  share2    <= 1'b1;
++                  addr2_last = addr2;
++                  last2_ok   = 1;
++               end
++            end
+ 			end
+-         else if(oe2 && (addr2_last != addr2)) begin
++         else if(oe2 && !(last2_ok && (addr2_last == addr2))) begin
+ 
+ 				mode    <= 2'b01;
+             channel <= 1'b1;
+@@ -196,6 +228,7 @@ always @(posedge clk) begin
+ 				addr_r  <= { 2'b00, 2'b10, addr2[22], addr2[7:0] };  // auto precharge
+             
+             addr2_last = addr2;
++            last2_ok   = 1;
+ 			end
+ 			else begin
+ 				sd_cmd <= CMD_AUTO_REFRESH;
+@@ -223,6 +256,10 @@ always @(posedge clk) begin
+          else begin
+             dout <= sd_data;
+             ack  <= 1'b1;
++            if (share2) begin
++               dout2 <= sd_data;
++               ack2  <= 1'b1;
++            end
+          end
+ 		end
+ 	end
+-- 
+2.43.0
+

@@ -1,0 +1,83 @@
+From fd5de5766d3ccd7a0f0c971eca79bf904461fdb7 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 7 Nov 2026 23:51:14 +0100
+Subject: [PATCH] npsim: --mixed compares the shared clock with upstream's
+ per-core speed control
+---
+ npsim/gb2p_sim.cpp | 18 +++++++++++++-----
+ 1 file changed, 13 insertions(+), 5 deletions(-)
+
+diff --git a/npsim/gb2p_sim.cpp b/npsim/gb2p_sim.cpp
+index 64ebae8..9a12c65 100644
+--- a/npsim/gb2p_sim.cpp
++++ b/npsim/gb2p_sim.cpp
+@@ -16,6 +16,8 @@
+ //
+ // --unshared runs the upstream per-core speedcontrol (no freezes possible) as a
+ // control: with link traffic it is expected to differ.
++// --mixed: A shared, B upstream per-core (no freezes): the shared clock must
++// not change what a core does (a game without link traffic must match).
+ // --p1/--p2: buttons held by player 1/2 the whole run (bit 4 = A).
+ // --script: lines "FRAME P1 P2" (hex buttons, held from that emulated frame of
+ //           the side's own core 1 on; # starts a comment). Overrides --p1/--p2.
+@@ -73,6 +75,7 @@ struct Side {
+ 	uint64_t hold_left = 0;
+ 	uint64_t ce1 = 0;             // core 1 ce count (frames)
+ 	uint64_t n[2] = {0, 0};       // samples per core
++	bool     skip_to_ce[2] = {false, false};
+ 	uint64_t frozen_cycles = 0, freezes = 0;
+ 	std::mt19937_64 rng;
+ 	uint8_t  p1 = 0, p2 = 0;
+@@ -186,8 +189,11 @@ struct Side {
+ 
+ 		// sample before the rising edge: the enables were set on the falling edge
+ 		if (collect && running) {
+-			if (m->ce1_cpu | m->ce1_cpu_n | m->ce1_cpu2x) { q[0].push_back(take(0)); n[0]++; }
+-			if (m->ce2_cpu | m->ce2_cpu_n | m->ce2_cpu2x) { q[1].push_back(take(1)); n[1]++; }
++			// skip_to_ce (--mixed, upstream side): drop enables before each core's first ce
++			if (skip_to_ce[0] && m->ce1_cpu) skip_to_ce[0] = false;
++			if (skip_to_ce[1] && m->ce2_cpu) skip_to_ce[1] = false;
++			if (!skip_to_ce[0] && (m->ce1_cpu | m->ce1_cpu_n | m->ce1_cpu2x)) { q[0].push_back(take(0)); n[0]++; }
++			if (!skip_to_ce[1] && (m->ce2_cpu | m->ce2_cpu_n | m->ce2_cpu2x)) { q[1].push_back(take(1)); n[1]++; }
+ 			lcd_track(0); lcd_track(1);
+ 			if (m->ce1_cpu) {
+ 				ce1++;
+@@ -445,7 +451,7 @@ int main(int argc, char **argv) {
+ 		return run_netplay(rom, dirty, df, nf, seed, d, lat, use_scr ? &scr : nullptr);
+ 	}
+ 	uint64_t frames = 60, seed = 1, offset = 12345;
+-	bool shared = true, freeze = true, jitter = true, quiet = false;
++	bool shared = true, freeze = true, jitter = true, quiet = false, mixed = false;
+ 	int p1 = 0, p2 = 0, sys = 0;
+ 	std::map<uint64_t, std::pair<uint8_t, uint8_t>> script;
+ 	bool use_script = false;
+@@ -458,6 +464,7 @@ int main(int argc, char **argv) {
+ 		else if (a == "--seed") seed = strtoull(next(), 0, 0);
+ 		else if (a == "--offset") offset = strtoull(next(), 0, 0);
+ 		else if (a == "--unshared") shared = false;
++		else if (a == "--mixed") mixed = true;
+ 		else if (a == "--no-freeze") freeze = false;
+ 		else if (a == "--no-jitter") jitter = false;
+ 		else if (a == "--p1") p1 = strtol(next(), 0, 16);
+@@ -484,7 +491,7 @@ int main(int argc, char **argv) {
+ 		else if (a == "--shot-prefix") shot_prefix = next();
+ 		else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
+ 	}
+-	if (!shared) freeze = false;
++	if (!shared || mixed) freeze = false;
+ 
+ 	// the CGB boot ROM is read from build/cgb_boot.hex (relative): run from npsim/
+ 	if (FILE *f = fopen("build/cgb_boot.hex", "r")) fclose(f);
+@@ -500,7 +507,8 @@ int main(int argc, char **argv) {
+ 			for (auto &ch : ext) ch = tolower(ch);
+ 			s->index = ext == ".gbc" ? 0x01 : ext == ".bin" ? 0x81 : 0x41;
+ 		}
+-		s->m->shared_ce = shared; s->m->sys_select = sys; s->m->rom_load_gb2 = 0;
++		if (mixed && s == &B) s->skip_to_ce[0] = s->skip_to_ce[1] = true;
++		s->m->shared_ce = mixed ? (s == &A) : shared; s->m->sys_select = sys; s->m->rom_load_gb2 = 0;
+ 		s->m->reset_in = 1; s->m->hold = 0; s->m->jitter = 0;
+ 		s->p1 = p1; s->p2 = p2;
+ 		if (use_script) s->script = &script;
+-- 
+2.43.0
+

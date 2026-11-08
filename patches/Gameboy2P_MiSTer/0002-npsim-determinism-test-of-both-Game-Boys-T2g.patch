@@ -1,0 +1,1100 @@
+From a6dbc2711ed136c73629f79696b9852a861c392a Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Fri, 6 Nov 2026 22:49:19 +0100
+Subject: [PATCH 2/4] npsim: determinism test of both Game Boys (T2g)
+
+Verilator runs two copies of gb2p_machine with the ROM download path and an
+SDRAM model: one plain, one with SDRAM jitter, random freezes and a later
+start, and compares the CPU buses, LCD and serial of both cores on every
+clock enable. make_linktest.py builds a link-cable test ROM (it needs a ROM
+to copy the boot logo from; the result is not committed).
+---
+ npsim/.gitignore       |   4 +
+ npsim/Makefile         |  63 +++++++++++
+ npsim/gb2p_sim.cpp     | 249 +++++++++++++++++++++++++++++++++++++++++
+ npsim/ghdl_fixes.txt   |   5 +
+ npsim/ghdl_prep.py     |  71 ++++++++++++
+ npsim/make_linktest.py |  72 ++++++++++++
+ npsim/merge_vlog.py    |  46 ++++++++
+ npsim/mif2hex.py       |  21 ++++
+ npsim/ram_sim.sv       | 114 +++++++++++++++++++
+ npsim/sdram_model.sv   |  97 ++++++++++++++++
+ npsim/sim_top.sv       | 234 ++++++++++++++++++++++++++++++++++++++
+ npsim/vhdl_files.txt   |  12 ++
+ 12 files changed, 988 insertions(+)
+ create mode 100644 npsim/.gitignore
+ create mode 100644 npsim/Makefile
+ create mode 100644 npsim/gb2p_sim.cpp
+ create mode 100644 npsim/ghdl_fixes.txt
+ create mode 100644 npsim/ghdl_prep.py
+ create mode 100644 npsim/make_linktest.py
+ create mode 100644 npsim/merge_vlog.py
+ create mode 100644 npsim/mif2hex.py
+ create mode 100644 npsim/ram_sim.sv
+ create mode 100644 npsim/sdram_model.sv
+ create mode 100644 npsim/sim_top.sv
+ create mode 100644 npsim/vhdl_files.txt
+
+diff --git a/npsim/.gitignore b/npsim/.gitignore
+new file mode 100644
+index 0000000..d6aa5a9
+--- /dev/null
++++ b/npsim/.gitignore
+@@ -0,0 +1,4 @@
++build/
++obj/
++*.gb
++*.gbc
+diff --git a/npsim/Makefile b/npsim/Makefile
+new file mode 100644
+index 0000000..bff5bab
+--- /dev/null
++++ b/npsim/Makefile
+@@ -0,0 +1,63 @@
++# Determinism test of the Game Boy 2P core (SPEC 11.7, T2g). Simulation only.
++#
++#   make -C npsim               build obj/gb2p_sim (GHDL in Docker translates the VHDL)
++#   make -C npsim run ROM=game.gb FRAMES=120
++#
++# GHDL runs in the Docker image hdlc/ghdl:yosys; Verilator runs locally.
++
++GHDL_IMAGE ?= hdlc/ghdl:yosys
++BUILD      := build
++TOPS       := GBse gbc_snd speedcontrol gb_savestates gb_statemanager
++GEN_gb_statemanager := -gSoftmap_SaveState_ADDR=58720256 -gSoftmap_Rewind_ADDR=33554432
++RTL_V      := $(BUILD)/video.v $(addprefix ../rtl/,gb.v cart.v sprites.v sprites_extra.v sprites_extra_store.v \
++              timer.v hdma.v link.v cheatcodes.sv megaswizzle.sv gb2p_machine.sv speedcontrol_shared.sv) \
++              $(wildcard ../rtl/mappers/*.v ../rtl/mappers/*.sv)
++SIM_SV     := sim_top.sv ram_sim.sv sdram_model.sv
++VHDL_SRC   := $(shell sed 's|^|../|' vhdl_files.txt)
++FRAMES     ?= 60
++VFLAGS     := -O3 --x-assign 0 --x-initial 0 -Wno-fatal -Wno-PROCASSWIRE -Wno-WIDTH \
++              -Wno-PINMISSING -Wno-UNOPTFLAT -Wno-CASEINCOMPLETE -Wno-UNUSED -Wno-LATCH -Wno-UNSIGNED \
++              -Wno-MULTIDRIVEN -Wno-IMPLICIT -Wno-SELRANGE \
++              +1364-2005ext+v +1800-2017ext+sv --top-module gb2p_side
++DOCKER     := docker run --rm -u $(shell id -u):$(shell id -g)
++
++all: obj/gb2p_sim
++
++$(BUILD)/analyzed: vhdl_files.txt ghdl_fixes.txt ghdl_prep.py $(VHDL_SRC)
++	mkdir -p $(BUILD)
++	cd .. && python3 -I npsim/ghdl_prep.py npsim/vhdl_files.txt npsim/$(BUILD)/vhdl npsim/$(BUILD)/ghdl
++	touch $@
++
++$(BUILD)/vlog/vhdl_all.v: $(BUILD)/analyzed merge_vlog.py ../rtl/gb.v ../rtl/gb2p_machine.sv
++	mkdir -p $(BUILD)/vlog
++	for e in $(TOPS); do \
++		g=""; [ $$e = gb_statemanager ] && g="$(GEN_gb_statemanager)"; \
++		$(DOCKER) -v $(abspath $(BUILD))/vhdl:/out -v $(abspath $(BUILD))/ghdl:/work -w /out $(GHDL_IMAGE) \
++			ghdl synth --std=08 -frelaxed -fsynopsys --latches --workdir=/work $$g --out=verilog $$e \
++			> $(BUILD)/vlog/$$e.v 2> $(BUILD)/vlog/$$e.log || { tail -20 $(BUILD)/vlog/$$e.log; exit 1; }; \
++	done
++	python3 -I merge_vlog.py $@ ../rtl/gb.v ../rtl/gb2p_machine.sv sim_top.sv -- $(addprefix $(BUILD)/vlog/,$(addsuffix .v,$(TOPS)))
++
++# video.v with the extra sprites' tristate bus on plain wires (Verilator cannot
++# drive an array element from a tristate output)
++$(BUILD)/video.v: ../rtl/video.v
++	mkdir -p $(BUILD)
++	sed -e 's/( spr_extra_tile\[\([01]\)\] )/( spr_extra_tile_\1 )/' \
++	    -e 's/^wire \[7:0\] spr_extra_tile\[0:1\];/&\nwire [7:0] spr_extra_tile_0, spr_extra_tile_1;\nassign spr_extra_tile[0] = spr_extra_tile_0;\nassign spr_extra_tile[1] = spr_extra_tile_1;/' $< > $@
++	grep -q 'spr_extra_tile_1 )' $@
++
++$(BUILD)/cgb_boot.hex: ../BootROMs/cgb_boot.mif mif2hex.py
++	mkdir -p $(BUILD)
++	python3 -I mif2hex.py $< $@
++
++obj/gb2p_sim: $(BUILD)/vlog/vhdl_all.v $(BUILD)/cgb_boot.hex $(SIM_SV) $(RTL_V) gb2p_sim.cpp
++	verilator --cc --exe --build -j 0 $(VFLAGS) -Mdir obj -o gb2p_sim \
++		$(SIM_SV) $(RTL_V) $(BUILD)/vlog/vhdl_all.v gb2p_sim.cpp
++
++run: obj/gb2p_sim
++	obj/gb2p_sim $(ROM) --frames $(FRAMES)
++
++clean:
++	rm -rf $(BUILD) obj
++
++.PHONY: all run clean
+diff --git a/npsim/gb2p_sim.cpp b/npsim/gb2p_sim.cpp
+new file mode 100644
+index 0000000..af3bd1e
+--- /dev/null
++++ b/npsim/gb2p_sim.cpp
+@@ -0,0 +1,249 @@
++// Determinism test of the Game Boy 2P core (SPEC 11.7, T2g).
++//
++// Two copies of the core (gb2p_side) run the same ROM with their own clocks:
++//   A: plain.
++//   B: starts later, its SDRAM model gets random jitter (reads served later),
++//      and (with the shared clock enable) random freezes of random length.
++// Every emulated clock enable (ce, ce_n, ce_2x) of each Game Boy is a sample of
++// what that core does (CPU bus, pixel, audio, link cable, ROM address). The
++// samples of A and B must be identical, in order, for every core.
++//
++//   gb2p_sim ROM [--frames N] [--seed S] [--unshared] [--no-freeze] [--no-jitter]
++//            [--offset CYCLES] [--p1 HEX] [--p2 HEX] [--sys 0|1|2] [--quiet]
++//
++// --unshared runs the upstream per-core speedcontrol (no freezes possible) as a
++// control: with link traffic it is expected to differ.
++// --p1/--p2: buttons held by player 1/2 the whole run (bit 4 = A).
++// Exit 0 and "PASS" when no sample differs.
++#include "Vgb2p_side.h"
++#include "verilated.h"
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <random>
++#include <string>
++#include <vector>
++
++struct Sample {
++	uint8_t  en;      // bit0 ce, bit1 ce_n, bit2 ce_2x
++	uint16_t addr;
++	uint8_t  dout;
++	uint8_t  strobes; // bit0 wr_n, bit1 rd_n, bit2 lcd_clkena, bit3 lcd_on, bit4 ser clk, bit5 ser data
++	uint8_t  lcd_mode;
++	uint16_t lcd_data;
++	uint16_t aud_l, aud_r;
++	uint32_t mbc;
++	bool operator==(const Sample &o) const {
++		return en == o.en && addr == o.addr && dout == o.dout && strobes == o.strobes &&
++		       lcd_mode == o.lcd_mode && lcd_data == o.lcd_data && aud_l == o.aud_l &&
++		       aud_r == o.aud_r && mbc == o.mbc;
++	}
++};
++
++static void print_sample(const char *who, const Sample &s) {
++	printf("  %s: en=%u addr=%04x do=%02x wr_n=%u rd_n=%u lcd_en=%u lcd_on=%u ser_clk=%u ser_d=%u "
++	       "mode=%u pix=%04x aud=%04x/%04x mbc=%06x\n", who, s.en, s.addr, s.dout, s.strobes & 1,
++	       (s.strobes >> 1) & 1, (s.strobes >> 2) & 1, (s.strobes >> 3) & 1, (s.strobes >> 4) & 1,
++	       (s.strobes >> 5) & 1, s.lcd_mode, s.lcd_data, s.aud_l, s.aud_r, s.mbc);
++}
++
++static const uint64_t CE_PER_FRAME = 70224;
++
++struct Side {
++	Vgb2p_side *m;
++	const char *name;
++	std::vector<uint8_t> rom;
++	uint64_t cycles = 0;          // clk_sys cycles
++	uint64_t start_at = 0;        // first download cycle
++	size_t   dl_pos = 0;          // next byte to download
++	int      dl_state = 0;        // 0 wait, 1 downloading, 2 tail, 3 done
++	uint64_t dl_tail = 0;
++	bool     freeze = false, jitter = false;
++	uint64_t hold_left = 0;
++	uint64_t ce1 = 0;             // core 1 ce count (frames)
++	uint64_t n[2] = {0, 0};       // samples per core
++	uint64_t frozen_cycles = 0, freezes = 0;
++	std::mt19937_64 rng;
++	uint8_t  p1 = 0, p2 = 0;
++	std::string serial_out;       // bytes core 1 writes to SB before starting a transfer
++	uint8_t  last_sb = 0;
++	bool     sb_wr_seen = false;
++	uint64_t cart_exec = 0;
++
++	Sample take(int core) {
++		Sample s{};
++		if (core == 0) {
++			s.en = m->ce1_cpu | (m->ce1_cpu_n << 1) | (m->ce1_cpu2x << 2);
++			s.addr = m->cpu1_addr; s.dout = m->cpu1_do;
++			s.strobes = m->cpu1_wr_n | (m->cpu1_rd_n << 1) | (m->lcd1_clkena << 2) | (m->lcd1_on << 3) |
++			            (m->ser1_clk_out << 4) | (m->ser1_data_out << 5);
++			s.lcd_mode = m->lcd1_mode; s.lcd_data = m->lcd1_data;
++			s.aud_l = m->AUDIO_L1; s.aud_r = m->AUDIO_R1; s.mbc = m->mbc1_addr;
++		} else {
++			s.en = m->ce2_cpu | (m->ce2_cpu_n << 1) | (m->ce2_cpu2x << 2);
++			s.addr = m->cpu2_addr; s.dout = m->cpu2_do;
++			s.strobes = m->cpu2_wr_n | (m->cpu2_rd_n << 1) | (m->lcd2_clkena << 2) | (m->lcd2_on << 3) |
++			            (m->ser2_clk_out << 4) | (m->ser2_data_out << 5);
++			s.lcd_mode = m->lcd2_mode; s.lcd_data = m->lcd2_data;
++			s.aud_l = m->AUDIO_L2; s.aud_r = m->AUDIO_R2; s.mbc = m->mbc2_addr;
++		}
++		return s;
++	}
++
++	void eval_half(int sys, int ram) {
++		m->clk_sys = sys; m->clk_ram = ram; m->eval();
++	}
++
++	// one clk_sys cycle; samples go to q[core]
++	void step(std::deque<Sample> *q, bool collect) {
++		// download driver (inputs change while clk_sys is low)
++		m->ioctl_wr = 0;
++		switch (dl_state) {
++		case 0:
++			m->reset_in = 1;
++			if (cycles >= start_at) { dl_state = 1; m->ioctl_download = 1; m->ioctl_index = 1; }
++			break;
++		case 1:
++			if (!m->ioctl_wait) {
++				if (dl_pos < rom.size()) {
++					m->ioctl_addr = dl_pos;
++					m->ioctl_dout = rom[dl_pos] | (dl_pos + 1 < rom.size() ? rom[dl_pos + 1] << 8 : 0);
++					m->ioctl_wr = 1;
++					dl_pos += 2;
++				} else { dl_state = 2; dl_tail = cycles + 64; }
++			}
++			break;
++		case 2:
++			if (cycles >= dl_tail) { m->ioctl_download = 0; m->reset_in = 0; dl_state = 3; }
++			break;
++		}
++		bool running = dl_state == 3;
++		m->joy1 = running ? p1 : 0;
++		m->joy2 = running ? p2 : 0;
++		if (jitter) m->jitter = (rng() % 3) == 0;
++		if (freeze && running) {
++			if (hold_left) hold_left--;
++			else if ((rng() % 100000) == 0) { hold_left = 1 + rng() % 20000; freezes++; }
++			m->hold = hold_left != 0;
++			if (m->hold) frozen_cycles++;
++		}
++		m->eval();
++
++		// sample before the rising edge: the enables were set on the falling edge
++		if (collect && running) {
++			if (m->ce1_cpu | m->ce1_cpu_n | m->ce1_cpu2x) { q[0].push_back(take(0)); n[0]++; }
++			if (m->ce2_cpu | m->ce2_cpu_n | m->ce2_cpu2x) { q[1].push_back(take(1)); n[1]++; }
++			if (m->ce1_cpu) {
++				ce1++;
++				if (!m->cpu1_rd_n && m->cpu1_addr >= 0x100 && m->cpu1_addr < 0x8000) cart_exec++;
++				// what core 1 writes to SB (test ROMs print through the link port)
++				bool wr = !m->cpu1_wr_n && m->cpu1_addr == 0xFF01;
++				if (wr && !sb_wr_seen) last_sb = m->cpu1_do;
++				bool sc = !m->cpu1_wr_n && m->cpu1_addr == 0xFF02 && (m->cpu1_do & 0x80);
++				if (sc && !sb_wr_seen) serial_out += (char)last_sb;
++				sb_wr_seen = wr || sc;
++			}
++		}
++		eval_half(1, 1);
++		eval_half(1, 0);
++		eval_half(0, 1);
++		eval_half(0, 0);
++		cycles++;
++	}
++};
++
++static std::vector<uint8_t> load(const char *path) {
++	FILE *f = fopen(path, "rb");
++	if (!f) { perror(path); exit(2); }
++	std::vector<uint8_t> v;
++	uint8_t buf[65536];
++	size_t r;
++	while ((r = fread(buf, 1, sizeof buf, f)) > 0) v.insert(v.end(), buf, buf + r);
++	fclose(f);
++	return v;
++}
++
++int main(int argc, char **argv) {
++	if (argc < 2) { fprintf(stderr, "usage: gb2p_sim ROM [options]\n"); return 2; }
++	const char *rom = argv[1];
++	uint64_t frames = 60, seed = 1, offset = 12345;
++	bool shared = true, freeze = true, jitter = true, quiet = false;
++	int p1 = 0, p2 = 0, sys = 0;
++	for (int i = 2; i < argc; i++) {
++		std::string a = argv[i];
++		auto next = [&]() { if (i + 1 >= argc) { fprintf(stderr, "%s needs a value\n", a.c_str()); exit(2); } return argv[++i]; };
++		if (a == "--frames") frames = strtoull(next(), 0, 0);
++		else if (a == "--seed") seed = strtoull(next(), 0, 0);
++		else if (a == "--offset") offset = strtoull(next(), 0, 0);
++		else if (a == "--unshared") shared = false;
++		else if (a == "--no-freeze") freeze = false;
++		else if (a == "--no-jitter") jitter = false;
++		else if (a == "--p1") p1 = strtol(next(), 0, 16);
++		else if (a == "--p2") p2 = strtol(next(), 0, 16);
++		else if (a == "--sys") sys = atoi(next());
++		else if (a == "--quiet") quiet = true;
++		else { fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
++	}
++	if (!shared) freeze = false;
++
++	auto *ctx = new VerilatedContext;
++	Side A, B;
++	A.m = new Vgb2p_side{ctx, "A"}; A.name = "A";
++	B.m = new Vgb2p_side{ctx, "B"}; B.name = "B";
++	for (Side *s : {&A, &B}) {
++		s->rom = load(rom);
++		s->m->shared_ce = shared; s->m->sys_select = sys; s->m->rom_load_gb2 = 0;
++		s->m->reset_in = 1; s->m->hold = 0; s->m->jitter = 0;
++		s->p1 = p1; s->p2 = p2;
++		s->eval_half(0, 0);
++	}
++	B.start_at = offset;
++	B.freeze = freeze;
++	B.jitter = jitter;
++	B.rng.seed(seed);
++
++	std::deque<Sample> qa[2], qb[2];
++	uint64_t compared[2] = {0, 0};
++	uint64_t last_frame = 0;
++	const uint64_t target = frames * CE_PER_FRAME;
++	while (A.ce1 < target) {
++		// keep the two sides close in emulated time: clock the one behind
++		bool a_turn = A.n[0] + A.n[1] <= B.n[0] + B.n[1] || B.cycles > A.cycles + 50000000;
++		if (a_turn) A.step(qa, true); else B.step(qb, true);
++		for (int c = 0; c < 2; c++) {
++			while (!qa[c].empty() && !qb[c].empty()) {
++				if (!(qa[c].front() == qb[c].front())) {
++					uint64_t idx = compared[c];
++					printf("FAIL: Game Boy %d differs at sample %llu (frame %llu)\n", c + 1,
++					       (unsigned long long)idx, (unsigned long long)(idx / (CE_PER_FRAME * 2)));  // ce + ce_n per cycle at single speed
++					print_sample("A", qa[c].front());
++					print_sample("B", qb[c].front());
++					printf("B: %llu freezes, %llu frozen cycles, start offset %llu\n",
++					       (unsigned long long)B.freezes, (unsigned long long)B.frozen_cycles,
++					       (unsigned long long)offset);
++					if (!A.serial_out.empty()) printf("serial (A, core 1): %s\n", A.serial_out.c_str());
++					return 1;
++				}
++				qa[c].pop_front(); qb[c].pop_front(); compared[c]++;
++			}
++		}
++		uint64_t f = A.ce1 / CE_PER_FRAME;
++		if (!quiet && f != last_frame && f % 30 == 0) {
++			printf("frame %llu: compared %llu + %llu samples, B frozen %llu cycles in %llu freezes\n",
++			       (unsigned long long)f, (unsigned long long)compared[0], (unsigned long long)compared[1],
++			       (unsigned long long)B.frozen_cycles, (unsigned long long)B.freezes);
++			fflush(stdout);
++		}
++		last_frame = f;
++	}
++	if (!A.serial_out.empty()) printf("serial (A, core 1): %s\n", A.serial_out.c_str());
++	printf("A core 1: last CPU address %04x, %llu samples in the cartridge's code (>= 0x100)\n", A.m->cpu1_addr, (unsigned long long)A.cart_exec);
++	printf("PASS: %llu frames, %llu + %llu samples identical; B: %llu freezes (%llu cycles), "
++	       "jitter %s, start offset %llu, %s clock enable\n",
++	       (unsigned long long)frames, (unsigned long long)compared[0], (unsigned long long)compared[1],
++	       (unsigned long long)B.freezes, (unsigned long long)B.frozen_cycles, jitter ? "on" : "off",
++	       (unsigned long long)offset, shared ? "shared" : "per-core");
++	return 0;
++}
+diff --git a/npsim/ghdl_fixes.txt b/npsim/ghdl_fixes.txt
+new file mode 100644
+index 0000000..b6ab752
+--- /dev/null
++++ b/npsim/ghdl_fixes.txt
+@@ -0,0 +1,5 @@
++# Literal replacements applied to the simulation copy before GHDL (file|old|new).
++# Quartus accepts these, GHDL does not. The core's own files are never changed.
++rtl/bus_savestates.vhd|      default     : std_logic_vector|      defaultv    : std_logic_vector
++rtl/bus_savestates.vhd|def   => Reg.default|def   => Reg.defaultv
++rtl/gbc_snd.vhd|: integer := dac_decay_timer'high;|: integer := 100;
+diff --git a/npsim/ghdl_prep.py b/npsim/ghdl_prep.py
+new file mode 100644
+index 0000000..cccde53
+--- /dev/null
++++ b/npsim/ghdl_prep.py
+@@ -0,0 +1,71 @@
++#!/usr/bin/env python3
++"""Copies the core's VHDL into a build folder for GHDL (simulation only) and
++works around constructs Quartus accepts but GHDL rejects:
++- literal replacements listed in ghdl_fixes.txt,
++- a `case` without `when others` gets `when others => null;`.
++Then analyses every file in order, in one GHDL run (in Docker); on a missing
++choice it fixes that file and starts again.
++usage: ghdl_prep.py <filelist> <outdir> <workdir>   (run from the core's root)"""
++import os, re, shutil, subprocess, sys
++
++flist, out, work = sys.argv[1:4]
++root = os.getcwd()
++uid = f"{os.getuid()}:{os.getgid()}"
++files = [l.strip() for l in open(flist) if l.strip()]
++fixes = {}
++for l in open(os.path.join(os.path.dirname(flist), "ghdl_fixes.txt")):
++    if l.strip() and not l.startswith("#"):
++        f, old, new = l.rstrip("\n").split("|")
++        fixes.setdefault(f, []).append((old, new))
++
++for f in files:
++    dst = os.path.join(out, f)
++    os.makedirs(os.path.dirname(dst), exist_ok=True)
++    shutil.copy(f, dst)
++    if f in fixes:
++        t = open(dst).read()
++        for old, new in fixes[f]:
++            if t.count(old) != 1:
++                sys.exit(f"fix not found exactly once in {f}: {old}")
++            t = t.replace(old, new)
++        open(dst, "w").write(t)
++
++def analyse_all():
++    os.makedirs(work, exist_ok=True)
++    for x in os.listdir(work):
++        os.remove(os.path.join(work, x))
++    script = "set -e\n" + "".join(
++        f"ghdl -a --std=08 -frelaxed -fsynopsys --workdir=/work {f} || {{ echo FAILED {f}; exit 1; }}\n" for f in files)
++    cmd = ["docker", "run", "--rm", "-i", "-u", uid, "-v", f"{os.path.abspath(out)}:/out",
++           "-v", f"{os.path.abspath(work)}:/work", "-w", "/out", "hdlc/ghdl:yosys", "sh"]
++    return subprocess.run(cmd, input=script, capture_output=True, text=True)
++
++for _ in range(100):
++    r = analyse_all()
++    if r.returncode == 0:
++        print("ANALYZED", len(files))
++        sys.exit(0)
++    failed = re.search(r"FAILED (\S+)", r.stdout)
++    m = re.search(r"^(\S+?):(\d+):\d+:error: missing choice", r.stderr, re.M)
++    if not failed or not m:
++        sys.exit(f"GHDL error:\n{r.stdout[-1000:]}\n{r.stderr[:3000]}")
++    f, line = m.group(1), int(m.group(2)) - 1
++    dst = os.path.join(out, f)
++    src = open(dst).read().split("\n")
++    depth, i = 0, line + 1
++    while i < len(src):
++        code = src[i].split("--")[0].lower()
++        if re.search(r"\bend\s+case\b", code):
++            if depth == 0:
++                indent = re.match(r"\s*", src[i]).group(0)
++                src.insert(i, indent + "\twhen others => null; -- sim: GHDL needs others")
++                break
++            depth -= 1
++        elif re.search(r"\bcase\b", code):
++            depth += 1
++        i += 1
++    else:
++        sys.exit(f"no end case after {f}:{line + 1}")
++    open(dst, "w").write("\n".join(src))
++    print(f"fixed: {f}:{line + 1}")
++sys.exit("too many fixes")
+diff --git a/npsim/make_linktest.py b/npsim/make_linktest.py
+new file mode 100644
+index 0000000..0e8b1c9
+--- /dev/null
++++ b/npsim/make_linktest.py
+@@ -0,0 +1,72 @@
++#!/usr/bin/env python3
++"""Builds roms/linktest.gb, a small link-cable test for the determinism test.
++
++Both Game Boys run the same code. The one whose player holds A is the master
++(internal clock), the other the slave. Every frame, at the start of VBlank,
++each loads SB with (accumulator xor frame counter) and starts a transfer;
++while waiting it counts its polling loop. The received byte xor that count is
++mixed into the accumulator, which goes to BGP (the palette) and so into the
++picture. The slave's count depends on exactly when the master's bits arrive,
++so any drift between the two cores changes the picture.
++The boot ROM requires the Nintendo logo in the header. It is not part of this
++file: it is copied from another ROM given on the command line.
++usage: make_linktest.py logo_source.gb out.gb"""
++import sys
++src, out = sys.argv[1], sys.argv[2]
++logo = open(src, "rb").read()[0x104:0x134]
++rom = bytearray(0x8000)
++rom[0x100:0x104] = bytes([0x00, 0xC3, 0x50, 0x01])          # nop; jp $0150
++rom[0x104:0x134] = logo
++rom[0x134:0x13F] = b"LINKTEST\0\0\0"
++code = bytes([
++	0xF3,                   # 0150 di
++	0x31, 0xFE, 0xFF,       # 0151 ld sp,$FFFE
++	0x3E, 0x10,             # 0154 ld a,$10        select the buttons
++	0xE0, 0x00,             # 0156 ldh ($00),a
++	0xF0, 0x00,             # 0158 ldh a,($00)
++	0xF0, 0x00,             # 015A ldh a,($00)
++	0xF0, 0x00,             # 015C ldh a,($00)
++	0xE6, 0x01,             # 015E and $01         0 = A held = master
++	0x67,                   # 0160 ld h,a
++	0x0E, 0x00,             # 0161 ld c,0          frame counter
++	0x16, 0x00,             # 0163 ld d,0          accumulator
++	# loop:
++	0xF0, 0x44,             # 0165 ldh a,($44)     LY
++	0xFE, 0x90,             # 0167 cp 144
++	0x20, 0xFA,             # 0169 jr nz,loop
++	0xF0, 0x44,             # 016B ldh a,($44)
++	0xFE, 0x90,             # 016D cp 144
++	0x28, 0xFA,             # 016F jr z,$016B      wait until LY leaves 144
++	0x7A,                   # 0171 ld a,d
++	0xA9,                   # 0172 xor c
++	0xE0, 0x01,             # 0173 ldh ($01),a     SB
++	0x7C,                   # 0175 ld a,h
++	0xB7,                   # 0176 or a
++	0x3E, 0x81,             # 0177 ld a,$81        master: start, internal clock
++	0x28, 0x02,             # 0179 jr z,$017D
++	0x3E, 0x80,             # 017B ld a,$80        slave: start, external clock
++	0xE0, 0x02,             # 017D ldh ($02),a     SC
++	0x06, 0x00,             # 017F ld b,0
++	# poll:
++	0x04,                   # 0181 inc b
++	0xF0, 0x02,             # 0182 ldh a,($02)
++	0xCB, 0x7F,             # 0184 bit 7,a
++	0x20, 0xF9,             # 0186 jr nz,poll
++	0xF0, 0x01,             # 0188 ldh a,($01)     received byte
++	0xA8,                   # 018A xor b
++	0x5F,                   # 018B ld e,a
++	0x7A,                   # 018C ld a,d
++	0x07,                   # 018D rlca
++	0x83,                   # 018E add a,e
++	0x57,                   # 018F ld d,a
++	0xE0, 0x47,             # 0190 ldh ($47),a     BGP
++	0x0C,                   # 0192 inc c
++	0x18, 0xD0,             # 0193 jr loop
++])
++assert len(code) == 0x195 - 0x150
++rom[0x150:0x150 + len(code)] = code
++x = 0
++for b in rom[0x134:0x14D]:
++	x = (x - b - 1) & 0xFF
++rom[0x14D] = x
++open(out, "wb").write(rom)
+diff --git a/npsim/merge_vlog.py b/npsim/merge_vlog.py
+new file mode 100644
+index 0000000..f104efb
+--- /dev/null
++++ b/npsim/merge_vlog.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++"""Merges the Verilog that `ghdl synth` wrote for each top entity into one
++file: submodules shared by several tops appear once (they must be identical).
++Tops that the Verilog instantiates with parameters get dummy parameters (GHDL
++fixes generics at the values given on its command line, which are the values
++the Verilog uses). VHDL is case-insensitive and Quartus matches the Verilog's
++pin names that way; Verilator does not, so the ports of each top get the
++Verilog's spelling.
++usage: merge_vlog.py out.v verilog1 [verilog2 ...] -- in1.v in2.v ..."""
++import re, sys
++
++out = sys.argv[1]
++sep = sys.argv.index("--")
++vlogs, ins = sys.argv[2:sep], sys.argv[sep + 1:]
++src = re.sub(r"//.*", "", "\n".join(open(f).read() for f in vlogs))
++pins = {}   # module -> {lower name: spelling in the Verilog}
++for m in re.finditer(r"^[ \t]*(?!(?:generate|if|else|module|begin|end)\b)(\w+)\s*(?:#\s*\((?:[^()]|\([^()]*\))*\)\s*)?\w+\s*\((.*?)\);", src, re.S | re.M):
++    for pin in re.findall(r"\.(\w+)\s*\(", m.group(2)):
++        pins.setdefault(m.group(1), {})[pin.lower()] = pin
++params = {"gb_statemanager": "parameter Softmap_SaveState_ADDR = 0;\n  parameter Softmap_Rewind_ADDR = 0;"}
++seen, order = {}, []
++for f in ins:
++    text = open(f).read()
++    for m in re.finditer(r"^module (\w+)\b.*?^endmodule\s*$", text, re.S | re.M):
++        name, body = m.group(1), m.group(0)
++        if name in seen:
++            norm = lambda t: re.sub(r"n\d+", "n", t)
++            if norm(seen[name]) != norm(body):
++                sys.exit(f"module {name} differs between inputs")
++            continue
++        if name in pins:
++            header = re.match(r"module \w+\s*\((.*?)\);", body, re.S).group(1)
++            for port in re.findall(r"(\w+)\s*(?:,|$)", header.replace("\n", " ")):
++                want = pins[name].get(port.lower())
++                if want and want != port:
++                    body = re.sub(r"\b%s\b" % re.escape(port), want, body)
++        if name in params:
++            body = re.sub(r"\);", ");\n  " + params[name], body, count=1)
++        seen[name] = body
++        order.append(name)
++with open(out, "w") as o:
++    o.write("// Generated by npsim/merge_vlog.py from ghdl synth output. Do not edit.\n")
++    o.write("/* verilator lint_off WIDTH */\n/* verilator lint_off UNOPTFLAT */\n")
++    for n in order:
++        o.write(seen[n] + "\n\n")
++print(f"{out}: {len(order)} modules")
+diff --git a/npsim/mif2hex.py b/npsim/mif2hex.py
+new file mode 100644
+index 0000000..5c079fc
+--- /dev/null
++++ b/npsim/mif2hex.py
+@@ -0,0 +1,21 @@
++#!/usr/bin/env python3
++"""Turns an Altera .mif (8-bit words, hex) into a $readmemh image.
++usage: mif2hex.py in.mif out.hex"""
++import re, sys
++depth, data = 0, {}
++body = False
++for line in open(sys.argv[1]):
++    line = line.split("--")[0].strip()
++    m = re.match(r"DEPTH\s*=\s*(\d+)", line)
++    if m: depth = int(m.group(1))
++    if line.startswith("CONTENT BEGIN"): body = True; continue
++    if not body or not line or line.startswith("END"): continue
++    m = re.match(r"\[?([0-9A-Fa-f]+)(?:\.\.([0-9A-Fa-f]+)\])?\s*:\s*(.*?);", line)
++    if not m: continue
++    a, b, vals = int(m.group(1), 16), m.group(2), m.group(3).split()
++    if b is not None:
++        for i in range(a, int(b, 16) + 1): data[i] = int(vals[0], 16)
++    else:
++        for i, v in enumerate(vals): data[a + i] = int(v, 16)
++with open(sys.argv[2], "w") as o:
++    for i in range(depth): o.write("%02x\n" % data.get(i, 0))
+diff --git a/npsim/ram_sim.sv b/npsim/ram_sim.sv
+new file mode 100644
+index 0000000..4f79434
+--- /dev/null
++++ b/npsim/ram_sim.sv
+@@ -0,0 +1,114 @@
++// Simulation-only replacements for rtl/dpram.vhd and rtl/bus_savestates.vhd's
++// eReg_SavestateV (Altera megafunctions are not available to Verilator, and a
++// VHDL entity with generics cannot be instantiated from Verilog through
++// ghdl synth). Same ports and the same behaviour as the altsyncram settings:
++// registered address, unregistered output, new data on a read during a write
++// on the same port. The core connects no clock enable or chip select, so
++// the models have none (always enabled).
++
++module dpram #(parameter addr_width = 8, parameter data_width = 8)
++(
++	input                       clock_a,
++	input      [addr_width-1:0] address_a,
++	input      [data_width-1:0] data_a,
++	input                       wren_a,
++	output     [data_width-1:0] q_a,
++
++	input                       clock_b,
++	input      [addr_width-1:0] address_b,
++	input      [data_width-1:0] data_b,
++	input                       wren_b,
++	output     [data_width-1:0] q_b
++);
++	reg [data_width-1:0] mem[0:(1<<addr_width)-1];
++	reg [addr_width-1:0] ra = 0, rb = 0;
++	initial for (int i = 0; i < (1<<addr_width); i++) mem[i] = 0;
++	always @(posedge clock_a) begin
++		if (wren_a) mem[address_a] <= data_a;
++		ra <= address_a;
++	end
++	always @(posedge clock_b) begin
++		if (wren_b) mem[address_b] <= data_b;
++		rb <= address_b;
++	end
++	assign q_a = mem[ra];
++	assign q_b = mem[rb];
++endmodule
++
++// Mixed widths on one clock. Port b's word i is {byte 2i+1, byte 2i} when
++// it is twice as wide as port a. The init file is read as a hex image made
++// from the .mif by the Makefile (build/<name>.hex).
++module dpram_dif #(
++	parameter addr_width_a = 8, parameter data_width_a = 8,
++	parameter addr_width_b = 8, parameter data_width_b = 8,
++	parameter mem_init_file = " "
++)
++(
++	input                         clock,
++	input      [addr_width_a-1:0] address_a,
++	input      [data_width_a-1:0] data_a,
++	input                         wren_a,
++	output     [data_width_a-1:0] q_a,
++	input      [addr_width_b-1:0] address_b,
++	input      [data_width_b-1:0] data_b,
++	input                         wren_b,
++	output     [data_width_b-1:0] q_b
++);
++	localparam BYTES = (1 << addr_width_a) * data_width_a / 8;
++	localparam RA = data_width_a / 8, RB = data_width_b / 8;
++	reg [7:0] mem[0:BYTES-1];
++	reg [addr_width_a-1:0] ra = 0;
++	reg [addr_width_b-1:0] rb = 0;
++	initial begin
++		for (int i = 0; i < BYTES; i++) mem[i] = 0;
++		if (mem_init_file == "BootROMs/cgb_boot.mif") $readmemh("build/cgb_boot.hex", mem);
++		if (mem_init_file == "lcd_color_lut.mif")      $readmemh("build/lcd_color_lut.hex", mem);
++	end
++	always @(posedge clock) begin
++		begin
++			if (wren_a) for (int k = 0; k < RA; k++) mem[address_a*RA + k] <= data_a[k*8 +: 8];
++			ra <= address_a;
++		end
++		begin
++			if (wren_b) for (int k = 0; k < RB; k++) mem[address_b*RB + k] <= data_b[k*8 +: 8];
++			rb <= address_b;
++		end
++	end
++	wire [data_width_a-1:0] qa;
++	wire [data_width_b-1:0] qb;
++	genvar g;
++	generate
++		for (g = 0; g < RA; g++) begin : ga assign qa[g*8 +: 8] = mem[ra*RA + g]; end
++		for (g = 0; g < RB; g++) begin : gb assign qb[g*8 +: 8] = mem[rb*RB + g]; end
++	endgenerate
++	assign q_a = qa;
++	assign q_b = qb;
++endmodule
++
++module eReg_SavestateV #(
++	parameter integer index = 0,
++	parameter integer Adr   = 0,
++	parameter integer upper = 0,
++	parameter integer lower = 0,
++	parameter [63:0]  def   = 64'h0
++)
++(
++	input              clk,
++	input       [63:0] BUS_Din,
++	input        [9:0] BUS_Adr,
++	input              BUS_wren,
++	input              BUS_rst,
++	output      [63:0] BUS_Dout,
++	input  [upper:lower] Din,
++	output [upper:lower] Dout
++);
++	reg [upper:lower] buffer = def[upper:lower];
++	wire hit = (BUS_Adr == 10'(Adr + index));
++	always @(posedge clk) begin
++		if (BUS_rst) buffer <= def[upper:lower];
++		else if (hit && BUS_wren) buffer <= BUS_Din[upper:lower];
++	end
++	assign Dout = buffer;
++	wire [63:0] din_full = 64'(Din) << lower;
++	assign BUS_Dout = hit ? din_full : 64'd0;
++endmodule
+diff --git a/npsim/sdram_model.sv b/npsim/sdram_model.sv
+new file mode 100644
+index 0000000..0800f09
+--- /dev/null
++++ b/npsim/sdram_model.sv
+@@ -0,0 +1,97 @@
++// Simulation model of rtl/sdram.sv: the same cycle (started by `sync`, one
++// command per cycle, refresh when idle), the same per-port address cache
++// (`addr_last`: a repeated read is acknowledged at once) and the same `ack`
++// timing, with an array in place of the chip. `jitter` = 1 at a command slot
++// turns a pending read into a refresh, so the read is served one cycle later:
++// a different SDRAM latency for the determinism test. Writes are never
++// delayed (the ROM download does not wait for them).
++module sdram_model
++(
++	input             clk,
++	input             sync,
++	input             jitter,
++	input      [15:0] din,
++	output reg [15:0] dout,
++	input      [23:0] addr,
++	input       [1:0] ds,
++	input             oe,
++	input             we,
++	output reg        ack,
++	output reg [15:0] dout2,
++	input      [23:0] addr2,
++	input             oe2,
++	output reg        ack2
++);
++
++localparam STATE_CMD_START = 3'd1;
++localparam STATE_CMD_CONT  = 3'd3;   // STATE_CMD_START + RASCAS_DELAY (2)
++localparam STATE_READ      = 3'd6;   // STATE_CMD_CONT + CAS_LATENCY (2) + 1
++
++reg [15:0] mem[0:(1<<23)-1];
++
++reg  [1:0] mode;
++reg [15:0] din_r;
++reg  [1:0] ds_r;
++reg  [2:0] stage = 0;
++reg        channel = 0;
++reg [23:0] addr_last = 0;
++reg [23:0] addr2_last = 0;
++reg [22:0] word;
++
++initial begin
++	ack = 0; ack2 = 0; dout = 0; dout2 = 0;
++end
++
++always @(posedge clk) begin
++	reg old_sync;
++	if (|stage) stage <= stage + 1'd1;
++	old_sync <= sync;
++	if (~old_sync && sync) stage <= 1;
++
++	if (stage == STATE_CMD_START) begin
++		ack  <= 1'b0;
++		ack2 <= 1'b0;
++		if (oe  && (addr_last  == addr )) ack  <= 1'b1;
++		if (oe2 && (addr2_last == addr2)) ack2 <= 1'b1;
++		mode <= 0;
++		if (we) begin
++			mode    <= 2'b10;
++			channel <= 1'b0;
++			word    <= addr[22:0];
++			din_r   <= din;
++			ds_r    <= ds;
++		end
++		else if (jitter) begin
++			// refresh instead: the read stays pending
++		end
++		else if (oe && (addr_last != addr)) begin
++			mode      <= 2'b01;
++			channel   <= 1'b0;
++			word      <= addr[22:0];
++			addr_last <= addr;
++		end
++		else if (oe2 && (addr2_last != addr2)) begin
++			mode       <= 2'b01;
++			channel    <= 1'b1;
++			word       <= addr2[22:0];
++			addr2_last <= addr2;
++		end
++	end
++
++	if (stage == STATE_CMD_CONT && mode[1]) begin
++		if (ds_r[1]) mem[word][15:8] <= din_r[15:8];
++		if (ds_r[0]) mem[word][7:0]  <= din_r[7:0];
++	end
++
++	if (stage == STATE_READ && mode[0]) begin
++		if (channel) begin
++			dout2 <= mem[word];
++			ack2  <= 1'b1;
++		end else begin
++			dout  <= mem[word];
++			ack   <= 1'b1;
++		end
++	end
++end
++
++endmodule
+diff --git a/npsim/sim_top.sv b/npsim/sim_top.sv
+new file mode 100644
+index 0000000..3f6ce0f
+--- /dev/null
++++ b/npsim/sim_top.sv
+@@ -0,0 +1,234 @@
++// One MiSTer's worth of the Game Boy 2P core for the determinism test
++// (SPEC 11.7, T2g): gb2p_machine (both Game Boys, the link cable, the clock
++// enables), the ROM download path and SDRAM mux as in Gameboy.sv, and a model
++// of the SDRAM controller. The C++ side runs two of these with their own
++// clocks: one plain, one with freezes, SDRAM jitter and a later start, and
++// compares what the cores do on every emulated clock enable.
++module gb2p_side
++(
++	input         clk_sys,
++	input         clk_ram,
++
++	input         reset_in,      // the OSD/HPS reset (the download resets by itself)
++	input         shared_ce,
++	input         hold,
++	input         jitter,
++
++	input         ioctl_download,
++	input   [7:0] ioctl_index,
++	input         ioctl_wr,
++	input  [24:0] ioctl_addr,
++	input  [15:0] ioctl_dout,
++	output reg    ioctl_wait = 0,
++	input         rom_load_gb2,
++	input   [1:0] sys_select,    // status[15:14]: 0 auto, 1 GB, 2 GBC
++
++	input   [7:0] joy1,
++	input   [7:0] joy2,
++
++	output        ce1_cpu,
++	output        ce1_cpu_n,
++	output        ce1_cpu2x,
++	output        ce2_cpu,
++	output        ce2_cpu_n,
++	output        ce2_cpu2x,
++
++	output        lcd1_clkena,
++	output [14:0] lcd1_data,
++	output  [1:0] lcd1_mode,
++	output        lcd1_on,
++	output        lcd2_clkena,
++	output [14:0] lcd2_data,
++	output  [1:0] lcd2_mode,
++	output        lcd2_on,
++	output [15:0] AUDIO_L1,
++	output [15:0] AUDIO_R1,
++	output [15:0] AUDIO_L2,
++	output [15:0] AUDIO_R2,
++	output        ser1_clk_out,
++	output        ser1_data_out,
++	output        ser2_clk_out,
++	output        ser2_data_out,
++
++	// the CPU buses, read through hierarchical references
++	output [15:0] cpu1_addr,
++	output  [7:0] cpu1_do,
++	output        cpu1_wr_n,
++	output        cpu1_rd_n,
++	output [15:0] cpu2_addr,
++	output  [7:0] cpu2_do,
++	output        cpu2_wr_n,
++	output        cpu2_rd_n,
++	output        isGBC_out,
++	output [22:0] mbc1_addr,
++	output [22:0] mbc2_addr
++);
++
++wire [7:0] filetype = ioctl_index;
++wire cart_download = ioctl_download && (filetype[5:0] == 6'h01 || filetype == 8'h80);
++wire reset = reset_in | cart_download;
++
++wire sys_auto = (sys_select == 0);
++wire sys_gbc  = (sys_select == 2);
++
++wire isGBC_game1, isGBC_game2;
++reg  isGBC = 0;
++always @(posedge clk_sys) if (reset) begin
++	if (~sys_auto) isGBC <= sys_gbc;
++	else if (cart_download) begin
++		if (!filetype[5:0]) isGBC <= (isGBC_game1 | isGBC_game2);
++		else isGBC <= !filetype[7:6];
++	end
++end
++assign isGBC_out = isGBC;
++
++// ROM download into the SDRAM (as Gameboy.sv)
++reg old_downloading = 0;
++reg rom_bank_gb2 = 0;
++always @(posedge clk_sys) begin
++	old_downloading <= cart_download;
++	if (~old_downloading & cart_download) rom_bank_gb2 <= rom_load_gb2;
++end
++
++reg dn_write = 0;
++always @(posedge clk_sys) begin
++	if (ioctl_wr) ioctl_wait <= 1;
++	if (ce1_cpu2x) begin
++		dn_write <= ioctl_wait;
++		if (dn_write) {ioctl_wait, dn_write} <= 0;
++	end
++end
++
++wire        sdram_oe, sdram_oe2, sdram_ack, sdram_ack2;
++wire [15:0] sdram_do, sdram_do2;
++wire  [1:0] sdram_ds   = cart_download ? 2'b11 : {mbc1_addr[0], ~mbc1_addr[0]};
++wire [15:0] sdram_di   = cart_download ? ioctl_dout : 16'd0;
++wire [23:0] sdram_addr = cart_download ? {1'b0, rom_bank_gb2, ioctl_addr[22:1]} : {2'b00, mbc1_addr[22:1]};
++wire        sdram_we   = cart_download & dn_write;
++wire [23:0] sdram_addr2 = {1'b0, rom_bank_gb2, mbc2_addr[22:1]};
++
++wire ce_ram2x;
++speedcontrol speedcontrolSDRAM
++(
++	.clk_sys     (clk_sys),
++	.reset       (reset),
++	.romread     (1'b0),
++	.romack      (1'b1),
++	.pausevideo  (1'b0),
++	.ce          (),
++	.ce_n        (),
++	.ce_2x       (ce_ram2x)
++);
++
++sdram_model sdram
++(
++	.clk    (clk_ram),
++	.sync   (ce_ram2x),
++	.jitter (jitter),
++	.din    (sdram_di),
++	.dout   (sdram_do),
++	.addr   (sdram_addr),
++	.ds     (sdram_ds),
++	.oe     (sdram_oe),
++	.we     (sdram_we),
++	.ack    (sdram_ack),
++	.dout2  (sdram_do2),
++	.addr2  (sdram_addr2),
++	.oe2    (sdram_oe2),
++	.ack2   (sdram_ack2)
++);
++
++wire [15:0] bk_q1, bk_q2;
++wire cart1_has_save, cart2_has_save, cram1_wr, cram2_wr;
++wire lcd1_vsync, lcd2_vsync;
++wire rumbling1, rumbling2;
++
++gb2p_machine machine
++(
++	.clk_sys           ( clk_sys ),
++	.reset             ( reset ),
++	.shared_ce         ( shared_ce ),
++	.hold              ( hold ),
++	.pausevideo1       ( 1'b0 ),
++	.pausevideo2       ( 1'b0 ),
++	.rtc_emu           ( 1'b1 ),
++	.isGBC             ( isGBC ),
++	.real_cgb_boot     ( 1'b0 ),
++	.megaduck          ( 1'b0 ),
++	.mapper_sel        ( 3'd0 ),
++	.extra_spr_en      ( 1'b0 ),
++	.boot_gba_en       ( 1'b0 ),
++	.fast_boot_en      ( 1'b1 ),   // shorter boot animation in simulation
++	.audio_no_pops     ( 1'b0 ),
++	.cart_download     ( cart_download ),
++	.rom_load_gb2      ( rom_load_gb2 ),
++	.cgb_boot_download ( 1'b0 ),
++	.dmg_boot_download ( 1'b0 ),
++	.sgb_boot_download ( 1'b0 ),
++	.ioctl_wr          ( ioctl_wr ),
++	.ioctl_addr        ( ioctl_addr ),
++	.ioctl_dout        ( ioctl_dout ),
++	.img_size          ( 64'd0 ),
++	.mbc1_addr         ( mbc1_addr ),
++	.sdram_oe          ( sdram_oe ),
++	.sdram_do          ( sdram_do ),
++	.sdram_ack         ( sdram_ack ),
++	.mbc2_addr         ( mbc2_addr ),
++	.sdram_oe2         ( sdram_oe2 ),
++	.sdram_do2         ( sdram_do2 ),
++	.sdram_ack2        ( sdram_ack2 ),
++	.joy1              ( joy1 ),
++	.joy2              ( joy2 ),
++	.joystick_analog_0 ( 16'd0 ),
++	.joystick_analog_1 ( 16'd0 ),
++	.bk_wr1            ( 1'b0 ),
++	.bk_wr2            ( 1'b0 ),
++	.bk_addr           ( 17'd0 ),
++	.bk_data           ( 16'd0 ),
++	.bk_q1             ( bk_q1 ),
++	.bk_q2             ( bk_q2 ),
++	.cart1_has_save    ( cart1_has_save ),
++	.cart2_has_save    ( cart2_has_save ),
++	.cram1_wr          ( cram1_wr ),
++	.cram2_wr          ( cram2_wr ),
++	.isGBC_game1       ( isGBC_game1 ),
++	.isGBC_game2       ( isGBC_game2 ),
++	.RTC_time          ( 33'd0 ),
++	.ce1_cpu           ( ce1_cpu ),
++	.ce1_cpu_n         ( ce1_cpu_n ),
++	.ce1_cpu2x         ( ce1_cpu2x ),
++	.ce2_cpu           ( ce2_cpu ),
++	.ce2_cpu_n         ( ce2_cpu_n ),
++	.ce2_cpu2x         ( ce2_cpu2x ),
++	.lcd1_clkena       ( lcd1_clkena ),
++	.lcd1_data         ( lcd1_data ),
++	.lcd1_mode         ( lcd1_mode ),
++	.lcd1_on           ( lcd1_on ),
++	.lcd1_vsync        ( lcd1_vsync ),
++	.lcd2_clkena       ( lcd2_clkena ),
++	.lcd2_data         ( lcd2_data ),
++	.lcd2_mode         ( lcd2_mode ),
++	.lcd2_on           ( lcd2_on ),
++	.lcd2_vsync        ( lcd2_vsync ),
++	.AUDIO_L1          ( AUDIO_L1 ),
++	.AUDIO_R1          ( AUDIO_R1 ),
++	.AUDIO_L2          ( AUDIO_L2 ),
++	.AUDIO_R2          ( AUDIO_R2 ),
++	.rumbling1         ( rumbling1 ),
++	.rumbling2         ( rumbling2 ),
++	.ser1_clk_out      ( ser1_clk_out ),
++	.ser1_data_out     ( ser1_data_out ),
++	.ser2_clk_out      ( ser2_clk_out ),
++	.ser2_data_out     ( ser2_data_out )
++);
++
++assign cpu1_addr = machine.gb1.cpu_addr;
++assign cpu1_do   = machine.gb1.cpu_do;
++assign cpu1_wr_n = machine.gb1.cpu_wr_n;
++assign cpu1_rd_n = machine.gb1.cpu_rd_n;
++assign cpu2_addr = machine.gb2.cpu_addr;
++assign cpu2_do   = machine.gb2.cpu_do;
++assign cpu2_wr_n = machine.gb2.cpu_wr_n;
++assign cpu2_rd_n = machine.gb2.cpu_rd_n;
++
++endmodule
+diff --git a/npsim/vhdl_files.txt b/npsim/vhdl_files.txt
+new file mode 100644
+index 0000000..04d1d62
+--- /dev/null
++++ b/npsim/vhdl_files.txt
+@@ -0,0 +1,12 @@
++rtl/bus_savestates.vhd
++rtl/reg_savestates.vhd
++rtl/T80/T80_Pack.vhd
++rtl/T80/T80_ALU.vhd
++rtl/T80/T80_MCode.vhd
++rtl/T80/T80_Reg.vhd
++rtl/T80/T80.vhd
++rtl/T80/GBse.vhd
++rtl/gbc_snd.vhd
++rtl/speedcontrol.vhd
++rtl/gb_savestates.vhd
++rtl/gb_statemanager.vhd
+-- 
+2.43.0
+

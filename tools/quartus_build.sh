@@ -4,6 +4,7 @@
 #   tools/quartus_build.sh            build NES_MiSTer, then check timing
 #   tools/quartus_build.sh --timing   only check the last build's timing
 #   CORE=SNES tools/quartus_build.sh  the same for SNES_MiSTer
+#   CORE=Gameboy CORE_DIR=Gameboy2P_MiSTer tools/quartus_build.sh  project name != folder
 #
 # Needs the mister-quartus17 image (tools/quartus-docker/README.md).
 # Result: <CORE>_MiSTer/output_files/<CORE>.rbf, log in <CORE>_MiSTer/output_files/quartus.log.
@@ -13,7 +14,7 @@ set -uo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 image="${QUARTUS_IMAGE:-mister-quartus17}"
 name="${CORE:-NES}"
-core="$root/${name}_MiSTer"
+core="$root/${CORE_DIR:-${name}_MiSTer}"
 out="$core/output_files"
 
 if [ "${1:-}" != "--timing" ]; then
