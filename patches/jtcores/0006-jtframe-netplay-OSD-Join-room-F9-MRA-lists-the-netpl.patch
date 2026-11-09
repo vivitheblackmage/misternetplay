@@ -1,0 +1,26 @@
+From d4d530fa20fc7791de65ff3355e84768d77fde9f Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Mon, 9 Nov 2026 21:08:29 +0100
+Subject: [PATCH 6/6] jtframe netplay: OSD Join room (F9, MRA) lists the
+ netplay rooms inside the core
+---
+ modules/jtframe/target/mister/cfgstr | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/modules/jtframe/target/mister/cfgstr b/modules/jtframe/target/mister/cfgstr
+index 93b970837..b2b015e97 100644
+--- a/modules/jtframe/target/mister/cfgstr
++++ b/modules/jtframe/target/mister/cfgstr
+@@ -45,7 +45,8 @@ d5P1oAD,Crop Offset,0,2,4,8,10,12,-12,-10,-8,-6,-4,-2;
+                                     o56,User port,Off,DB15 Joystick,UART; {{ end }}
+     {{ else }}                      o5,User port,Off,DB15 Joystick; {{ end }}
+ {{ if .JTFRAME_CREDITS }} OC,Show credits in pause,On,Off; {{ end }}
+-{{ if .JTFRAME_NETPLAY }}        O[127:126],Netplay,netplay.ini,Off,Host,Join; {{ end }}
++{{ if .JTFRAME_NETPLAY }}        O[127:126],Netplay,netplay.ini,Off,Host,Join;
++                                 F9,MRA,Join room; {{ end }}
+ R0,Reset;
+ {{ with .MISTER_EXTRA }} {{ . }} {{ end }}
+ V,v{{ .JTFRAME_COMMIT }};
+-- 
+2.43.0
+

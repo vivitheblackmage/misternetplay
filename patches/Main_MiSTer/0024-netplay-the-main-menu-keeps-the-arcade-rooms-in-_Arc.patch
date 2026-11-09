@@ -1,0 +1,136 @@
+From 33f9a3d0a9c8679fd713e57e60fb0375197ba0b8 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sun, 8 Nov 2026 18:42:15 +0100
+Subject: [PATCH 24/24] netplay: the main menu keeps the arcade rooms in
+ _Arcade/_Netplay up to date, before any MRA is loaded
+---
+ support/netplay/netplay.cpp          | 22 +++++++++++++++++++++-
+ support/netplay/test/Makefile        |  1 +
+ support/netplay/test/run_udp_test.sh |  2 +-
+ support/netplay/test/udp_harness.cpp | 10 ++++++++--
+ 4 files changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 9fc12fc..70b6d90 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -1196,6 +1196,8 @@ static std::string                      my_room;      // the room we host: not l
+ // restarts Main, so the folder stays mounted across netplay_stop() and the room
+ // is read back from the file, not from room_files.
+ static bool                             arc_lobby = false;   // the lobby serves an arcade core
++static bool                             arc_menu = false;    // ... from the main menu: rooms of every jtframe core
++static bool                             menu_tried = false;  // the menu lobby was considered (once per Main start)
+ static std::mutex                       arc_mtx;
+ static std::map<std::string, std::string> arc_mras;          // lower-case MRA name (no .mra) -> path
+ static const char                       ARC_TAG[] = "<!-- netplay room: ";
+@@ -1389,7 +1391,7 @@ static void update_rooms(const std::string &list)
+ 			else if (f[k].size() < 200) f[k] += c;
+ 		}
+ 		bool two = core_sys == SYS_GB2P && is_hex(f[3], 64);
+-		if (k != 6 || !is_hex(f[0], 8) || f[1] != "waiting" || strcasecmp(f[2].c_str(), srv_core.c_str()) || !(two || is_hex(f[3], 32))) continue;
++		if (k != 6 || !is_hex(f[0], 8) || f[1] != "waiting" || (arc_menu ? strncasecmp(f[2].c_str(), "JT", 2) : strcasecmp(f[2].c_str(), srv_core.c_str())) || !(two || is_hex(f[3], 32))) continue;
+ 		if (f[0] == mine) continue;
+ 		count++;
+ 
+@@ -1630,6 +1632,7 @@ static void server_games_stop()
+ 	if (srv_mounted && !arc_lobby) umount2(np_dir.c_str(), MNT_DETACH);   // the games and rooms are gone with it
+ 	srv_mounted = false;
+ 	arc_lobby = false;
++	arc_menu = false;
+ }
+ 
+ // The netplay thread tells the lobby which room it hosts (not listed), and
+@@ -2143,6 +2146,23 @@ void netplay_stop(void)
+ 
+ void netplay_poll(void)
+ {
++	// The main menu keeps the arcade rooms in _Arcade/_Netplay up to date
++	// (SPEC.md 12.5), so a player sees them before loading any MRA. Loading
++	// one stops it (netplay_stop() on the core change; the folder stays).
++	if (!core_armed && !thread_running && !menu_tried && is_menu())
++	{
++		menu_tried = true;
++		cfg = Config();
++		load_config(&cfg);
++		if (cfg.server[0])
++		{
++			core_sys = SYS_ARCADE;
++			core_name.clear();
++			srv_core.clear();                // /rooms without core: all of them, filtered on JT*
++			arc_menu = true;
++			server_games_start();
++		}
++	}
+ 	if (!thread_running && !core_armed) return;   // lobby messages come before any session
+ 
+ 	// Arcade: there is no game load to start a session after the MRA, so a
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index 91a2186..57d3877 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -33,6 +33,7 @@ test: test_netplay udp_harness
+ 	  NP_SYSTEM=gb2p NP_TWO=1 NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
+ 	  NP_SYSTEM=gb2p NP_TWO=1 NP_SERVER_BIN=$$srv NP_SAV=1 ./run_udp_test.sh && \
+ 	  NP_SYSTEM=arcade NP_SERVER_BIN=$$srv ./run_udp_test.sh && \
++	  NP_SYSTEM=arcade NP_SERVER_BIN=$$srv NP_MENU=1 ./run_udp_test.sh && \
+ 	  NP_SYSTEM=arcade NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
+ 	  NP_SYSTEM=arcade NP_SERVER_BIN=$$srv NP_DIRECT=no NP_AUTOJOIN=1 ./run_udp_test.sh; \
+ 	else echo "SKIP udp (server): build it with server/build.sh"; fi
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+index 89282f2..74f418a 100755
+--- a/support/netplay/test/run_udp_test.sh
++++ b/support/netplay/test/run_udp_test.sh
+@@ -40,7 +40,7 @@ h=$(grep RESULT "$tmp/host.log"); j=$(grep RESULT "$tmp/join.log")
+ echo "host: $h"
+ echo "join: $j"
+ hd=${h##*digest=}; jd=${j##*digest=}
+-label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_TWO:+ (two games)}${NP_OSD:+ (OSD mode)}${NP_SERVER_BIN:+ (server${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}"
++label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_TWO:+ (two games)}${NP_OSD:+ (OSD mode)}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}"
+ ok=0
+ [ $hr -eq 0 ] && [ $jr -eq 0 ] && [ -n "$hd" ] && [ "$hd" = "$jd" ] && ok=1
+ # through a server: the path the session took, and the names
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index 84b77e8..c50a21b 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -45,6 +45,8 @@ static int         spi_cmd = -1, spi_words = 0;
+ char *user_io_get_core_name(int) { static char n[] = "NES", sn[] = "SNES", g[] = "GAMEBOY2P", a[] = "JTBUBL"; return arcade ? a : gb2p ? g : snes ? sn : n; }
+ char *user_io_get_core_path(const char *, int) { static char p[] = "games/NES", sp[] = "games/SNES", g[] = "games/GAMEBOY2P"; return gb2p ? g : snes ? sp : p; }
+ char is_arcade() { return arcade; }
++static bool menu_mode = false;              // NP_MENU: the join starts in the main menu
++char is_menu() { return menu_mode; }
+ 
+ sw_struct *arcade_sw() { return &sw; }
+ void arcade_sw_send()
+@@ -175,7 +177,10 @@ static int run_arcade(bool host, bool osd, uint32_t want)
+ 	// through a server without NP_AUTOJOIN: the join picks the host's room in
+ 	// _Arcade/_Netplay, which reloads the core and restarts Main (SPEC.md 12.5)
+ 	bool pick = getenv("NP_SERVER") && !host && !getenv("NP_AUTOJOIN");
+-	netplay_start();
++	// NP_MENU: the join is in the main menu (no core, no MRA): the menu lobby lists the rooms
++	bool menu = pick && getenv("NP_MENU");
++	menu_mode = menu;
++	if (!menu) netplay_start();
+ 	uint8_t m0[16], m1[16];
+ 	memset(m0, 0x11 + (getenv("NP_ROMSALT") ? atoi(getenv("NP_ROMSALT")) : 0), 16);
+ 	memset(m1, 0x22, 16);
+@@ -186,7 +191,7 @@ static int run_arcade(bool host, bool osd, uint32_t want)
+ 	netplay_note_arcade_rom(0, m0);
+ 	netplay_note_arcade_rom(1, m1);
+ 	arcade_sw_send();                          // mra_loader sends the DIP switches before the end
+-	netplay_note_arcade(mra.c_str(), 0);
++	if (!menu) netplay_note_arcade(mra.c_str(), 0);
+ 	if (pick)
+ 	{
+ 		std::string dir = getFullPath("_Arcade/_Netplay"), room;
+@@ -207,6 +212,7 @@ static int run_arcade(bool host, bool osd, uint32_t want)
+ 		printf("[harness] room file: %s\n", room.c_str());
+ 		// loading it: core reload, Main restarts (netplay_stop, netplay_start), the MRA loads
+ 		netplay_stop();
++		menu_mode = false;
+ 		netplay_start();
+ 		netplay_note_arcade_rom(0, m0);
+ 		netplay_note_arcade_rom(1, m1);
+-- 
+2.43.0
+

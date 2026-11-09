@@ -3,10 +3,15 @@
 # systemd (Raspberry Pi OS, Debian, Ubuntu). Run it from the folder with the
 # netplay-server-linux-* files:
 #
-#   sudo sh install-linux.sh            install or update, then start
+#   sudo sh install-linux.sh            install or update, then start (the same
+#                                       command every time: copy the new folder
+#                                       over, run it again)
 #   sudo sh install-linux.sh remove     stop and remove (keeps /opt/netplay-server)
 #
 # Settings, the key, the roms folder and catalog.txt live in /opt/netplay-server.
+# From the folder this runs in it also takes: roms/ (copied over, nothing is
+# deleted), and netplay-server.ini and catalog.txt when /opt/netplay-server has
+# none yet (so a server moved from another computer keeps its key).
 # Log: journalctl -u netplay-server -f
 set -eu
 
@@ -37,6 +42,10 @@ id netplay >/dev/null 2>&1 || useradd --system --home-dir "$dir" --shell /usr/sb
 mkdir -p "$dir/roms"
 systemctl stop netplay-server 2>/dev/null || true
 install -m 0755 "$here/$bin" "$dir/netplay-server"
+[ -d "$here/roms" ] && cp -r "$here/roms/." "$dir/roms/"
+for f in netplay-server.ini catalog.txt; do
+	[ -f "$here/$f" ] && [ ! -f "$dir/$f" ] && cp "$here/$f" "$dir/$f"
+done
 chown -R netplay:netplay "$dir"
 
 cat > "$unit" <<EOF
@@ -73,5 +82,9 @@ echo "netplay-server is running and starts at boot."
 echo "  Settings: $dir/netplay-server.ini   Games to hand out: $dir/roms"
 echo "  Forward port ${port:-7845} (UDP and TCP) in the router to ${ip:-this machine}."
 echo "  In each MiSTer's netplay.ini:  server=<your address>:${port:-7845}   key=$key"
-echo "  Rooms in a browser: http://${ip:-localhost}:${port:-7845}/?key=$key"
+if grep -qi '^public_page *= *\(no\|off\|0\|false\)' "$dir/netplay-server.ini" 2>/dev/null; then
+	echo "  Rooms in a browser: http://${ip:-localhost}:${port:-7845}/?key=$key"
+else
+	echo "  Rooms in a browser: http://${ip:-localhost}:${port:-7845}/"
+fi
 echo "  Log: journalctl -u netplay-server -f"

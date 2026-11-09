@@ -1,7 +1,7 @@
-# NES, SNES and Game Boy netplay for MiSTer
+# NES, SNES, Game Boy and arcade netplay for MiSTer
 
-Play NES, Super NES and Game Boy link-cable games together on two
-[MiSTer FPGA](https://github.com/MiSTer-devel/Wiki_MiSTer/wiki) boards over the
+Play NES, Super NES, Game Boy link-cable games and Bubble Bobble (arcade)
+together on two [MiSTer FPGA](https://github.com/MiSTer-devel/Wiki_MiSTer/wiki) boards over the
 internet or a LAN. Both MiSTers run the real core in lockstep: each frame's controller input is sent to the other side, and both
 run exactly the same frames with the same input. A checksum of the game state
 is compared all the time, so a desync stops the session instead of going on
@@ -16,6 +16,11 @@ It comes in these parts:
   MiSTer runs both Game Boys; the host plays Game Boy 1, the other player Game
   Boy 2, so link-cable games (Tetris, Tennis, Dr. Mario, trading and battles)
   work over the network.
+- **Arcade core** (`jtbubl-netplay.rbf`, Bubble Bobble): Jotego's jtbubl core
+  with the netplay module added to his jtframe framework, so other jtframe
+  arcade cores can follow. It goes next to the normal `jtbubl.rbf`, which stays
+  as it is, and is started from its own MRA,
+  `Bubble Bobble (US, Ver 5.1) [netplay]`.
 - **Main binary** (`MiSTer_online`): the MiSTer main program (menu, file
   browser, input) with the netplay engine and the UDP networking added. Your
   normal MiSTer binary is kept, and you can switch back from the Scripts menu.
@@ -50,6 +55,11 @@ MiSTer-devel project.
   (Verilator): two simulated MiSTers stay in sync over 1,800 frames of a Tetris
   link match, and also when one of them ran another game first; the test ROMs dmg-acid2, cgb-acid2,
   instr_timing and cpu_instrs pass.
+- Bubble Bobble on hardware: two MiSTers over the internet through the lobby
+  server (on a Raspberry Pi), 33 levels in 20 minutes without a desync, and
+  without picture glitches. In simulation (Verilator): the whole jtbubl core on
+  two simulated MiSTers stays in sync, with the same order of every clock
+  enable, and a changed input is caught as a desync in the frame it happens.
 - Automated tests for the core (Verilator testbench) and for the netplay engine,
   host and join over real UDP, with and without the server.
 
@@ -63,14 +73,16 @@ them; it holds our changes as patches on top of exact upstream commits:
 | NES core (FPGA) | [github.com/MiSTer-devel/NES_MiSTer](https://github.com/MiSTer-devel/NES_MiSTer) | `49a0a66` (2026-09-30) | [`patches/NES_MiSTer/`](patches/NES_MiSTer) |
 | SNES core (FPGA) | [github.com/MiSTer-devel/SNES_MiSTer](https://github.com/MiSTer-devel/SNES_MiSTer) | `4c2b746` (2026-10-31) | [`patches/SNES_MiSTer/`](patches/SNES_MiSTer) |
 | Game Boy 2P core (FPGA) | [github.com/pomstazlesa/Gameboy2PUW_MiSTer](https://github.com/pomstazlesa/Gameboy2PUW_MiSTer) (branch `Gameboy2P`) | `83e167f` (2025-10-05) | [`patches/Gameboy2P_MiSTer/`](patches/Gameboy2P_MiSTer) |
+| Arcade core (FPGA) | [github.com/jotego/jtcores](https://github.com/jotego/jtcores) (jtbubl and jtframe) | `15d60ca` (2026-10-23) | [`patches/jtcores/`](patches/jtcores) |
 | Main binary (ARM) | [github.com/MiSTer-devel/Main_MiSTer](https://github.com/MiSTer-devel/Main_MiSTer) | `0827165` (2026-10-30) | [`patches/Main_MiSTer/`](patches/Main_MiSTer) |
 
 The NES and SNES cores are the work of the MiSTer-devel contributors and of the
 authors credited in their own READMEs; Main_MiSTer likewise. The Game Boy 2P
-core is pomstazlesa's two-player fork of the MiSTer-devel Game Boy core. All
-are licensed GPL-3.0, and so are our patches.
+core is pomstazlesa's two-player fork of the MiSTer-devel Game Boy core. The
+arcade core and jtframe are Jotego's (jtcores). All are licensed GPL-3.0, and
+so are our patches.
 
-`./setup.sh` clones the four upstream repositories next to it and applies the
+`./setup.sh` clones the five upstream repositories next to it and applies the
 patches on a branch called `netplay`.
 
 Everything else here is our own: the lobby server (`server/`), the tools
@@ -83,7 +95,7 @@ Everything else here is our own: the lobby server (`server/`), the tools
 | | Needed |
 | --- | --- |
 | MiSTer | Two MiSTers (DE10-Nano) with SDRAM, a network connection (Ethernet is best) and the current MiSTer Linux. Tested on kernel `6.18.38-MiSTer` (glibc 2.31). `MiSTer_online` needs glibc 2.29 or newer, so a MiSTer kept up to date with the official updater (`update_all` or `downloader`) is fine. Check with `uname -r` over ssh. |
-| Game | The same ROM file on both MiSTers (same md5), or the server's copy. NetPong, a free two-player NES test game, is included. Game Boy 2P needs the SDRAM board, as the original core. |
+| Game | The same ROM file on both MiSTers (same md5), or the server's copy. NetPong, a free two-player NES test game, is included. Game Boy 2P needs the SDRAM board, as the original core. Bubble Bobble: the ROM set the MiSTer updater installs for Jotego's core (`games/mame/bublbobl.zip`), the same on both MiSTers; arcade games never come from the server. |
 | Server (optional) | Windows 10/11, or Linux on x86-64, ARM64 or ARMv7, such as Raspberry Pi OS (32- or 64-bit), Debian or Ubuntu. The binaries have no dependencies; the installer needs systemd (without it, run the binary by hand). Tested on Windows 10; Linux x86-64 in the automated tests. One forwarded port (7845, UDP and TCP) on the server's router. |
 | Building (developers) | Linux, tested on Ubuntu 24.04 (also in WSL2 on Windows 10). Docker for Quartus Prime Lite 17.0.2, Verilator 5, g++, Python 3, Go 1.22 (or Docker). See [Building](#building). |
 
@@ -97,6 +109,9 @@ computer. Then on **each** MiSTer:
    computer. None of your files is overwritten:
    - `_Console/NES_netplay.rbf`, `_Console/SNES_netplay.rbf` and
      `_Console/GAMEBOY2P_netplay.rbf`: the cores, next to the normal ones
+   - `_Arcade/cores/jtbubl-netplay.rbf` and
+     `_Arcade/Bubble Bobble (US, Ver 5.1) [netplay].mra`: the arcade core and
+     its MRA, next to Jotego's (which are not changed)
    - `MiSTer_online`: the netplay main binary
    - `Scripts/netplay_on.sh`, `Scripts/netplay_off.sh`
    - `netplay.ini`: the settings (keep yours if you already have one)
@@ -111,6 +126,8 @@ computer. Then on **each** MiSTer:
    the same OSD settings.
 5. Game Boy 2P: start **Console → GAMEBOY2P_netplay**. Put the games
    (`.gb`, `.gbc`) in `games/GAMEBOY2P`. Nothing to set up.
+6. Arcade: start **Arcade → Bubble Bobble (US, Ver 5.1) [netplay]**. Nothing
+   to set up; the DIP switches are the host's during a session.
 
 **Switching between the netplay cores:** reboot from the MiSTer's menu first,
 then start the other core. Jumping straight from one core to the
@@ -142,6 +159,11 @@ delay=4
   (`Alex - NetPong`) and pick the game in it. Leave and re-open the folder to
   see new rooms. The server's own games are in **_Netplay/Server games**.
   Rooms and games are per core: SNES rooms show in SNES_netplay only.
+- **Join without picking a room:** OSD **Netplay → Join** and load the game.
+  This joins only when exactly one room with that game is open; with more the
+  OSD says `2 rooms with this game: pick one`. Note: with `mode=join` in
+  `netplay.ini` (or the OSD on Join) this happens on every game load; keep
+  `mode=off` and the OSD on `netplay.ini` to pick rooms yourself.
 - The OSD says `playing with Alex (delay 4, direct)` or `... through the server`.
 
 All settings are described in [`tools/netplay.ini.example`](tools/netplay.ini.example).
@@ -165,6 +187,24 @@ All settings are described in [`tools/netplay.ini.example`](tools/netplay.ini.ex
 - Not supported: MegaDuck games (`.bin`). OSD reset, *Reload Backup RAM* and
   *Sync Video* are off during netplay.
 
+### Arcade (Bubble Bobble)
+
+- Start **Bubble Bobble (US, Ver 5.1) [netplay]** in the Arcade list on both
+  MiSTers. The host is player 1.
+- **Host:** OSD **Netplay → Host**.
+- **Join with a server:** in the game's OSD, **Join room**, and pick the room
+  (`Alex - Bubble Bobble (US, Ver 5.1) [netplay]`); the game is not reloaded.
+  The same rooms are in the Arcade list, folder **_Netplay**, also from the
+  main menu before any core is loaded. Or **Netplay → Join** (exactly one open
+  room, as above).
+- **Join without a server:** `peer=` in `netplay.ini`, then **Netplay → Join**.
+- Both need the same ROM set (checked) and the same core. The host's DIP
+  switches are used during the session; yours come back afterwards. The RAM is
+  cleared at the start of a session, so high scores from before do not count.
+- Pause, test and service switches are off during netplay. While the game waits
+  for the other player's input, HDMI repeats the last picture; analog video
+  may flicker for that moment.
+
 ## Running the server
 
 - **Windows:** double-click `netplay-server.exe`.
@@ -174,7 +214,7 @@ All settings are described in [`tools/netplay.ini.example`](tools/netplay.ini.ex
 
 The first start writes `netplay-server.ini` with a random key. Forward port
 **7845, UDP and TCP**, to that computer. Open rooms show in a browser at
-`http://<server>:7845/?key=<key>`. The server's games go in `roms/NES` (or
+`http://<server>:7845/` (no key needed; `public_page=no` in `netplay-server.ini` asks for `?key=`). The server's games go in `roms/NES` (or
 `roms` itself), `roms/SNES` and `roms/GB`. Details: [`server/README.md`](server/README.md).
 
 ## Troubleshooting
@@ -213,8 +253,11 @@ The MiSTer boots, but the screen stays black and there is no menu. The new
 | `Set RAM Clear to $00 or $FF` | OSD → Advanced → RAM Clear, then Save settings |
 | `Different core settings` | an OSD setting differs (NES: system type, PPU reset, extra sprites, mask edges, overscan; SNES: region, ROM header, blending, audio clock, initial WRAM/ARAM, GSU slow ROM, Sufami swap): make them the same before loading the game |
 | `Game chip not supported in netplay` | SNES: MSU-1, BS-X/Satellaview, a game with a clock (S-RTC, SPC7110 RTC) or a competition cart |
-| `The other player runs another console` | the two players are in different netplay cores (NES, SNES, Game Boy 2P) |
+| `The other player runs another console` | the two players are in different netplay cores (NES, SNES, Game Boy 2P, arcade) |
 | `Different netplay version` | use the same release on both MiSTers |
+| `Different core version` | arcade: different `jtbubl-netplay.rbf` files: use the same release on both |
+| `server: 2 rooms with this game: pick one` | more than one room with your game is open: pick one in _Netplay/Rooms (arcade: OSD *Join room*) |
+| `rooms need server= in netplay.ini` | arcade *Join room* without a server: use *Netplay → Join* with `peer=` |
 | `cannot reach server` | wrong `server=`, or the server is not running |
 | `server: wrong key` | `key=` does not match the server's |
 | `connection lost` | nothing arrived from the other player for 5 seconds |
@@ -239,15 +282,16 @@ system, not under `/mnt/c`):
 
 ```sh
 sudo apt install -y git make g++ verilator python3 rsync
-./setup.sh                                   # NES_MiSTer/, SNES_MiSTer/ and Main_MiSTer/ with the patches
+./setup.sh                                   # NES_MiSTer/, SNES_MiSTer/, Gameboy2P_MiSTer/, jtcores/ and Main_MiSTer/ with the patches
 make -C NES_MiSTer/sim lint test             # RTL lint and testbench
 make -C SNES_MiSTer/sim                      # whole SNES core in Verilator (GHDL in Docker): snes_sim
 make -C Main_MiSTer/support/netplay/test     # netplay engine tests, host + join over UDP
 tools/quartus_build.sh                       # the NES core, Quartus 17.0.2 in Docker (10-30 min)
 CORE=SNES tools/quartus_build.sh             # the SNES core (about 40 min)
 (cd Main_MiSTer && source setup_default_toolchain.sh && make)   # MiSTer_online
+tools/jt_build.sh bubl                       # the arcade core, Quartus 20.1 in Docker (jotego/jtcore20, about 15 min)
 server/build.sh                              # netplay-server, Go in Docker
-tools/make_release.sh v0.3                   # releases/v0.3/ and mister-netplay-v0.3.zip
+tools/make_release.sh v0.4                   # releases/v0.4/ and mister-netplay-v0.4.zip
 ```
 
 The Quartus image: [`tools/quartus-docker/README.md`](tools/quartus-docker/README.md).
@@ -256,6 +300,6 @@ The design and the protocols are specified in [`SPEC.md`](SPEC.md).
 
 ## Licence
 
-GPL-3.0 (see `LICENSE`), as the upstream NES_MiSTer, SNES_MiSTer and Main_MiSTer.
+GPL-3.0 (see `LICENSE`), as the upstream NES_MiSTer, SNES_MiSTer, Gameboy2P, jtcores and Main_MiSTer.
 `tools/quartus-docker` is MIT (see `tools/quartus-docker/LICENSE.ebraminio`).
 Only put games on a server that you are allowed to share.

@@ -1,0 +1,923 @@
+From a356b20048bb5dd06476600e2f6192ca9d2c204f Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sun, 8 Nov 2026 20:27:00 +0100
+Subject: [PATCH 3/6] jtbubl netplay: CPU ROMs in block RAM (the SDRAM latency
+ differed between MiSTers and changed the order of the clock enables), the
+ game's RAM cleared at a session start, np_test checks the clock enable order
+---
+ cores/bubl/cfg/files.yaml                     |  1 +
+ cores/bubl/cfg/mem.yaml                       | 22 +++++++
+ cores/bubl/hdl/jtbubl_colmix.v                | 29 ++++++++--
+ cores/bubl/hdl/jtbubl_game.v                  | 55 +++++++++++++++---
+ cores/bubl/hdl/jtbubl_gfx.v                   | 57 +++++++++++++++----
+ cores/bubl/hdl/jtbubl_main.v                  | 32 +++++++++--
+ cores/bubl/hdl/jtbubl_sound.v                 |  4 ++
+ cores/bubl/hdl/jtbubl_video.v                 |  3 +
+ modules/jtframe/hdl/cpu/jtframe_6801mcu.v     | 25 ++++++--
+ modules/jtframe/hdl/cpu/jtframe_z80.v         | 27 ++++++++-
+ modules/jtframe/hdl/inc/game_sdram.v          |  4 ++
+ .../jtframe/hdl/inc/jtframe_game_instance.v   |  1 +
+ .../jtframe/hdl/inc/jtframe_game_ports.inc    |  3 +
+ modules/jtframe/hdl/ram/jtframe_np_ramclr.v   | 43 ++++++++++++++
+ modules/jtframe/hdl/ver/game_test.v           | 13 +++++
+ .../jtframe/target/mister/hdl/jtframe_emu.sv  |  2 +
+ .../target/mister/hdl/jtframe_mister.sv       |  5 +-
+ .../target/mister/hdl/jtframe_np_board.sv     |  5 ++
+ modules/jtframe/verilator/np_test.cpp         | 42 +++++++++++++-
+ 19 files changed, 330 insertions(+), 43 deletions(-)
+ create mode 100644 modules/jtframe/hdl/ram/jtframe_np_ramclr.v
+
+diff --git a/cores/bubl/cfg/files.yaml b/cores/bubl/cfg/files.yaml
+index 5dfe1997c..c10a32831 100644
+--- a/cores/bubl/cfg/files.yaml
++++ b/cores/bubl/cfg/files.yaml
+@@ -21,6 +21,7 @@ jtframe:
+       - jtframe_ram.v
+       - jtframe_obj_buffer.v
+       - jtframe_prom.v
++      - jtframe_np_ramclr.v
+   - from: video
+     get:
+       - jtframe_vtimer.v
+diff --git a/cores/bubl/cfg/mem.yaml b/cores/bubl/cfg/mem.yaml
+index 20db9d7e3..d05897f87 100644
+--- a/cores/bubl/cfg/mem.yaml
++++ b/cores/bubl/cfg/mem.yaml
+@@ -37,6 +37,28 @@ sdram:
+           addr_width: 19
+           data_width: 32
+ bram:
++  # Netplay (SPEC 12.3): the CPUs read their ROMs from block RAM, so a ROM read
++  # always takes the same time and the clock enables never wait for the SDRAM,
++  # whose latency differs between two MiSTers. The SDRAM buses above keep the
++  # ROM layout; jtbubl_game leaves them unused.
++  - name: mainrom
++    addr_width: 18
++    data_width: 8
++    when: [ JTFRAME_NETPLAY ]
++    rom:
++      offset: "0"
++  - name: subrom
++    addr_width: 15
++    data_width: 8
++    when: [ JTFRAME_NETPLAY ]
++    rom:
++      offset: "24'h01_4000"
++  - name: sndrom
++    addr_width: 15
++    data_width: 8
++    when: [ JTFRAME_NETPLAY ]
++    rom:
++      offset: "24'h40_0000"
+   - name: mcu
+     addr_width: 12
+     data_width: 8
+diff --git a/cores/bubl/hdl/jtbubl_colmix.v b/cores/bubl/hdl/jtbubl_colmix.v
+index e9fa5e64f..4867ff047 100644
+--- a/cores/bubl/hdl/jtbubl_colmix.v
++++ b/cores/bubl/hdl/jtbubl_colmix.v
+@@ -3,6 +3,7 @@
+  * Date: 29-05-2020 */
+ 
+ module jtbubl_colmix(
++    input       [1:0]   np_ram,     // netplay RAM clear (jtframe_np_ramclr)
+     input               clk,
+     input               clk_cpu,
+     input               pxl_cen,
+@@ -38,13 +39,21 @@ assign green    = col_out[3:0];
+ assign blue     = col_out[15:12];
+ assign pal_dout = !cpu_addr[0] ? pal_even : pal_odd;
+ 
++wire [7:0] pal0_a;
++wire [7:0] pal0_d;
++wire       pal0_w;
++jtframe_np_ramclr #(.AW(8)) pal0_np(
++    .clk(clk_cpu), .cen(1'b1), .mode(np_ram),
++    .addr(pal_addr), .din(cpu_dout), .we(pal0_we),
++    .addr_o(pal0_a), .din_o(pal0_d), .we_o(pal0_w) );
++
+ jtframe_dual_ram #(.AW(8),.SIMHEXFILE("pal_even.hex")) u_ram0(
+     .clk0   ( clk_cpu      ),
+     .clk1   ( clk          ),
+     // Port 0
+-    .data0  ( cpu_dout     ),
+-    .addr0  ( pal_addr     ),
+-    .we0    ( pal0_we      ),
++    .data0  ( pal0_d       ),
++    .addr0  ( pal0_a       ),
++    .we0    ( pal0_w       ),
+     .q0     ( pal_even     ),
+     // Port 1
+     .data1  (              ),
+@@ -53,13 +62,21 @@ jtframe_dual_ram #(.AW(8),.SIMHEXFILE("pal_even.hex")) u_ram0(
+     .q1     ( co_bus[7:0]  )
+ );
+ 
++wire [7:0] pal1_a;
++wire [7:0] pal1_d;
++wire       pal1_w;
++jtframe_np_ramclr #(.AW(8)) pal1_np(
++    .clk(clk_cpu), .cen(1'b1), .mode(np_ram),
++    .addr(pal_addr), .din(cpu_dout), .we(pal1_we),
++    .addr_o(pal1_a), .din_o(pal1_d), .we_o(pal1_w) );
++
+ jtframe_dual_ram #(.AW(8),.SIMHEXFILE("pal_odd.hex")) u_ram1(
+     .clk0   ( clk_cpu      ),
+     .clk1   ( clk          ),
+     // Port 0
+-    .data0  ( cpu_dout     ),
+-    .addr0  ( pal_addr     ),
+-    .we0    ( pal1_we      ),
++    .data0  ( pal1_d       ),
++    .addr0  ( pal1_a       ),
++    .we0    ( pal1_w       ),
+     .q0     ( pal_odd      ),
+     // Port 1
+     .data1  (              ),
+diff --git a/cores/bubl/hdl/jtbubl_game.v b/cores/bubl/hdl/jtbubl_game.v
+index a816bc704..163260b49 100644
+--- a/cores/bubl/hdl/jtbubl_game.v
++++ b/cores/bubl/hdl/jtbubl_game.v
+@@ -40,7 +40,42 @@ always @(posedge clk) begin
+     endcase
+ end
+ /* verilator tracing_off */
++`ifndef JTFRAME_NETPLAY
++wire [1:0] np_ram = 2'd0;   // netplay clears the RAM at a session start (jtframe_np_ramclr)
++`endif
++
++// The CPUs' ROM buses. With netplay they read block RAM (mem.yaml mainrom,
++// subrom, sndrom): ok drops for the one clock after an address change, the
++// same on both MiSTers, and the SDRAM buses stay idle so the clock enables
++// never wait for the SDRAM.
++wire       main_rq, sub_rq, snd_rq, main_rok, sub_rok, snd_rok;
++wire [7:0] main_rdata, sub_rdata, snd_rdata;
++`ifdef JTFRAME_NETPLAY
++reg [17:0] main_aq;
++reg [14:0] sub_aq, snd_aq;
++always @(posedge clk) begin
++    main_aq <= main_addr;
++    sub_aq  <= sub_addr;
++    snd_aq  <= snd_addr;
++end
++assign mainrom_addr = main_addr;
++assign subrom_addr  = sub_addr;
++assign sndrom_addr  = snd_addr;
++assign { main_cs, sub_cs, snd_cs } = 3'd0;
++assign main_rok   = main_addr == main_aq;
++assign sub_rok    = sub_addr  == sub_aq;
++assign snd_rok    = snd_addr  == snd_aq;
++assign main_rdata = mainrom_data;
++assign sub_rdata  = subrom_data;
++assign snd_rdata  = sndrom_data;
++`else
++assign { main_cs, sub_cs, snd_cs } = { main_rq, sub_rq, snd_rq };
++assign { main_rok, sub_rok, snd_rok } = { main_ok, sub_ok, snd_ok };
++assign { main_rdata, sub_rdata, snd_rdata } = { main_data, sub_data, snd_data };
++`endif
++
+ jtbubl_main u_main(
++    .np_ram         ( np_ram        ),
+     .rst            ( rst           ),
+     .clk            ( clk           ),        // 24 MHz
+     .cen6           ( cen6          ),
+@@ -51,14 +86,14 @@ jtbubl_main u_main(
+     .bootleg        ( bootleg       ),
+     // Main CPU ROM
+     .main_rom_addr  ( main_addr     ),
+-    .main_rom_cs    ( main_cs       ),
+-    .main_rom_ok    ( main_ok       ),
+-    .main_rom_data  ( main_data     ),
++    .main_rom_cs    ( main_rq       ),
++    .main_rom_ok    ( main_rok      ),
++    .main_rom_data  ( main_rdata    ),
+     // Sub CPU ROM
+     .sub_rom_addr   ( sub_addr      ),
+-    .sub_rom_cs     ( sub_cs        ),
+-    .sub_rom_ok     ( sub_ok        ),
+-    .sub_rom_data   ( sub_data      ),
++    .sub_rom_cs     ( sub_rq        ),
++    .sub_rom_ok     ( sub_rok       ),
++    .sub_rom_data   ( sub_rdata     ),
+     // MCU ROM
+     .mcu_rom_addr   ( mcu_addr      ),
+     .mcu_rom_cs     (               ),
+@@ -100,6 +135,7 @@ jtbubl_main u_main(
+ );
+ /* verilator tracing_on */
+ jtbubl_video u_video(
++    .np_ram         ( np_ram        ),
+     .rst            ( rst           ),
+     .clk            ( clk           ),
+     .clk_cpu        ( clk           ),
+@@ -139,6 +175,7 @@ jtbubl_video u_video(
+ );
+ /* verilator tracing_off */
+ jtbubl_sound u_sound(
++    .np_ram         ( np_ram        ),
+     .rst        ( rst           ),
+     .clk        ( clk           ), // 24 MHz
+     .rstn       ( snd_rstn_eff  ),
+@@ -154,9 +191,9 @@ jtbubl_sound u_sound(
+     .main_flag  ( main_flag     ),
+     // ROM
+     .rom_addr   ( snd_addr      ),
+-    .rom_cs     ( snd_cs        ),
+-    .rom_data   ( snd_data      ),
+-    .rom_ok     ( snd_ok        ),
++    .rom_cs     ( snd_rq        ),
++    .rom_data   ( snd_rdata     ),
++    .rom_ok     ( snd_rok       ),
+ 
+     // Sound output
+     .fm03       ( fm03          ),
+diff --git a/cores/bubl/hdl/jtbubl_gfx.v b/cores/bubl/hdl/jtbubl_gfx.v
+index 00a6e9ba2..9f37c0adc 100644
+--- a/cores/bubl/hdl/jtbubl_gfx.v
++++ b/cores/bubl/hdl/jtbubl_gfx.v
+@@ -3,6 +3,7 @@
+  * Date: 29-05-2020 */
+ 
+ module jtbubl_gfx(
++    input       [1:0]   np_ram,     // netplay RAM clear (jtframe_np_ramclr)
+     input               rst,
+     input               clk,
+     input               clk_cpu,
+@@ -225,13 +226,21 @@ always @(posedge clk, posedge rst) begin
+     end
+ end
+ 
++wire [10:0] vram0_a;
++wire [7:0] vram0_d;
++wire       vram0_w;
++jtframe_np_ramclr #(.AW(11)) vram0_np(
++    .clk(clk_cpu), .cen(1'b1), .mode(np_ram),
++    .addr(vram_addr), .din(cpu_dout), .we(vram_we[0]),
++    .addr_o(vram0_a), .din_o(vram0_d), .we_o(vram0_w) );
++
+ jtframe_dual_ram #(.AW(11),.SIMHEXFILE("vram0.hex")) u_ram0(
+     .clk0   ( clk_cpu   ),
+     .clk1   ( clk       ),
+     // Port 0
+-    .data0  ( cpu_dout  ),
+-    .addr0  ( vram_addr ),
+-    .we0    ( vram_we[0]),
++    .data0  ( vram0_d   ),
++    .addr0  ( vram0_a   ),
++    .we0    ( vram0_w   ),
+     .q0     ( vram0_dout),
+     // Port 1
+     .data1  (           ),
+@@ -240,13 +249,21 @@ jtframe_dual_ram #(.AW(11),.SIMHEXFILE("vram0.hex")) u_ram0(
+     .q1     ( scan0_data)
+ );
+ 
++wire [10:0] vram1_a;
++wire [7:0] vram1_d;
++wire       vram1_w;
++jtframe_np_ramclr #(.AW(11)) vram1_np(
++    .clk(clk_cpu), .cen(1'b1), .mode(np_ram),
++    .addr(vram_addr), .din(cpu_dout), .we(vram_we[1]),
++    .addr_o(vram1_a), .din_o(vram1_d), .we_o(vram1_w) );
++
+ jtframe_dual_ram #(.AW(11),.SIMHEXFILE("vram1.hex")) u_ram1(
+     .clk0   ( clk_cpu   ),
+     .clk1   ( clk       ),
+     // Port 0
+-    .data0  ( cpu_dout  ),
+-    .addr0  ( vram_addr ),
+-    .we0    ( vram_we[1]),
++    .data0  ( vram1_d   ),
++    .addr0  ( vram1_a   ),
++    .we0    ( vram1_w   ),
+     .q0     ( vram1_dout),
+     // Port 1
+     .data1  (           ),
+@@ -255,13 +272,21 @@ jtframe_dual_ram #(.AW(11),.SIMHEXFILE("vram1.hex")) u_ram1(
+     .q1     ( scan1_data)
+ );
+ 
++wire [10:0] vram2_a;
++wire [7:0] vram2_d;
++wire       vram2_w;
++jtframe_np_ramclr #(.AW(11)) vram2_np(
++    .clk(clk_cpu), .cen(1'b1), .mode(np_ram),
++    .addr(vram_addr), .din(cpu_dout), .we(vram_we[2]),
++    .addr_o(vram2_a), .din_o(vram2_d), .we_o(vram2_w) );
++
+ jtframe_dual_ram #(.AW(11),.SIMHEXFILE("vram2.hex")) u_ram2(
+     .clk0   ( clk_cpu     ),
+     .clk1   ( clk       ),
+     // Port 0
+-    .data0  ( cpu_dout  ),
+-    .addr0  ( vram_addr ),
+-    .we0    ( vram_we[2]),
++    .data0  ( vram2_d   ),
++    .addr0  ( vram2_a   ),
++    .we0    ( vram2_w   ),
+     .q0     ( vram2_dout),
+     // Port 1
+     .data1  (           ),
+@@ -270,13 +295,21 @@ jtframe_dual_ram #(.AW(11),.SIMHEXFILE("vram2.hex")) u_ram2(
+     .q1     ( scan2_data)
+ );
+ 
++wire [10:0] vram3_a;
++wire [7:0] vram3_d;
++wire       vram3_w;
++jtframe_np_ramclr #(.AW(11)) vram3_np(
++    .clk(clk_cpu), .cen(1'b1), .mode(np_ram),
++    .addr(vram_addr), .din(cpu_dout), .we(vram_we[3]),
++    .addr_o(vram3_a), .din_o(vram3_d), .we_o(vram3_w) );
++
+ jtframe_dual_ram #(.AW(11),.SIMHEXFILE("vram3.hex")) u_ram3(
+     .clk0   ( clk_cpu     ),
+     .clk1   ( clk       ),
+     // Port 0
+-    .data0  ( cpu_dout  ),
+-    .addr0  ( vram_addr ),
+-    .we0    ( vram_we[3]),
++    .data0  ( vram3_d   ),
++    .addr0  ( vram3_a   ),
++    .we0    ( vram3_w   ),
+     .q0     ( vram3_dout),
+     // Port 1
+     .data1  (           ),
+diff --git a/cores/bubl/hdl/jtbubl_main.v b/cores/bubl/hdl/jtbubl_main.v
+index 9b95c1ad8..72adfc52e 100644
+--- a/cores/bubl/hdl/jtbubl_main.v
++++ b/cores/bubl/hdl/jtbubl_main.v
+@@ -3,6 +3,7 @@
+  * Date: 1-06-2020 */
+ 
+ module jtbubl_main(
++    input       [1:0]   np_ram,     // netplay RAM clear (jtframe_np_ramclr)
+     input               rst,
+     input               clk,
+     input               cen6,
+@@ -258,11 +259,19 @@ always @(*) begin
+ end
+ */
+ // Time shared
++wire [12:0] work_a;
++wire [7:0] work_d;
++wire       work_w;
++jtframe_np_ramclr #(.AW(13)) work_np(
++    .clk(clk), .cen(1'b1), .mode(np_ram),
++    .addr(main_addr[12:0]), .din(main_dout), .we(~main_wrn & lde),
++    .addr_o(work_a), .din_o(work_d), .we_o(work_w) );
++
+ jtframe_dual_ram #(.AW(13)) u_work(
+     .clk0   ( clk             ),
+-    .data0  ( main_dout       ),
+-    .addr0  ( main_addr[12:0] ),
+-    .we0    ( ~main_wrn & lde ),
++    .data0  ( work_d          ),
++    .addr0  ( work_a          ),
++    .we0    ( work_w          ),
+     .q0     ( work2main_dout  ),
+     // Sub CPU
+     .clk1   ( clk             ),
+@@ -415,13 +424,21 @@ jtframe_ff u_mcu2main (
+ );
+ 
+ // Time shared
++wire [9:0] comm_a;
++wire [7:0] comm_d;
++wire       comm_w;
++jtframe_np_ramclr #(.AW(10)) comm_np(
++    .clk(clk), .cen(1'b1), .mode(np_ram),
++    .addr(main_addr[9:0]), .din(main_dout), .we(mcram_we),
++    .addr_o(comm_a), .din_o(comm_d), .we_o(comm_w) );
++
+ jtframe_dual_ram #(.AW(10)) u_comm(
+     .clk0   ( clk              ),
+     .clk1   ( clk              ),
+     // Main CPU
+-    .addr0  ( main_addr[9:0]     ),
+-    .data0  ( main_dout          ),
+-    .we0    ( mcram_we           ),
++    .addr0  ( comm_a             ),
++    .data0  ( comm_d             ),
++    .we0    ( comm_w             ),
+     .q0     ( comm2main          ),
+     // MCU
+     .addr1  ( mcu_bus[9:0]       ),
+@@ -545,6 +562,9 @@ jtframe_6801mcu #(.MODE(7)) u_mcu01 ( // MC6801U4
+     .rom_addr   ( rom01_a       ),
+     .rom_data   ( mcu_rom_data  ),
+     .rom_cs     ( rom01_cs      )
++`ifdef JTFRAME_NETPLAY
++   ,.np_ram     ( np_ram        )
++`endif
+ );
+ 
+ jtkunio_mcu u_mcu05(
+diff --git a/cores/bubl/hdl/jtbubl_sound.v b/cores/bubl/hdl/jtbubl_sound.v
+index 5b9e49768..68015f952 100644
+--- a/cores/bubl/hdl/jtbubl_sound.v
++++ b/cores/bubl/hdl/jtbubl_sound.v
+@@ -3,6 +3,7 @@
+  * Date: 02-06-2020 */
+ 
+ module jtbubl_sound(
++    input       [1:0] np_ram, // netplay RAM clear (jtframe_np_ramclr)
+     input             rst,    // System reset
+     input             rstn,   // from Main
+     input             clk,
+@@ -148,6 +149,9 @@ jtframe_sysz80 #(.RAM_AW(13),.RECOVERY(0)) u_cpu(
+     .ram_cs     ( ram_cs      ),
+     .rom_cs     ( rom_cs      ),
+     .rom_ok     ( 1'b1        )   // SDRAM gating managed in mem.yaml
++`ifdef JTFRAME_NETPLAY
++   ,.np_ram     ( np_ram      )
++`endif
+ );
+ 
+ jt03 #(.YM2203_LUMPED(1)) u_2203(
+diff --git a/cores/bubl/hdl/jtbubl_video.v b/cores/bubl/hdl/jtbubl_video.v
+index 234690392..5ab37ea32 100644
+--- a/cores/bubl/hdl/jtbubl_video.v
++++ b/cores/bubl/hdl/jtbubl_video.v
+@@ -3,6 +3,7 @@
+  * Date: 29-05-2020 */
+ 
+ module jtbubl_video(
++    input       [1:0]   np_ram,     // netplay RAM clear (jtframe_np_ramclr)
+     input               rst,
+     input               clk,
+     input               clk_cpu,
+@@ -71,6 +72,7 @@ u_timer(
+ );
+ 
+ jtbubl_gfx u_gfx(
++    .np_ram     ( np_ram        ),
+     .rst        ( rst            ),
+     .clk        ( clk            ),
+     .clk_cpu    ( clk_cpu        ),
+@@ -103,6 +105,7 @@ jtbubl_gfx u_gfx(
+ 
+ 
+ jtbubl_colmix u_colmix(
++    .np_ram     ( np_ram        ),
+     .clk        ( clk            ),
+     .clk_cpu    ( clk_cpu        ),
+     .pxl_cen    ( pxl_cen        ),
+diff --git a/modules/jtframe/hdl/cpu/jtframe_6801mcu.v b/modules/jtframe/hdl/cpu/jtframe_6801mcu.v
+index d33c39624..135ee1ebe 100644
+--- a/modules/jtframe/hdl/cpu/jtframe_6801mcu.v
++++ b/modules/jtframe/hdl/cpu/jtframe_6801mcu.v
+@@ -45,6 +45,9 @@ module jtframe_6801mcu #(
+     output [ROMW-1:0]  rom_addr,    // just addr, provided as a safeguard to check AW against upper hierarchy's signals
+     input      [ 7:0]  rom_data,
+     output reg         rom_cs
++`ifdef JTFRAME_NETPLAY
++   ,input       [1:0]  np_ram   // jtframe_np_ramclr: the internal RAM is not cleared by rst
++`endif
+ );
+ 
+ localparam M6801=0, M6801U4=1, H6301=2;
+@@ -344,6 +347,18 @@ always @(posedge clk) begin
+     end
+ end
+ 
++// netplay (SPEC 12.3): a session starts with the same internal RAM on both sides
++wire [7:0] ram_a, ram_d;
++wire       ram_w;
++`ifdef JTFRAME_NETPLAY
++jtframe_np_ramclr #(.AW(8)) u_npclr(
++    .clk(clk), .cen(cen), .mode(np_ram),
++    .addr(addr[7:0]), .din(dout), .we(buf_we),
++    .addr_o(ram_a), .din_o(ram_d), .we_o(ram_w) );
++`else
++assign { ram_a, ram_d, ram_w } = { addr[7:0], dout, buf_we };
++`endif
++
+ `ifdef SIMULATION
+ reg [7:0] ram[0:255];
+ reg [7:0] bdout_aux;
+@@ -355,10 +370,12 @@ assign buf_dout = bdout_aux;
+ 
+ always @(posedge clk) begin
+     if( rst ) begin
++`ifndef JTFRAME_NETPLAY // netplay sims keep it as the FPGA's block RAM does
+         for(rk=0;rk<256;rk=rk+1) ram[rk]=0;
++`endif
+         bdout_aux <= 0;
+     end else begin
+-        if(buf_we) ram[addr[7:0]] <= dout;
++        if(ram_w) ram[ram_a] <= ram_d;
+         bdout_aux <= ram[addr[7:0]];
+     end
+ end
+@@ -366,9 +383,9 @@ end
+ jtframe_ram #(.AW(8)) u_buffer( // internal RAM
+     .clk    ( clk       ),
+     .cen    ( cen       ),
+-    .data   ( dout      ),
+-    .addr   ( addr[7:0] ),
+-    .we     ( buf_we    ),
++    .data   ( ram_d     ),
++    .addr   ( ram_a     ),
++    .we     ( ram_w     ),
+     .q      ( buf_dout  )
+ );
+ `endif
+diff --git a/modules/jtframe/hdl/cpu/jtframe_z80.v b/modules/jtframe/hdl/cpu/jtframe_z80.v
+index 049aef936..86cd51053 100644
+--- a/modules/jtframe/hdl/cpu/jtframe_z80.v
++++ b/modules/jtframe/hdl/cpu/jtframe_z80.v
+@@ -35,6 +35,9 @@ module jtframe_sysz80(
+     input         ram_cs,
+     input         rom_cs,
+     input         rom_ok
++`ifdef JTFRAME_NETPLAY
++   ,input  [1:0]  np_ram      // jtframe_np_ramclr
++`endif
+ );
+     parameter
+         RAM_AW   = 12,
+@@ -76,6 +79,9 @@ module jtframe_sysz80(
+         .ram_cs     ( ram_cs    ),
+         .rom_cs     ( rom_cs    ),
+         .rom_ok     ( rom_ok    )
++`ifdef JTFRAME_NETPLAY
++       ,.np_ram     ( np_ram    )
++`endif
+     );
+ endmodule
+ 
+@@ -107,6 +113,9 @@ module jtframe_sysz80_nvram#( parameter
+     output [7:0]  cpu_dout,
+     output [7:0]  ram_dout,
+     // NVRAM dump/restoration
++`ifdef JTFRAME_NETPLAY
++    input  [1:0]        np_ram,
++`endif
+     input  [RAM_AW-1:0] prog_addr,
+     input  [7:0]        prog_data,
+     output [7:0]        prog_din,
+@@ -132,12 +141,24 @@ end
+ 
+     //wire clk_ram = clk & cpu_cen;
+ 
++    wire [RAM_AW-1:0] ram_a;
++    wire [7:0]        ram_d;
++    wire              ram_w;
++`ifdef JTFRAME_NETPLAY
++    jtframe_np_ramclr #(.AW(RAM_AW)) u_npclr(
++        .clk(clk), .cen(1'b1), .mode(np_ram),
++        .addr(A[RAM_AW-1:0]), .din(cpu_dout), .we(ram_we),
++        .addr_o(ram_a), .din_o(ram_d), .we_o(ram_w) );
++`else
++    assign { ram_a, ram_d, ram_w } = { A[RAM_AW-1:0], cpu_dout, ram_we };
++`endif
++
+     jtframe_dual_nvram #(.AW(RAM_AW)) u_ram(
+         // regular access
+         .clk0   ( clk         ), // clk_ram may be needed (?)
+-        .data0  ( cpu_dout    ),
+-        .addr0  ( A[RAM_AW-1:0]),
+-        .we0    ( ram_we      ),
++        .data0  ( ram_d       ),
++        .addr0  ( ram_a       ),
++        .we0    ( ram_w       ),
+         .q0     ( ram_dout    ),
+         // NVRAM interface
+         .clk1   ( clk         ), // should really use clk_rom
+diff --git a/modules/jtframe/hdl/inc/game_sdram.v b/modules/jtframe/hdl/inc/game_sdram.v
+index acaa07b64..47b153aec 100644
+--- a/modules/jtframe/hdl/inc/game_sdram.v
++++ b/modules/jtframe/hdl/inc/game_sdram.v
+@@ -14,6 +14,7 @@ module jt{{.Core}}_game_sdram(
+ `ifdef JTFRAME_NETPLAY
+     input           np_hold,    // freezes the game's clock enables (netplay)
+     input           np_clr,     // restarts them from zero when a session's frame 0 starts
++    input   [ 1:0]  np_ram,     // clears the game's RAM (jtframe_np_ramclr)
+ `endif
+     `include "jtframe_common_ports.inc"
+     `include "jtframe_mem_ports.inc"
+@@ -134,6 +135,9 @@ jtframe_rsthold u_hold(
+ );
+ /* verilator tracing_on */
+ jt{{if .Game}}{{.Game}}{{else}}{{.Core}}{{end}}_game u_game(
++`ifdef JTFRAME_NETPLAY
++    .np_ram     ( np_ram    ),
++`endif
+     .rst        ( rst_h     ),
+     .clk        ( clk       ),
+     .rst24      ( rst24_h   ),
+diff --git a/modules/jtframe/hdl/inc/jtframe_game_instance.v b/modules/jtframe/hdl/inc/jtframe_game_instance.v
+index f92591a2e..d60627572 100644
+--- a/modules/jtframe/hdl/inc/jtframe_game_instance.v
++++ b/modules/jtframe/hdl/inc/jtframe_game_instance.v
+@@ -55,6 +55,7 @@ u_game(
+ `ifdef JTFRAME_NETPLAY
+     .np_hold     ( np_hold        ),
+     .np_clr      ( np_clr         ),
++    .np_ram      ( np_ram         ),
+ `endif
+     .rst         ( game_rst       ),
+     // The main clock is always the same one as the SDRAM
+diff --git a/modules/jtframe/hdl/inc/jtframe_game_ports.inc b/modules/jtframe/hdl/inc/jtframe_game_ports.inc
+index 588de2bee..0162d7b2b 100644
+--- a/modules/jtframe/hdl/inc/jtframe_game_ports.inc
++++ b/modules/jtframe/hdl/inc/jtframe_game_ports.inc
+@@ -1,3 +1,6 @@
++`ifdef JTFRAME_NETPLAY
++    input   [ 1:0]  np_ram,     // netplay: 1 = clear the game's RAM, 2 = fill it (tests), jtframe_np_ramclr
++`endif
+ `include "jtframe_common_ports.inc"
+     // Memory ports
+ `ifndef JTFRAME_MEMGEN // If the game does not use mem.yaml
+diff --git a/modules/jtframe/hdl/ram/jtframe_np_ramclr.v b/modules/jtframe/hdl/ram/jtframe_np_ramclr.v
+new file mode 100644
+index 000000000..41174d689
+--- /dev/null
++++ b/modules/jtframe/hdl/ram/jtframe_np_ramclr.v
+@@ -0,0 +1,43 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++ *
++ * jtframe_np_ramclr.v
++ *
++ * Sits in front of a RAM write port for netplay (SPEC 12.3). A session must
++ * start from the same RAM on both MiSTers, but block RAM keeps whatever the
++ * game left in it (high scores, for instance) across a reset. While mode is
++ * not 0 this takes the port over and writes every address in turn:
++ *   mode 1: zeros (netplay ARMED/PRIME: the game is held in reset meanwhile)
++ *   mode 2: a pseudo-random pattern (test bench only: a "dirty" RAM)
++ * The address advances on cen, so a RAM that only writes on its clock enable
++ * gets every address too.
++ */
++
++module jtframe_np_ramclr #(parameter AW=10, DW=8)(
++    input               clk,
++    input               cen,
++    input       [1:0]   mode,
++    // the game's port
++    input      [AW-1:0] addr,
++    input      [DW-1:0] din,
++    input               we,
++    // to the RAM
++    output     [AW-1:0] addr_o,
++    output     [DW-1:0] din_o,
++    output              we_o
++);
++
++reg [AW-1:0] cnt  = 0;
++reg [15:0]   lfsr = 16'hACE1;
++wire         busy = mode != 2'd0;
++wire [((DW+15)/16)*16-1:0] rnd = {(DW+15)/16{lfsr}};
++
++always @(posedge clk) if( busy && cen ) begin
++    cnt  <= cnt + 1'd1;
++    lfsr <= { lfsr[14:0], lfsr[15] ^ lfsr[13] ^ lfsr[12] ^ lfsr[10] };
++end
++
++assign addr_o = busy ? cnt : addr;
++assign din_o  = mode == 2'd1 ? {DW{1'b0}} : mode == 2'd2 ? rnd[DW-1:0] : din;
++assign we_o   = busy ? 1'b1 : we;
++
++endmodule
+diff --git a/modules/jtframe/hdl/ver/game_test.v b/modules/jtframe/hdl/ver/game_test.v
+index a7241a01e..2ed632816 100644
+--- a/modules/jtframe/hdl/ver/game_test.v
++++ b/modules/jtframe/hdl/ver/game_test.v
+@@ -109,10 +109,13 @@ module game_test(
+     output          np_ddr_req,
+     input           np_ddr_ack,
+     input           np_dip_wr,
++    input           np_ram_dirty,   // fill the game's RAM with a pattern (a "dirty" machine)
+     output [ 2:0]   np_state,
+     output [31:0]   np_frame,
+     output [ 7:0]   np_error,
+     output          np_hold_o,
++    output  [ 2:0]  np_ilv,         // which clock enables fire this clock: the order check of np_test
++    output          np_busy,        // a CPU waits for the SDRAM (the gated clock enables' busy)
+ `endif
+     // input  [21:0]   SDRAM_BA_ADDR0,
+     // input  [21:0]   SDRAM_BA_ADDR1,
+@@ -549,6 +552,7 @@ assign burst_addr=0, burst_ba=0, burst_rd=0, burst_wr=0, burst_din=0,
+ // Netplay (jtframe_np_board.sv): the same logic as on MiSTer, with the
+ // DDR3 mailbox channel on the test bench's ports
+ wire        g_rst, g_service, g_tilt, g_test, g_pause, np_hold, np_clr;
++wire [ 1:0] np_ram;
+ wire [ 9:0] g_joy1, g_joy2;
+ wire [ 3:0] g_start, g_coin;
+ `ifdef JTFRAME_NETPLAY
+@@ -587,6 +591,8 @@ jtframe_np_board #(
+     .np_hold        ( np_hold       ),
+     .np_clr         ( np_clr        ),
+     .np_stall       (               ),
++    .np_ram         ( np_ram        ),
++    .ram_dirty      ( np_ram_dirty  ),
+     .ddr_addr       ( np_ddr_addr   ),
+     .ddr_din        ( np_ddr_din    ),
+     .ddr_dout       ( np_ddr_dout   ),
+@@ -598,7 +604,13 @@ jtframe_np_board #(
+     .np_error       ( np_error      )
+ );
+ assign np_hold_o = np_hold;
++// The order in which the game's clock enables come (np_test --ilv): it must be
++// the same on both sides for the emulation to be. jtbubl's names (cen6 for the
++// CPUs, cen4 for the sound chips) and the pixel enable.
++assign np_ilv = { u_game.cen6, u_game.cen4, pxl_cen };
++assign np_busy = (u_game.main_cs & ~u_game.main_ok) | (u_game.sub_cs & ~u_game.sub_ok) | (u_game.snd_cs & ~u_game.snd_ok);
+ `else
++assign np_ram = 2'd0;
+ assign { g_rst, g_service, g_tilt, g_test, g_pause, np_hold, np_clr } =
+        { rst,   service,   tilt,   dip_test, dip_pause, 1'b0, 1'b0 };
+ assign { g_joy1, g_joy2, g_start, g_coin } = { joystick1, joystick2, cab_1p, coin };
+@@ -609,6 +621,7 @@ u_game(
+ `ifdef JTFRAME_NETPLAY
+     .np_hold     ( np_hold        ),
+     .np_clr      ( np_clr         ),
++    .np_ram      ( np_ram         ),
+ `endif
+     .rst         ( g_rst          ),
+     // The main clock is always the same one as the SDRAM
+diff --git a/modules/jtframe/target/mister/hdl/jtframe_emu.sv b/modules/jtframe/target/mister/hdl/jtframe_emu.sv
+index 7c2cc99c9..af2f785aa 100644
+--- a/modules/jtframe/target/mister/hdl/jtframe_emu.sv
++++ b/modules/jtframe/target/mister/hdl/jtframe_emu.sv
+@@ -196,6 +196,7 @@ assign VGA_SCALER    = 0;
+ assign VGA_DISABLE   = 0;
+ `ifdef JTFRAME_NETPLAY
+ wire   np_hold, np_clr, np_stall;
++wire [1:0] np_ram;
+ assign HDMI_FREEZE   = np_stall;
+ `else
+ assign HDMI_FREEZE   = 0;
+@@ -469,6 +470,7 @@ u_frame(
+     .np_hold        ( np_hold        ),
+     .np_clr         ( np_clr         ),
+     .np_stall       ( np_stall       ),
++    .np_ram         ( np_ram         ),
+ `endif
+     .clk_sys        ( clk_sys        ),
+     .clk_rom        ( clk_rom        ),
+diff --git a/modules/jtframe/target/mister/hdl/jtframe_mister.sv b/modules/jtframe/target/mister/hdl/jtframe_mister.sv
+index 41e8a711f..a87bb26da 100644
+--- a/modules/jtframe/target/mister/hdl/jtframe_mister.sv
++++ b/modules/jtframe/target/mister/hdl/jtframe_mister.sv
+@@ -225,7 +225,8 @@ module jtframe_mister #(parameter
+     // netplay (jtframe_netplay.sv)
+    ,output            np_hold,    // freeze the game's clock enables
+     output            np_clr,     // restart them (first clock of a session)
+-    output            np_stall    // held for missing input: HDMI freeze
++    output            np_stall,   // held for missing input: HDMI freeze
++    output    [1:0]   np_ram      // clear the game's RAM
+ `endif
+ );
+ 
+@@ -765,6 +766,8 @@ jtframe_np_board #(
+     .np_hold        ( np_hold         ),
+     .np_clr         ( np_clr          ),
+     .np_stall       ( np_stall        ),
++    .np_ram         ( np_ram          ),
++    .ram_dirty      ( 1'b0            ),
+     .ddr_addr       ( np_addr         ),
+     .ddr_din        ( np_din          ),
+     .ddr_dout       ( np_dout         ),
+diff --git a/modules/jtframe/target/mister/hdl/jtframe_np_board.sv b/modules/jtframe/target/mister/hdl/jtframe_np_board.sv
+index 3aaaeef41..b1b717248 100644
+--- a/modules/jtframe/target/mister/hdl/jtframe_np_board.sv
++++ b/modules/jtframe/target/mister/hdl/jtframe_np_board.sv
+@@ -41,6 +41,8 @@ module jtframe_np_board #(parameter
+     output            np_hold,
+     output            np_clr,
+     output            np_stall,
++    output      [1:0] np_ram,         // to jtframe_np_ramclr: 1 clear (ARMED, PRIME), 2 fill
++    input             ram_dirty,      // test bench only: fill the RAM with a pattern
+ 
+     // DDR3 mailbox channel (toggle handshake)
+     output     [31:3] ddr_addr,
+@@ -100,6 +102,9 @@ jtframe_netplay u_netplay(
+     .error_o    ( np_error      )
+ );
+ 
++// The RAM is cleared all the time the game is held in reset for a session, so
++// both sides start from the same RAM without a core reload (SPEC 12.3)
++assign np_ram         = { ram_dirty & ~active, active & hold_reset };
+ assign game_rst       = active ? (rst | hold_reset) : bd_game_rst;
+ assign game_joystick1 = active ? (INACT ? ~p1[9:0] : p1[9:0]) : bd_joystick1;
+ assign game_joystick2 = active ? (INACT ? ~p2[9:0] : p2[9:0]) : bd_joystick2;
+diff --git a/modules/jtframe/verilator/np_test.cpp b/modules/jtframe/verilator/np_test.cpp
+index 16985acd7..0a891d31e 100644
+--- a/modules/jtframe/verilator/np_test.cpp
++++ b/modules/jtframe/verilator/np_test.cpp
+@@ -20,6 +20,9 @@
+  *   --delay D     input delay in frames (default 3)
+  *   --latency C   maximum network latency in clocks (default 400000)
+  *   --dirty F     the join plays F frames with random input before its session
++ *   --dirty-ram   the join fills the game's RAM with a pattern before its
++ *                 session (as a MiSTer that played before: high scores etc.);
++ *                 the session start must clear it (jtframe_np_ramclr)
+  *   --stalls N    each side, about once every N of its frames, holds its next
+  *                 INPUT back for up to two frames (a late packet; 0 = off), so
+  *                 the two sides freeze at different moments and for different
+@@ -51,6 +54,13 @@ struct Side {
+     int   ddr_wait = -1;
+     uint64_t held = 0;
+     uint16_t pad = 0;        // this side's player 1, active high {coin, start, buttons, U, D, L, R}
++    bool dirty = false;      // fill the game's RAM (np_ram_dirty)
++    // the order of the clock enables per frame: a hash of the codes of the
++    // clocks in which any of them fires (np_ilv), by np_frame
++    uint64_t ilv = 0;
++    uint32_t ilv_frame = 0;
++    std::map<uint32_t, uint64_t> ilv_by_frame;
++    uint64_t run_clk = 0, busy_clk = 0;   // clocks in RUN not held, and those with a CPU waiting
+ 
+     void apply_pad() {
+         // game_test's inputs are active low
+@@ -62,12 +72,19 @@ struct Side {
+         m->tilt      = 1;
+         m->dip_pause = 1;
+         m->np_dip_wr = 0;
++        m->np_ram_dirty = dirty;
+     }
+ 
+     void step() {
+         apply_pad();
+         sim->clock(1);
+         held += m->np_hold_o;
++        if (m->np_state == 3)
++        {
++            if (m->np_frame != ilv_frame) { ilv_by_frame[ilv_frame] = ilv; ilv = 1469598103934665603ULL; ilv_frame = m->np_frame; }
++            if (m->np_ilv) ilv = (ilv ^ m->np_ilv) * 1099511628211ULL;
++        }
++        if (m->np_state == 3 && !m->np_hold_o) { run_clk++; busy_clk += m->np_busy; }
+         // the mailbox port (toggle handshake), served after a random 4..40 clocks
+         if (m->np_ddr_req != m->np_ddr_ack) {
+             if (ddr_wait < 0) ddr_wait = 4 + rng() % 37;
+@@ -176,6 +193,7 @@ static uint16_t random_pad(std::mt19937_64 &r, uint32_t frame) {
+ 
+ int main(int argc, char *argv[]) {
+     int frames = 600, delay = 3, dirty = 0, stalls = 0;
++    bool dirty_ram = false;
+     uint64_t seed = 1, max_lat = 400000;
+     {
+         const char *e = getenv("NP_ARGS");
+@@ -189,6 +207,7 @@ int main(int argc, char *argv[]) {
+             else if (a[k] == "--latency") max_lat = strtoull(next(), 0, 0);
+             else if (a[k] == "--dirty") dirty = atoi(next());
+             else if (a[k] == "--stalls") stalls = atoi(next());
++            else if (a[k] == "--dirty-ram") dirty_ram = true;
+             else { fprintf(stderr, "np_test: unknown option %s\n", a[k].c_str()); return 2; }
+         }
+     }
+@@ -197,7 +216,7 @@ int main(int argc, char *argv[]) {
+     makeCRCTable();
+     try {
+         UUT mh{&context, "H"}, mj{&context, "J"};
+-        for (UUT *m : {&mh, &mj}) { m->np_ddr_ack = 0; m->np_ddr_dout = 0; m->np_dip_wr = 0; }
++        for (UUT *m : {&mh, &mj}) { m->np_ddr_ack = 0; m->np_ddr_dout = 0; m->np_dip_wr = 0; m->np_ram_dirty = 0; }
+         Side H{"host", &mh}, J{"join", &mj};
+         JTSim sh(mh, argc, argv), sj(mj, argc, argv);
+         H.sim = &sh; J.sim = &sj;
+@@ -211,8 +230,9 @@ int main(int argc, char *argv[]) {
+         hh.arm_at = 2 * FRAME_CLK;
+         hj.arm_at = 2 * FRAME_CLK + (uint64_t)dirty * FRAME_CLK + r() % (3 * FRAME_CLK);
+         hj.settle += r() % FRAME_CLK;
+-        fprintf(stderr, "\nnp_test: join arms %llu clocks after the host%s; delay %d, latency up to %llu clocks, seed %llu\n",
++        fprintf(stderr, "\nnp_test: join arms %llu clocks after the host%s%s; delay %d, latency up to %llu clocks, seed %llu\n",
+             (unsigned long long)(hj.arm_at - hh.arm_at), dirty ? " (after playing with other input)" : "",
++            dirty_ram ? " (its RAM filled with a pattern)" : "",
+             delay, (unsigned long long)max_lat, (unsigned long long)seed);
+ 
+         struct Pkt { uint64_t at; uint32_t f; uint16_t joy; };
+@@ -232,6 +252,8 @@ int main(int argc, char *argv[]) {
+             // the pads change once per frame of each side (or every ~frame before its session)
+             uint32_t hf = hh.phase == 2 ? mh.np_frame : (uint32_t)(now / FRAME_CLK);
+             uint32_t jf = hj.phase == 2 ? mj.np_frame : (uint32_t)(now / FRAME_CLK) + 1000;
++            // --dirty-ram: the join's RAM gets a pattern for 40000 clocks, one frame after the load
++            J.dirty = dirty_ram && hj.phase == 0 && now > loaded_at + FRAME_CLK && now < loaded_at + FRAME_CLK + 40000;
+             if (hf != h_last) { h_last = hf; H.pad = random_pad(ph, hf); }
+             if (jf != j_last) { j_last = jf; J.pad = (hj.phase == 2 || dirty) ? random_pad(pj, jf) : 0; }
+             if (now % 64) continue;
+@@ -264,6 +286,22 @@ int main(int argc, char *argv[]) {
+                 return 1;
+             }
+         }
++        // the clock enable order
++        {
++            uint32_t first = ~0u, diff = 0, both = 0;
++            for (auto &x : H.ilv_by_frame)
++            {
++                auto y = J.ilv_by_frame.find(x.first);
++                if (y == J.ilv_by_frame.end() || x.first == 0) continue;
++                both++;
++                if (y->second != x.second) { diff++; if (first == ~0u) first = x.first; }
++            }
++            if (diff) fprintf(stderr, "\nnp_test: clock enable order differs in %u of %u frames, first frame %u\n", diff, both, first);
++            else fprintf(stderr, "\nnp_test: clock enable order identical in %u frames\n", both);
++            for (Side *x : {&H, &J})
++                fprintf(stderr, "np_test: %s: a CPU waits for the SDRAM in %.2f%% of the clocks\n", x->name,
++                    x->run_clk ? 100.0 * x->busy_clk / x->run_clk : 0.0);
++        }
+         int bad = 0;
+         uint32_t n = std::min(hh.next_crc, hj.next_crc);
+         for (uint32_t f = 0; f < n; f++)
+-- 
+2.43.0
+

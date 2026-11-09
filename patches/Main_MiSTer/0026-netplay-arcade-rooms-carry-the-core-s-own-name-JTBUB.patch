@@ -1,0 +1,75 @@
+From 791b30f0ff226b74f77816913b59f306909f5c1c Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Mon, 9 Nov 2026 19:59:28 +0100
+Subject: [PATCH] netplay: arcade rooms carry the core's own name (JTBUBL), the
+ menu lobby lists every non-console room
+---
+ support/netplay/netplay.cpp          | 16 +++++++++++++---
+ support/netplay/test/udp_harness.cpp |  3 ++-
+ 2 files changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 8b01292..01a719f 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -1037,6 +1037,14 @@ static std::string clean_file(const std::string &in, size_t max)
+ 	return out;
+ }
+ 
++// A room's core field: NES, SNES and GB2P are the consoles; anything else is an
++// arcade core (its own name, "JTBUBL"). Its game must still match one of the
++// player's MRAs (SPEC.md 12.5).
++static bool is_arcade_core(const std::string &c)
++{
++	return !c.empty() && strcasecmp(c.c_str(), "NES") && strcasecmp(c.c_str(), "SNES") && strcasecmp(c.c_str(), "GB2P");
++}
++
+ static bool is_hex(const std::string &s, size_t n)
+ {
+ 	return s.size() == n && s.find_first_not_of("0123456789abcdef") == std::string::npos;
+@@ -1391,7 +1399,7 @@ static void update_rooms(const std::string &list)
+ 			else if (f[k].size() < 200) f[k] += c;
+ 		}
+ 		bool two = core_sys == SYS_GB2P && is_hex(f[3], 64);
+-		if (k != 6 || !is_hex(f[0], 8) || f[1] != "waiting" || (arc_menu ? strncasecmp(f[2].c_str(), "JT", 2) : strcasecmp(f[2].c_str(), srv_core.c_str())) || !(two || is_hex(f[3], 32))) continue;
++		if (k != 6 || !is_hex(f[0], 8) || f[1] != "waiting" || (arc_menu ? !is_arcade_core(f[2]) : strcasecmp(f[2].c_str(), srv_core.c_str())) || !(two || is_hex(f[3], 32))) continue;
+ 		if (f[0] == mine) continue;
+ 		count++;
+ 
+@@ -2123,7 +2131,9 @@ void netplay_start(void)
+ 	cfg = Config();
+ 	load_config(&cfg);
+ 	core_name = user_io_get_core_name();
+-	srv_core = core_sys == SYS_GB2P ? "GB2P" : core_name;
++	// arcade: the core's own name (the OSD's title, "JTBUBL"), the same for every
++	// MRA; core_name is the MRA's set name, which differs per version of a game
++	srv_core = core_sys == SYS_GB2P ? "GB2P" : core_sys == SYS_ARCADE ? user_io_get_core_name(1) : core_name;
+ 	gb_rom1.clear(); gb_rom2.clear();   // gb_boot already holds the boot ROMs of this core load
+ 	arc_xml.clear(); arc_roms.clear(); arc_pending = false; dip_applied = false;
+ 	core_armed = true;
+@@ -2158,7 +2168,7 @@ void netplay_poll(void)
+ 		{
+ 			core_sys = SYS_ARCADE;
+ 			core_name.clear();
+-			srv_core.clear();                // /rooms without core: all of them, filtered on JT*
++			srv_core.clear();                // /rooms without core: all of them, the arcade ones kept
+ 			arc_menu = true;
+ 			server_games_start();
+ 		}
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index beb657b..c77d1c9 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -42,7 +42,8 @@ static int         spi_cmd = -1, spi_words = 0;
+ 
+ // --- stubs for the MiSTer functions netplay.cpp uses ------------------------
+ 
+-char *user_io_get_core_name(int) { static char n[] = "NES", sn[] = "SNES", g[] = "GAMEBOY2P", a[] = "JTBUBL"; return arcade ? a : gb2p ? g : snes ? sn : n; }
++// arcade: the MRA's set name, and with orig the core's own name (as Main has them)
++char *user_io_get_core_name(int orig) { static char n[] = "NES", sn[] = "SNES", g[] = "GAMEBOY2P", a[] = "bublboblr", ao[] = "JTBUBL"; return arcade ? (orig ? ao : a) : gb2p ? g : snes ? sn : n; }
+ char *user_io_get_core_path(const char *, int) { static char p[] = "games/NES", sp[] = "games/SNES", g[] = "games/GAMEBOY2P"; return gb2p ? g : snes ? sp : p; }
+ char is_arcade() { return arcade; }
+ static bool menu_mode = false;              // NP_MENU: the join starts in the main menu
+-- 
+2.43.0
+

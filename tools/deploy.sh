@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Copy the netplay builds to a MiSTer over SSH (default password: 1).
 #
-#   tools/deploy.sh <mister-ip> [core|main|ini|all] [--no-reboot]
+#   tools/deploy.sh <mister-ip> [core|main|ini|arcade|all] [--no-reboot]
 #
 #   core  NES_MiSTer/output_files/NES.rbf  -> /media/fat/_Console/NES_netplay.rbf
 #         SNES_MiSTer/output_files/SNES.rbf -> /media/fat/_Console/SNES_netplay.rbf
@@ -9,6 +9,12 @@
 #         (each when built)
 #   main  Main_MiSTer/bin/MiSTer           -> /media/fat/MiSTer_online, plus
 #         Scripts/netplay_on.sh and netplay_off.sh to switch (your MiSTer is kept)
+#   arcade jtcores/release/mister/jtbubl.rbf -> /media/fat/_Arcade/cores/jtbubl-netplay.rbf
+#         and "Bubble Bobble (US, Ver 5.1) [netplay].mra" made on the MiSTer from
+#         its own US Ver 5.1 MRA with <rbf>jtbubl-netplay</rbf> and the DIP switch
+#         Language on English by default (bit 0; the MRA's default ff is Japanese). Jotego's jtbubl.rbf and its MRAs
+#         are not touched (Main picks <rbf>jtbubl</rbf> by "jtbubl" + "." or "_",
+#         so the "-" keeps the netplay core out of the normal MRAs).
 #   ini   tools/netplay.ini.example        -> /media/fat/netplay.ini (only if missing)
 #
 # A new MiSTer binary only takes effect after a reboot. The script reboots only
@@ -22,7 +28,7 @@ if [ -z "${SSHPW_WRAPPED:-}" ] && [ ! -t 0 ] && [ -f "$(dirname "$0")/sshpw.py" 
 	exec python3 -I "$(dirname "$0")/sshpw.py" "$0" "$@"
 fi
 
-host="${1:?usage: deploy.sh <mister-ip> [core|main|ini|all] [--no-reboot]}"
+host="${1:?usage: deploy.sh <mister-ip> [core|main|ini|arcade|all] [--no-reboot]}"
 what="${2:-all}"
 reboot=1
 [ "${3:-}" = "--no-reboot" ] && reboot=0
@@ -41,6 +47,17 @@ if [[ "$what" == core || "$what" == all ]]; then
 		n=$((n + 1))
 	done
 	[ $n -gt 0 ] || { echo "no core built - build one in Quartus first"; exit 1; }
+fi
+
+if [[ "$what" == arcade ]]; then
+	rbf="$root/jtcores/release/mister/jtbubl.rbf"
+	[ -f "$rbf" ] || { echo "no $rbf - run tools/jt_build.sh bubl first"; exit 1; }
+	scp "${ssh_opts[@]}" "$rbf" "root@$host:/media/fat/_Arcade/cores/jtbubl-netplay.rbf"
+	ssh "${ssh_opts[@]}" "root@$host" 'cd /media/fat/_Arcade && src="_alternatives/_Bubble Bobble/Bubble Bobble (US, Ver 5.1).mra" &&
+		{ [ -f "$src" ] || { echo "no $src on the MiSTer (update_all installs it)"; exit 1; }; } &&
+		sed -e "s|<rbf>jtbubl</rbf>|<rbf>jtbubl-netplay</rbf>|" -e "s|</name>| [netplay]</name>|" -e "/<switches /s|default=\"ff,ff\"|default=\"fe,ff\"|" "$src" > "Bubble Bobble (US, Ver 5.1) [netplay].mra" &&
+		rm -f "Bubble Bobble (Japan, Ver 0.1) [netplay].mra"'
+	echo "arcade -> /media/fat/_Arcade/cores/jtbubl-netplay.rbf, _Arcade/Bubble Bobble (US, Ver 5.1) [netplay].mra"
 fi
 
 if [[ "$what" == main || "$what" == all ]]; then

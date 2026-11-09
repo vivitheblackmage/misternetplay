@@ -1,0 +1,77 @@
+From 25585ca11089fd53a475f26e1cc5542f870866db Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sun, 8 Nov 2026 16:30:47 +0100
+Subject: [PATCH 2/6] np_test: --stalls makes each side hold its INPUT back now
+ and then, so the sides freeze at different moments
+---
+ modules/jtframe/verilator/np_test.cpp | 18 +++++++++++++++++-
+ 1 file changed, 17 insertions(+), 1 deletion(-)
+
+diff --git a/modules/jtframe/verilator/np_test.cpp b/modules/jtframe/verilator/np_test.cpp
+index b3a2bb5cc..16985acd7 100644
+--- a/modules/jtframe/verilator/np_test.cpp
++++ b/modules/jtframe/verilator/np_test.cpp
+@@ -20,6 +20,10 @@
+  *   --delay D     input delay in frames (default 3)
+  *   --latency C   maximum network latency in clocks (default 400000)
+  *   --dirty F     the join plays F frames with random input before its session
++ *   --stalls N    each side, about once every N of its frames, holds its next
++ *                 INPUT back for up to two frames (a late packet; 0 = off), so
++ *                 the two sides freeze at different moments and for different
++ *                 times
+  */
+ 
+ #define main jtsim_main
+@@ -93,6 +97,10 @@ struct FakeHps {
+     uint32_t next_input;
+     std::map<uint32_t, uint32_t> crcs;
+     uint32_t next_crc = 0;
++    uint64_t late_until = 0;            // --stalls: INPUT is held back until then
++    uint32_t late_frame = 0;
++    int      stalls = 0;
++    std::mt19937_64 lr;
+ 
+     FakeHps(Side &ss, bool h, int d, uint8_t sid) : s(ss), host(h), delay(d), sess(sid), next_input(d) {}
+ 
+@@ -132,7 +140,12 @@ struct FakeHps {
+             send.push_back({next_local, (uint16_t)(lo & 0xFFF)});
+             next_local++;
+         }
++        if (stalls && next_input != late_frame) {
++            late_frame = next_input;
++            if (lr() % stalls == 0) late_until = now + lr() % (2 * 811000);
++        }
+         for (;;) {
++            if (now < late_until) break;
+             uint32_t f = next_input - delay;
+             if (!mine.count(f) || !peer.count(f)) break;
+             uint16_t p1 = host ? mine[f] : peer[f], p2 = host ? peer[f] : mine[f];
+@@ -162,7 +175,7 @@ static uint16_t random_pad(std::mt19937_64 &r, uint32_t frame) {
+ }
+ 
+ int main(int argc, char *argv[]) {
+-    int frames = 600, delay = 3, dirty = 0;
++    int frames = 600, delay = 3, dirty = 0, stalls = 0;
+     uint64_t seed = 1, max_lat = 400000;
+     {
+         const char *e = getenv("NP_ARGS");
+@@ -175,6 +188,7 @@ int main(int argc, char *argv[]) {
+             else if (a[k] == "--delay") delay = atoi(next());
+             else if (a[k] == "--latency") max_lat = strtoull(next(), 0, 0);
+             else if (a[k] == "--dirty") dirty = atoi(next());
++            else if (a[k] == "--stalls") stalls = atoi(next());
+             else { fprintf(stderr, "np_test: unknown option %s\n", a[k].c_str()); return 2; }
+         }
+     }
+@@ -190,6 +204,8 @@ int main(int argc, char *argv[]) {
+         H.rng.seed(seed * 7 + 1); J.rng.seed(seed * 13 + 2);
+ 
+         FakeHps hh(H, true, delay, 0x5A), hj(J, false, delay, 0x5A);
++        hh.stalls = hj.stalls = stalls;
++        hh.lr.seed(seed * 41 + 3); hj.lr.seed(seed * 43 + 7);
+         std::mt19937_64 r(seed);
+         const uint64_t FRAME_CLK = 811000;   // 48 MHz / 59.19 Hz
+         hh.arm_at = 2 * FRAME_CLK;
+-- 
+2.43.0
+

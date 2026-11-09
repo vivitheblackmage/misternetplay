@@ -283,7 +283,7 @@ and rooms are in RAM.
 | --- | --- | --- |
 | `_Netplay/Rooms/<room>/` | anything but OSD `Off` | joins that room |
 | anywhere else | Host | opens a room with the game (host) |
-| anywhere else | Join | joins the oldest waiting room with the same game (md5), else OSD "no room with this game" |
+| anywhere else | Join | joins the waiting room with the same game (md5) when there is exactly one; with several the server answers `ERR <n> rooms with this game: pick one` (the player picks a room, nobody is matched with a stranger by chance), with none `ERR no room with this game` |
 
 **Control protocol (UDP, same port).** Packets starting with `NPS1` are for the
 server; fields are separated by tabs (`\t`). Everything from the server and from
@@ -291,7 +291,8 @@ other players is untrusted: lengths and characters are checked, anything
 invalid is dropped.
 - `NPS1 REG` key room role name local-address core md5 game → `NPS1 OK` role
   `waiting|paired` room-id, or `NPS1 ERR` text. `room` is the host's random id
-  (8 hex digits) or `*` for a join without a room (match on md5); after OK the
+  (8 hex digits) or `*` for a join without a room (match on md5, only when
+  exactly one room waits with it); after OK the
   join sends the room's id instead of `*`. REG is sent every second until OK,
   then every 3 seconds. A role is free after 15 s of silence; when a new address
   takes over the place, the old one no longer counts.
@@ -313,7 +314,8 @@ invalid is dropped.
 - `NPS1 BYE` key room role: the room/place is freed at once when a session ends.
 - No hole punching: `direct=no` in `netplay.ini` (everything through the server).
 
-**HTTP (TCP, same port number), all with `?key=`:** `/roms` (`md5 size name`),
+**HTTP (TCP, same port number), all with `?key=` except the status page `/`
+while `public_page=yes` (the default; `no` asks for the key there too):** `/roms` (`md5 size name`),
 `/rom?name=`, `/catalog` (`md5 name`: versions everyone brings themselves; a
 game loaded in server mode that is neither there nor among the server's games
 gives the OSD message "not the server's version of this game"), `/rooms?core=`
@@ -805,3 +807,229 @@ plays with their own save, and in lockstep both MiSTers need the same one.
 | T5g | Replay on one MiSTer, ≥ 36000 frames | "replay OK" on Tetris (2P), Dr. Mario (2P) and a GBC link game |
 | T6g | Two MiSTers through the lobby | 30 min of a two-player match without a CRC mismatch |
 | T7g | 11.B: own saves | after a trade both `.sav` files hold the traded result, each only its own half changed |
+
+## 12. Arcade (v4, in progress: Main_MiSTer and the server (T3), the core (T2a, T4) done; hardware (T5a, T6a) open)
+
+Netplay for arcade cores, starting with Bubble Bobble. The protocol, the server
+and the lockstep model are the same as for NES, SNES and Game Boy 2P. The
+difference: there is no game file. A MiSTer arcade game is an MRA, from which
+Main assembles the ROM out of the player's own zip, so nothing is reloaded or
+sent. Both sides check instead that they assembled exactly the same ROM.
+
+### 12.1 The core
+
+- The arcade cores update_all installs for Bubble Bobble are Jotego's
+  (`jtbubl` from `jotego/jtcores`, MRA `<rbf>jtbubl</rbf>`). Netplay is built
+  into those, in their common framework **jtframe**, so the same work serves
+  the other jtframe cores later.
+- **The netplay core sits next to Jotego's, it never replaces it:** file
+  `_Arcade/cores/jtbubl-netplay.rbf`, loaded by its own MRA, a copy of the
+  player's *Bubble Bobble (US, Ver 5.1)* MRA (English; set `bublboblr`, from
+  `bublbobl.zip`) with `<rbf>jtbubl-netplay</rbf>` and ` [netplay]` in its name (`tools/deploy.sh <ip> arcade`). Main picks the core for
+  `<rbf>jtbubl</rbf>` as the last file named `jtbubl` + `.` or `_`, so the `-`
+  keeps the normal MRAs on `jtbubl.rbf`; update_all does not touch the netplay
+  files. Both players use the netplay MRA (the ROM check does not depend on the
+  MRA's file name). (The `neptuno-fpga` Bubble Bobble repository is
+  Jotego's older port for another board, not the MiSTer core.)
+- Jotego builds MiSTer cores with Quartus 20.1 (`jotego/jtcore20`); see 12.6.
+
+### 12.2 Main_MiSTer: the game and the session
+
+- `System` gets `SYS_ARCADE = 3`, chosen for a core loaded from an MRA
+  (`is_arcade()`) whose configuration string has the option
+  `O[127:126],Netplay,netplay.ini,Off,Host,Join` (status bits `[127:126]`,
+  the same values as the other cores' *Netplay*). Arcade cores without it are
+  not touched.
+- `mra_loader.cpp` calls three hooks: `netplay_note_arcade_rom(index, md5)`
+  when a `<rom>` node is finished (the md5 Main already computes for
+  `asm_md5` over the data it sent), `netplay_note_arcade(xml, nvram)` at the
+  end of `arcade_send_rom()`, after the ROMs and the DIP switches have gone to
+  the core, and `netplay_note_dip()` in `arcade_sw_send()`.
+- **The ROM check.** `rom_md5` in HELLO is the md5 over `{index u8, md5[16]}`
+  of each `<rom>` node that sent data, in index order, the last node per index
+  (as the core holds it; a later `index="0"` node after a valid one sends
+  nothing and does not count) (`rom2_md5` = `rom_md5`). So
+  the ROM data, the order Main assembled it in and the core's header bytes (for
+  Bubble Bobble the PCB type and `<rom index="1">`) all count, but not the
+  MRA's or the zip's file name. A difference gives `REJ_ROM`, shown as
+  "Different ROM set (MRA or zip)". `core_build` is the core's `V,` string
+  (jtframe: the commit), so a core that update_all has updated on only one side
+  gives `REJ_CORE`, "Different core version (update both)".
+- **Starting a session.** The MRA load is the game load: `netplay_note_arcade`
+  starts a session with the OSD *Netplay* option, or `mode=` in `netplay.ini`
+  for *netplay.ini*. As there is no later game load, a change of the OSD
+  option while the core runs starts (Host, Join) or stops (Off) a session. A
+  change counts once the OSD is closed, or after it stood 1.5 s with the OSD
+  open, so stepping through Off, Host and Join does not start sessions.
+  A DIP switch the player changes in the OSD starts the session again (12.4).
+- `sav_md5` is zeros. A game whose MRA has `<nvram>` is refused
+  (`REJ_NVRAM`, "Games with NVRAM are not supported yet"): its NVRAM is the
+  player's own and has changed since it was loaded.
+- The OSD Reset, the cheats and the pause are the core's matter (12.3).
+
+### 12.3 The core's netplay module (requirements)
+
+The module is the GB2P/NES one (`rtl/netplay.sv`, the same states, CTRL and
+rings), added in jtframe so every jtframe core gets it:
+
+- Mailbox at `0x3C000000` as NES and Game Boy 2P, `MAGIC` = `0x3130504E44435241`
+  ("ARCDNP01"). The address must not collide with the DDR3 a jtframe core uses
+  itself: screen rotation writes at `0x24000000`–`0x2BFFFFFF`, so it does not.
+  The mailbox shares the video DDR3 client (`jtframe_np_ddrarb`): rotation keeps
+  priority, the mailbox takes the bus between two of its writes. Cores whose
+  video client reads DDR3 (the DDR3 line-frame buffer, `JTFRAME_MR_GAME_DDR`)
+  are refused at build time.
+- Code: `target/mister/hdl/jtframe_netplay.sv` (the protocol),
+  `jtframe_np_board.sv` (controls, reset, pause between the board and the game;
+  also used by the Verilator test bench), `jtframe_np_ddrarb.sv`; the macro
+  `JTFRAME_NETPLAY` (in the core's `macros.def`, `[mister]`) builds it in and
+  adds the OSD option.
+- **Frame tick:** the start of the emulated vertical blank (jtframe `LVBL`
+  falling), from the game's own video timing: frame k starts on the first
+  clock in which the game's `LVBL` reads low.
+- **Freezing the game.** Everything a jtframe game does advances on clock
+  enables: the ones `jtframe mem` generates from `mem.yaml` (`jtframe_gated_cen`,
+  CPUs and sound) and the pixel enables (`jtframe_pxlcen`, video). With
+  `JTFRAME_NETPLAY` both get a `hold` input that freezes them completely: no
+  pulse is lost and none is caught up afterwards, so a held clock does not exist
+  for the game. The clock in which a frame starts is always held, plus 4 more,
+  so INPUT[k] reaches the game before its next enable; the hold lasts as long
+  as INPUT[k] is missing. The held pixel enable stops the scaler's input, so
+  HDMI repeats the newest frame; `HDMI_FREEZE` is not used (a freeze where a
+  frame ends makes ascal skip a buffer switch and show a frame two frames old
+  once: a flicker on every stall, seen on hardware). Only cores
+  whose game logic runs entirely on those enables qualify (checked per core;
+  `jtbubl` does).
+- **No SDRAM in the game's timing.** jtframe holds a CPU's clock enable while
+  its ROM read waits for the SDRAM and catches the lost pulses up afterwards,
+  while the pixel enables do not wait. The SDRAM's latency (its refresh phase,
+  the other buses) differs between two MiSTers, so the order of the CPU, sound
+  and pixel enables differed too: measured in the test bench, 58 of 60 frames
+  with the same picture, and on hardware DESYNC after 876 and 13863 frames.
+  Waiting without catching up would cost the time the CPUs wait (12 % for
+  `jtbubl`). So with `JTFRAME_NETPLAY` the CPUs read their ROMs from block RAM
+  (`mem.yaml` `mainrom`, `subrom`, `sndrom` with `when: [JTFRAME_NETPLAY]`,
+  loaded from the same download; the SDRAM buses stay for the layout and are
+  left idle): a read's `ok` drops for exactly the clock after an address change.
+  Only the graphics read the SDRAM, which decides no game timing. `jtbubl`:
+  465 of 553 RAM blocks. The test bench checks the order of the enables per
+  frame (`np_ilv`): identical in all frames.
+- **The CRC covers the game state** (`JTFRAME_NP_STATE`): every write of the
+  main and sub CPUs, address and data, taken in its first clock, instead of the
+  picture. The graphics still read the SDRAM, and a line that is late on one
+  MiSTer changes the picture without the games being out of step (a desync
+  after 17522 frames with identical cores on hardware). `np_test --corrupt F`
+  gives the join other input in frame F: CRC mismatch at frame F.
+- The core's version (`V,` in the configuration string, compared by Main) is
+  jtcores' commit, so `tools/jt_build.sh` refuses to build uncommitted changes.
+- **RAM.** Block RAM keeps what the game left in it across a reset (high
+  scores, for instance), so two MiSTers that played before would start a
+  session from different RAM (seen on hardware: DESYNC at frames 876 and
+  13863). While the game is held in reset (ARMED, PRIME) every game RAM is
+  written with zeros through `jtframe_np_ramclr`, in front of each RAM's first
+  port (`np_ram` = 1; the address steps on the RAM's clock enable). For
+  `jtbubl`: work and comm RAM, the four VRAMs, the two palette RAMs, the sound
+  CPU's RAM (`jtframe_sysz80`) and the MCU's internal RAM (`jtframe_6801mcu`,
+  whose simulation model cleared it on reset while the FPGA did not: netplay
+  sims no longer do). The test bench's `--dirty-ram` fills the join's RAM with
+  a pattern before its session (`np_ram` = 2).
+- **Session start.** In ARMED and PRIME the game is held in reset while its
+  video timing runs on (jtframe's video timers have no reset). Frame 0 starts
+  at an `LVBL` fall once INPUT[0] and INPUT[1] are in hand: reset is released
+  there and the clock enable generators restart from zero (`clr`), so both
+  sides start at the same video position and enable phase. The game's line
+  buffers still hold a picture from before the session, so the CRC of frames
+  0 and 1 covers only the input; from frame 2 it covers every visible pixel
+  (`pxl_cen & LHBL & LVBL`, 8 bits per colour).
+- **Input:** 12 bits per player, entries as SNES (`{f[11:0], sess[7:0],
+  joy[11:0]}` in both halves): bits 3:0 Right, Left, Down, Up; 9:4 buttons 1–6;
+  10 Start; 11 Coin. The host is player 1, the join player 2; each side's own
+  player 1 controls are its `LOCAL`. Service and test buttons and the tilt are
+  held off.
+- **Session start:** in ARMED the module holds the game in reset and clears
+  the game's RAM (everything the game writes) to a fixed value, so both sides
+  start equal without a ROM reload. Main sends the session's DIP switches
+  meanwhile (12.4). PRIME and RUN as in section 3.
+- While netplay is active: the OSD Reset, the core's pause (also the one on an
+  open OSD), cheats and hiscore loading have no effect on the game.
+- DIP switches (download index 254): taken in IDLE and ARMED (Main sends the
+  session's in ARMED). One in PRIME or RUN (a player changed a switch in the
+  OSD) sets the `RELOAD` error, so the session ends cleanly before Main starts
+  it again, instead of running a few frames with other switches than the peer.
+
+### 12.4 Protocol version 4 and the DIP switches
+
+- UDP **version 4** for arcade: as version 3 (system byte = 3, `u16` input
+  samples, of which 12 bits are used; `rom2_md5`, `boot_md5` (zeros) and
+  `rtc_time` after `sav_md5`), plus `dip u64` right after `rtc_time` (before
+  `settings`), in HELLO and HELLO_ACK. `settings` is 0. A peer of another
+  console gets `REJ_OTHER_SYSTEM` in its own version.
+- **The DIP switches are the host's.** The join takes `dip` from HELLO_ACK. In
+  place of the ROM reload (section 4, step 3) Main sends the session's switches
+  to the core (`arcade_sw_send`) without saving them: the player's `.dip` file
+  is not changed, also not when the OSD's DIP page is opened meanwhile. Main
+  remembers which session they were sent for; once that session is over (an
+  end, a refusal after arming, OSD Off, a new session) the player's own come
+  back. A host offers its own switches, also right after it was a join. A DIP switch changed in the OSD during a session becomes the
+  player's own and starts the session again.
+- Recordings: `NPR3` with system 3 and `dip u64` after the system byte; a
+  replay plays with the recorded switches.
+
+### 12.5 Server and lobby
+
+- The core field in REG is the core's own name, the OSD's title
+  (`user_io_get_core_name(1)`, `JTBUBL`), the same for every MRA of the core;
+  not Main's core name, which for an MRA is its set name (`bublboblr`) and
+  differs per version of a game. The game is the MRA's file name
+  without `.mra`, the md5 `rom_md5` (12.2). The server needs no other change:
+  rooms match on core and md5. Every core other than `NES`, `SNES` and `GB2P`
+  is an arcade core: the status page shows it with an arcade badge, and an
+  *Arcade* tab with the open arcade rooms in place of a library; the main
+  menu's room list (below) takes these rooms and keeps those whose game is one
+  of the player's MRAs.
+- Arcade games never come from the server. The host loads the netplay MRA and
+  picks OSD *Netplay → Host*.
+- **Rooms in the arcade menu:** with `server=` set, Main mounts a RAM folder
+  `_Arcade/_Netplay` once the MRA is loaded and keeps one MRA per waiting room
+  of the same core in it, `<name> - <game>.mra`: a copy of the player's own MRA
+  with the host's MRA name (searched in `_Arcade` and its folders; none: the
+  room is not shown), with `<!-- netplay room: <id> -->` after the root tag.
+  Loading one joins that room. An MRA load reloads the core and restarts Main,
+  so the folder is not unmounted by `netplay_stop()` and the room is read back
+  from the file; the loaded room's file stays until its session is over.
+  OSD *Netplay → Join* without a picked room joins the room with the same ROM
+  when it is the only one waiting (the `*` room of section 7).
+- **Rooms inside the core:** with `JTFRAME_NETPLAY` jtframe's OSD has
+  *Join room* (`F9,MRA,Join room`) under the Netplay option. Main's file
+  browser opens it in `_Arcade/_Netplay` (that folder is its home), so the
+  rooms are picked where NES and SNES pick theirs, in the core's own menu.
+  `user_io_file_tx()` hands the pick to netplay (`netplay_take_file()`), which
+  joins the room in the file without a core reload; nothing is sent to the
+  core (jtframe ignores download index 9 anyway). Without `server=` the entry
+  says "rooms need server= in netplay.ini"; with OSD Netplay Off it says so.
+- **In the main menu** (no core loaded, `server=` set) Main keeps the same
+  folder up to date with the waiting rooms of every arcade core (any core but
+  `NES`, `SNES`, `GB2P`), so a
+  player sees them before loading any MRA; loading one stops that lobby (core
+  change) and the folder stays for the MRA load.
+
+### 12.6 Open
+
+- Building jtframe cores: Quartus 20.1 (Docker image `jotego/jtcore20`),
+  `tools/jt_build.sh bubl` -> `jtcores/release/mister/jtbubl.rbf`. Quartus 20.1's own
+  `libudev.so.1` crashes `quartus_map`; the script preloads the system's.
+- jtframe with netplay lives in `jtcores/` (branch `netplay`, patches in
+  `patches/jtcores/`), based on jtcores `15d60ca4f` (2026-10-23), the jtframe of
+  the released `jtbubl` core: jtframe's MiSTer video changes of 2026-11-03..07
+  draw the OSD across the whole screen width (seen on hardware). T2a: `jtframe/bin/np_sim.sh bublbobl [options]` from
+  `cores/bubl/ver/np` (ROM zips in `~/.mame/roms`).
+
+### 12.7 Tests (arcade)
+
+| # | Test | Passes when |
+| --- | --- | --- |
+| T3 | Engine tests (HELLO v4 with `dip`, 12-bit words, the host's DIP switches, other ROM set, other core version, NVRAM, other console, record/replay with `dip`) and `NP_SYSTEM=arcade` UDP runs (direct, OSD mode, through a server, `direct=no`, room from the main menu, *Join room* in the core with a second host waiting with the same game, a join without a room refused while two rooms wait): no reload, both play with the host's DIP switches, the join's own come back after the session | `PASS` |
+| T2a | `jtbubl` with the netplay module in Verilator, two machines, a fake HPS each | the same CRC every frame for ≥ 600 frames |
+| T4 | Quartus build of `jtbubl` with netplay | timing met |
+| T5a | Replay on one MiSTer, ≥ 36000 frames of Bubble Bobble | "replay OK" |
+| T6a | Two MiSTers through the lobby | 30 min of a two-player game without a CRC mismatch |

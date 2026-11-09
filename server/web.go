@@ -79,7 +79,7 @@ background:linear-gradient(180deg,#fff 0%,var(--cyan) 45%,var(--violet) 55%,var(
 filter:drop-shadow(0 0 10px rgba(62,232,255,.5)) drop-shadow(0 3px 0 rgba(120,20,160,.9))}
 .tag{margin-top:9px;font:600 12px/1.3 ui-monospace,Consolas,monospace;letter-spacing:.3em;text-transform:uppercase;color:var(--cyan);text-shadow:0 0 8px rgba(62,232,255,.7)}
 .stats{margin-left:auto;display:flex;gap:12px}
-.stat{min-width:104px;padding:9px 16px;border-radius:12px;text-align:center;background:var(--panel);border:1px solid var(--line);box-shadow:0 8px 30px rgba(0,0,0,.4);backdrop-filter:blur(6px)}
+.stat{min-width:104px;padding:9px 16px;border-radius:12px;text-align:center;background:var(--panel);border:1px solid var(--line);box-shadow:0 8px 30px rgba(0,0,0,.4);backdrop-filter:none;background:rgba(18,8,44,.92)}
 .stat b{display:block;font:800 28px/1.1 ui-monospace,Consolas,monospace;color:#fff}
 .stat span{font:600 10.5px ui-monospace,Consolas,monospace;letter-spacing:.2em;text-transform:uppercase;color:var(--dim)}
 .stat.wait b{text-shadow:0 0 12px var(--wait)}.stat.play b{text-shadow:0 0 12px var(--ok)}.stat.games b{text-shadow:0 0 12px var(--cyan)}
@@ -92,7 +92,7 @@ h2{text-shadow:0 0 10px var(--magenta),0 1px 3px #000;display:flex;align-items:c
 h2::before{content:"";flex:none;width:9px;height:9px;transform:rotate(45deg);background:var(--pink);box-shadow:0 0 10px var(--pink)}
 h2::after{content:"";flex:1;height:2px;background:linear-gradient(90deg,var(--pink),var(--violet) 40%,transparent)}
 h2 .n{color:#fff;font-size:11px;padding:3px 8px;border-radius:999px;background:rgba(255,63,164,.25);border:1px solid rgba(255,63,164,.5);text-shadow:none;letter-spacing:.08em}
-p.hint{display:inline-block;padding:3px 10px;border-radius:8px;background:rgba(7,3,26,.6);backdrop-filter:blur(4px);color:#cbbfee;margin:0 0 12px;font-size:13px;text-shadow:0 1px 2px #000,0 0 8px rgba(7,3,26,.9)}
+p.hint{display:inline-block;padding:3px 10px;border-radius:8px;background:rgba(7,3,26,.85);color:#cbbfee;margin:0 0 12px;font-size:13px;text-shadow:0 1px 2px #000,0 0 8px rgba(7,3,26,.9)}
 p.hint b{color:var(--cyan);font-weight:600}
 aside{position:sticky;top:16px;padding:18px 14px}
 aside h3{margin:2px 6px 12px;font:700 11px ui-monospace,Consolas,monospace;letter-spacing:.24em;text-transform:uppercase;color:var(--magenta)}
@@ -106,13 +106,14 @@ aside h3{margin:2px 6px 12px;font:700 11px ui-monospace,Consolas,monospace;lette
 .tab.NES .ico{background:linear-gradient(180deg,#ff6b85,#c81f4a);box-shadow:0 0 10px rgba(255,77,109,.55)}
 .tab.SNES .ico{background:linear-gradient(180deg,#b38bff,#6a3ae0);box-shadow:0 0 10px rgba(155,107,255,.55)}
 .tab.GB2P .ico{background:linear-gradient(180deg,#9be36b,#3f9a2a);box-shadow:0 0 10px rgba(120,220,90,.55)}
+.tab.ARC .ico{background:linear-gradient(180deg,#ffc24d,#d9761a);box-shadow:0 0 10px rgba(255,170,60,.55)}
 .tab.BYO .ico{background:linear-gradient(180deg,#7ff3ff,#139bbf);box-shadow:0 0 10px rgba(62,232,255,.5)}
 .sel{position:absolute;opacity:0;pointer-events:none}
-#t-NES:checked~.wrap .tab.NES,#t-SNES:checked~.wrap .tab.SNES,#t-GB2P:checked~.wrap .tab.GB2P,#t-BYO:checked~.wrap .tab.BYO{background:var(--panel2);border-color:rgba(255,63,164,.55);box-shadow:0 0 16px rgba(255,63,164,.25) inset,0 0 14px rgba(214,60,255,.25)}
-#t-NES:checked~.wrap .tab.NES .cnt,#t-SNES:checked~.wrap .tab.SNES .cnt,#t-GB2P:checked~.wrap .tab.GB2P .cnt,#t-BYO:checked~.wrap .tab.BYO .cnt{color:#fff;text-shadow:0 0 8px var(--pink)}
-#t-NES:focus-visible~.wrap .tab.NES,#t-SNES:focus-visible~.wrap .tab.SNES,#t-GB2P:focus-visible~.wrap .tab.GB2P,#t-BYO:focus-visible~.wrap .tab.BYO{outline:2px solid var(--cyan);outline-offset:2px}
+#t-NES:checked~.wrap .tab.NES,#t-SNES:checked~.wrap .tab.SNES,#t-GB2P:checked~.wrap .tab.GB2P,#t-ARC:checked~.wrap .tab.ARC,#t-BYO:checked~.wrap .tab.BYO{background:var(--panel2);border-color:rgba(255,63,164,.55);box-shadow:0 0 16px rgba(255,63,164,.25) inset,0 0 14px rgba(214,60,255,.25)}
+#t-NES:checked~.wrap .tab.NES .cnt,#t-SNES:checked~.wrap .tab.SNES .cnt,#t-GB2P:checked~.wrap .tab.GB2P .cnt,#t-ARC:checked~.wrap .tab.ARC .cnt,#t-BYO:checked~.wrap .tab.BYO .cnt{color:#fff;text-shadow:0 0 8px var(--pink)}
+#t-NES:focus-visible~.wrap .tab.NES,#t-SNES:focus-visible~.wrap .tab.SNES,#t-GB2P:focus-visible~.wrap .tab.GB2P,#t-ARC:focus-visible~.wrap .tab.ARC,#t-BYO:focus-visible~.wrap .tab.BYO{outline:2px solid var(--cyan);outline-offset:2px}
 .lib{display:none}
-#t-NES:checked~.wrap .lib.NES,#t-SNES:checked~.wrap .lib.SNES,#t-GB2P:checked~.wrap .lib.GB2P,#t-BYO:checked~.wrap .lib.BYO{display:block}
+#t-NES:checked~.wrap .lib.NES,#t-SNES:checked~.wrap .lib.SNES,#t-GB2P:checked~.wrap .lib.GB2P,#t-ARC:checked~.wrap .lib.ARC,#t-BYO:checked~.wrap .lib.BYO{display:block}
 .side-foot{margin:14px 6px 0;padding-top:12px;border-top:1px solid var(--line);color:var(--dim);font-size:12px}
 main section+section{margin-top:34px}
 .rooms{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px}
@@ -138,6 +139,7 @@ aside.panel{animation-duration:8s,11s;animation-delay:-1s,-4s}
 .core.NES{background:linear-gradient(180deg,#ff6b85,#c81f4a);box-shadow:0 0 10px rgba(255,77,109,.55)}
 .core.SNES{background:linear-gradient(180deg,#b38bff,#6a3ae0);box-shadow:0 0 10px rgba(155,107,255,.55)}
 .core.GB2P{background:linear-gradient(180deg,#9be36b,#3f9a2a);box-shadow:0 0 10px rgba(120,220,90,.55)}
+.core.ARC{background:linear-gradient(180deg,#ffc24d,#d9761a);box-shadow:0 0 10px rgba(255,170,60,.55)}
 .state{display:inline-flex;align-items:center;gap:7px;font:700 11px ui-monospace,Consolas,monospace;letter-spacing:.12em;text-transform:uppercase}
 .state::before{content:"";width:8px;height:8px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor}
 .state.waiting{color:var(--wait)}.state.playing{color:var(--ok)}
@@ -175,7 +177,7 @@ background:linear-gradient(115deg,transparent 35%,rgba(62,240,176,.16) 45%,rgba(
 @keyframes flicker{0%,93%,97%,100%{opacity:1}94%,96%{opacity:.55}95%{opacity:.9}}
 .tab:hover{transform:translateX(3px)}
 .tab{transition:background .15s,border-color .15s,box-shadow .15s,transform .15s}
-#t-NES:checked~.wrap .tab.NES,#t-SNES:checked~.wrap .tab.SNES,#t-GB2P:checked~.wrap .tab.GB2P,#t-BYO:checked~.wrap .tab.BYO{animation:tabglow 2.2s ease-in-out infinite alternate}
+#t-NES:checked~.wrap .tab.NES,#t-SNES:checked~.wrap .tab.SNES,#t-GB2P:checked~.wrap .tab.GB2P,#t-ARC:checked~.wrap .tab.ARC,#t-BYO:checked~.wrap .tab.BYO{animation:tabglow 2.2s ease-in-out infinite alternate}
 @keyframes tabglow{from{box-shadow:0 0 12px rgba(255,63,164,.18) inset,0 0 10px rgba(214,60,255,.2)}to{box-shadow:0 0 20px rgba(255,63,164,.35) inset,0 0 22px rgba(214,60,255,.45)}}
 tr:hover td{background:rgba(255,63,164,.08)}
 tr:hover td:first-child{box-shadow:3px 0 0 var(--pink) inset}
@@ -186,6 +188,11 @@ tr:hover td:first-child{box-shadow:3px 0 0 var(--pink) inset}
 .lib{animation:fadein .35s ease-out}
 @keyframes fadein{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 @media (prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
+/* Light on the computer that shows the page: no endless animations and no
+   blur behind the panels. Over 20 animated layers and filters kept a browser
+   busy all the time the page was open; the look stays, standing still. */
+*,*::before,*::after{animation:none!important}
+.stat,p.hint{backdrop-filter:none!important}
 @media (max-width:860px){.layout{grid-template-columns:1fr}aside.panel{position:static;display:block;padding:10px}#side{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}
 aside h3,.side-foot{display:none}.tab{margin:0;flex-direction:column;text-align:center;gap:6px;padding:10px 6px}.tab .lbl small{display:none}.stats{margin-left:0}}
 @media (max-width:640px){header{gap:14px}header img{width:170px}.title{border:0;padding:0}.brand{font-size:28px}.stats{width:100%}.stat{flex:1;min-width:0}td,th{padding:9px 10px}.hide-sm{display:none}}
@@ -217,6 +224,8 @@ func coreBadge(core string) string {
 	cls := ""
 	if c == "NES" || c == "SNES" || c == "GB2P" {
 		cls = " " + c
+	} else if c != "" {
+		cls = " ARC" // arcade: the core's own name (JTBUBL), SPEC 12.5
 	}
 	return fmt.Sprintf(`<span class="core%s">%s</span>`, cls, htmlEscape(c))
 }
@@ -240,8 +249,14 @@ func writePage(w http.ResponseWriter, l *library, catalog string, r *relay) {
 	cat := readCatalog(catalog)
 	waiting, playing := 0, 0
 	roomsBy := map[string]int{}
+	var arcRooms []roomInfo
 	for _, ri := range rooms {
-		roomsBy[strings.ToUpper(ri.core)]++
+		c := strings.ToUpper(ri.core)
+		if c != "NES" && c != "SNES" && c != "GB2P" {
+			c = "ARC" // arcade: any other core (JTBUBL, ...), SPEC 12.5
+			arcRooms = append(arcRooms, ri)
+		}
+		roomsBy[c]++
 		if ri.join != "" {
 			playing++
 		} else {
@@ -254,8 +269,8 @@ func writePage(w http.ResponseWriter, l *library, catalog string, r *relay) {
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
 <noscript><meta http-equiv="refresh" content="10"></noscript><title>Netplay lobby</title><style>%s</style></head><body>
 <div class="sky" aria-hidden="true"><div class="nebula"></div><div class="stars s1"></div><div class="stars s2"></div><div class="stars s3"></div><div class="stars s4"></div><div class="stars s5"></div><div class="glow"></div><div class="sunwrap"><div class="sun"></div></div><div class="floor"><div class="lines"></div></div></div>
-<input class="sel" type="radio" name="lib" id="t-NES" value="NES" checked><input class="sel" type="radio" name="lib" id="t-SNES" value="SNES"><input class="sel" type="radio" name="lib" id="t-GB2P" value="GB2P"><input class="sel" type="radio" name="lib" id="t-BYO" value="BYO">
-<div class="wrap"><header>%s<div class="title"><div class="brand">NETPLAY</div><div class="tag">Lobby &amp; relay &middot; NES &middot; SNES &middot; Game Boy 2P</div></div>
+<input class="sel" type="radio" name="lib" id="t-NES" value="NES" checked><input class="sel" type="radio" name="lib" id="t-SNES" value="SNES"><input class="sel" type="radio" name="lib" id="t-GB2P" value="GB2P"><input class="sel" type="radio" name="lib" id="t-ARC" value="ARC"><input class="sel" type="radio" name="lib" id="t-BYO" value="BYO">
+<div class="wrap"><header>%s<div class="title"><div class="brand">NETPLAY</div><div class="tag">Lobby &amp; relay &middot; NES &middot; SNES &middot; Game Boy 2P &middot; Arcade</div></div>
 <div class="stats" id="stats"><div class="stat wait"><b>%d</b><span>waiting</span></div><div class="stat play"><b>%d</b><span>playing</span></div><div class="stat games"><b>%d</b><span>games</span></div></div></header>
 <div class="neon"></div><div class="layout">`,
 		pageCSS, pageLogo, waiting, playing, len(games["NES"])+len(games["SNES"])+len(games["GB2P"]))
@@ -276,6 +291,7 @@ func writePage(w http.ResponseWriter, l *library, catalog string, r *relay) {
 		{"NES", "NES", "NES", roomsText("NES"), len(games["NES"])},
 		{"SNES", "SNES", "Super NES", roomsText("SNES"), len(games["SNES"])},
 		{"GB2P", "GB", "Game Boy 2P", roomsText("GB2P"), len(games["GB2P"])},
+		{"ARC", "ARC", "Arcade", roomsText("ARC"), len(arcRooms)},
 		{"BYO", "MD5", "Bring your own", "catalog by MD5", len(cat)},
 	} {
 		fmt.Fprintf(&b, `<label class="tab %s" for="t-%s"><span class="ico">%s</span><span class="lbl"><b>%s</b><small>%s</small></span><span class="cnt">%d</span></label>`,
@@ -318,6 +334,19 @@ func writePage(w http.ResponseWriter, l *library, catalog string, r *relay) {
 		}
 		b.WriteString(`</table></div></div>`)
 	}
+	// Arcade: no games from the server (each player's own MRA and zip), so the
+	// rooms with their games instead of a library
+	fmt.Fprintf(&b, `<div class="lib ARC"><h2>Arcade <span class="n">%d</span></h2><p class="hint">Arcade games are not sent: each player uses their own MRA and zip, and the ROM check makes sure both are the same. Host: the netplay MRA, OSD Netplay &rarr; Host. Join: the room in <b>_Arcade/_Netplay</b>, or OSD Netplay &rarr; Join.</p><div class="panel"><table>`, len(arcRooms))
+	if len(arcRooms) == 0 {
+		b.WriteString(`<tr><td class="empty">No arcade rooms open.</td></tr>`)
+	} else {
+		b.WriteString(`<tr><th>Game</th><th class="hide-sm">Core</th><th>Host</th></tr>`)
+		for _, ri := range arcRooms {
+			fmt.Fprintf(&b, `<tr><td>%s</td><td class="mono hide-sm">%s</td><td>%s</td></tr>`,
+				htmlEscape(ri.game), htmlEscape(strings.ToUpper(ri.core)), htmlEscape(ri.host))
+		}
+	}
+	b.WriteString(`</table></div></div>`)
 	fmt.Fprintf(&b, `<div class="lib BYO"><h2>Bring your own <span class="n">%d</span></h2><p class="hint">Versions everyone brings themselves: your file must have exactly this MD5.</p><div class="panel"><table>`, len(cat))
 	if len(cat) == 0 {
 		b.WriteString(`<tr><td class="empty">The catalog is empty.</td></tr>`)

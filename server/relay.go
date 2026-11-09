@@ -208,7 +208,13 @@ func (r *relay) control(pkt string, from *net.UDPAddr, now time.Time) []outgoing
 			if b, ok := r.by[k]; ok && !b.host {
 				rm = b.room // already matched
 			} else {
-				rm = r.match(core, sum, now)
+				var n int
+				rm, n = r.match(core, sum, now)
+				if n > 1 {
+					// a join without a room goes only where there is no choice:
+					// with several waiting rooms the player picks one (SPEC.md 7)
+					return reply(fmt.Sprintf("ERR %d rooms with this game: pick one", n))
+				}
 			}
 			if rm == nil {
 				return reply("ERR no room with this game")
@@ -255,16 +261,19 @@ func (rm *room) memberName(host bool) string {
 	return rm.join.name
 }
 
-// match: the oldest waiting room with this game.
-func (r *relay) match(core, sum string, now time.Time) *room {
+// match: the oldest waiting room with this game, and how many are waiting.
+func (r *relay) match(core, sum string, now time.Time) (*room, int) {
 	var best *room
+	n := 0
 	for _, rm := range r.rooms {
-		if rm.core == core && rm.md5 == sum && rm.host.live(now) && !rm.join.live(now) &&
-			(best == nil || rm.created.Before(best.created)) {
-			best = rm
+		if rm.core == core && rm.md5 == sum && rm.host.live(now) && !rm.join.live(now) {
+			n++
+			if best == nil || rm.created.Before(best.created) {
+				best = rm
+			}
 		}
 	}
-	return best
+	return best, n
 }
 
 func (r *relay) run() {

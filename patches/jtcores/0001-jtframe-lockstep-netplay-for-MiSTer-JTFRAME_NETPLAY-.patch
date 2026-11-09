@@ -1,0 +1,1593 @@
+From e638dd22581b994e42e5263f87b8752fbb9f1941 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sun, 8 Nov 2026 15:21:36 +0100
+Subject: [PATCH 1/6] jtframe: lockstep netplay for MiSTer (JTFRAME_NETPLAY),
+ jtbubl built with it
+
+Mailbox in DDR3 at 0x3C000000 shared with screen rotation, frame tick at the
+start of the game's vertical blank, clock enable hold without catch-up,
+session start at a vertical blank with the enable generators restarted.
+Verilator test bench with two machines (verilator/np_test.cpp, bin/np_sim.sh).
+---
+ cores/bubl/cfg/macros.def                     |   1 +
+ modules/jtframe/bin/np_sim.sh                 |  22 +
+ modules/jtframe/doc/macros.md                 |   1 +
+ .../jtframe/hdl/clocking/jtframe_gated_cen.v  |  12 +-
+ modules/jtframe/hdl/clocking/jtframe_pxlcen.v |  25 ++
+ modules/jtframe/hdl/inc/game_sdram.v          |  11 +
+ .../jtframe/hdl/inc/jtframe_game_instance.v   |   4 +
+ modules/jtframe/hdl/jtframe_board.v           |   8 +
+ modules/jtframe/hdl/ver/game_test.v           | 101 ++++-
+ modules/jtframe/target/mister/cfg/files.yaml  |   5 +
+ modules/jtframe/target/mister/cfgstr          |   1 +
+ .../jtframe/target/mister/hdl/jtframe_emu.sv  |  10 +
+ .../target/mister/hdl/jtframe_mister.sv       | 160 ++++++-
+ .../target/mister/hdl/jtframe_netplay.sv      | 421 ++++++++++++++++++
+ .../target/mister/hdl/jtframe_np_board.sv     | 113 +++++
+ .../target/mister/hdl/jtframe_np_ddrarb.sv    |  83 ++++
+ modules/jtframe/ver/clocking/gated_cen/test.v |   2 +
+ modules/jtframe/verilator/np_test.cpp         | 270 +++++++++++
+ 18 files changed, 1219 insertions(+), 31 deletions(-)
+ create mode 100755 modules/jtframe/bin/np_sim.sh
+ create mode 100644 modules/jtframe/target/mister/hdl/jtframe_netplay.sv
+ create mode 100644 modules/jtframe/target/mister/hdl/jtframe_np_board.sv
+ create mode 100644 modules/jtframe/target/mister/hdl/jtframe_np_ddrarb.sv
+ create mode 100644 modules/jtframe/verilator/np_test.cpp
+
+diff --git a/cores/bubl/cfg/macros.def b/cores/bubl/cfg/macros.def
+index 45aa5c670..92d1ec4c3 100644
+--- a/cores/bubl/cfg/macros.def
++++ b/cores/bubl/cfg/macros.def
+@@ -20,3 +20,4 @@ JTFRAME_HEADER=4
+ [mister]
+ JTFRAME_ARX=5
+ JTFRAME_ARY=4
++JTFRAME_NETPLAY
+diff --git a/modules/jtframe/bin/np_sim.sh b/modules/jtframe/bin/np_sim.sh
+new file mode 100755
+index 000000000..53f9df45d
+--- /dev/null
++++ b/modules/jtframe/bin/np_sim.sh
+@@ -0,0 +1,22 @@
++#!/bin/bash
++# Netplay test bench (T2a): builds the core with JTFRAME_NETPLAY and the
++# two-MiSTer harness verilator/np_test.cpp, and runs it.
++#
++#   np_sim.sh <setname> [np_test options] [-- jtsim options]
++#
++# Run it from a folder of its own inside the core's ver/ folder (it puts
++# test.cpp there). Example, from cores/bubl/ver/np:
++#   np_sim.sh bublbobl --frames 600 --seed 3 --dirty 100
++set -e
++if [ -z "$JTFRAME" ]; then echo "np_sim.sh: source setprj.sh first"; exit 1; fi
++SETNAME=${1:?usage: np_sim.sh <setname> [options] [-- jtsim options]}
++shift
++NP=()
++while [ $# -gt 0 ] && [ "$1" != "--" ]; do NP+=("$1"); shift; done
++[ "$1" = "--" ] && shift
++cp "$JTFRAME/verilator/np_test.cpp" test.cpp
++cp "$JTFRAME/verilator/test.cpp" jtsim_test.cpp
++
++export NP_ARGS="${NP[*]}"
++# -keepcpp keeps our test.cpp (jtsim shifts one extra argument after it)
++exec jtsim -mister -setname "$SETNAME" "$@" -keepcpp -keepcpp
+diff --git a/modules/jtframe/doc/macros.md b/modules/jtframe/doc/macros.md
+index 08874393c..b774d0fde 100644
+--- a/modules/jtframe/doc/macros.md
++++ b/modules/jtframe/doc/macros.md
+@@ -68,6 +68,7 @@ JTFRAME_MOUSE_NOEMU      |         | Disables mouse emulation via joystick
+ JTFRAME_MR_DDR           | MiSTer  | Defined internally when MiSTer DDR is used. Do not define manually.
+ JTFRAME_MR_DDRLOAD       | MiSTer  | ROM download process uses the DDR as proxy
+ JTFRAME_MR_GAME_DDR      | MiSTer  | Game module gets the DDR3 port (ddr_* signals on clk_rom, see sdram.md). Not with rotation, LF buffer or DDR load
++JTFRAME_NETPLAY          | MiSTer  | Lockstep netplay with Main_MiSTer (target/mister/hdl/jtframe_netplay.sv): mailbox in DDR3 at 0x3C000000, OSD option O[127:126]. Needs mem.yaml clocks; not with game DDR3 or the DDR3 LF buffer
+ JTFRAME_MR_LF_BRAM       | MiSTer  | Use BRAM instead of DDR for JTFRAME_LF_BUFFER. Automatically set when JTFRAME_VERTICAL is also enabled
+ JTFRAME_MR_FASTIO        | MiSTer  | 16-bit ROM load in MiSTer. Set by default if CLK96 is set
+ JTFRAME_NO_ANALOGIZER    | Pocket  | Disables analog video output and SNAC controllers through cartridge pins. Defined by default if JTFRAME_RELEASE is not defined
+diff --git a/modules/jtframe/hdl/clocking/jtframe_gated_cen.v b/modules/jtframe/hdl/clocking/jtframe_gated_cen.v
+index 5528c48c7..89ebed0fd 100644
+--- a/modules/jtframe/hdl/clocking/jtframe_gated_cen.v
++++ b/modules/jtframe/hdl/clocking/jtframe_gated_cen.v
+@@ -21,6 +21,8 @@ module jtframe_gated_cen #( parameter
+     input              rst,
+     input              clk,
+     input              busy,
++    input              hold,   // freezes the generator: no cen and no catch-up afterwards (netplay)
++    input              clr,    // restarts the generator from zero (netplay: the first cycle of a session)
+     output     [W-1:0] cen,
+ 
+     output     [ 15:0] fave, fworst // average cpu_cen frequency in kHz
+@@ -40,7 +42,7 @@ integer       i;
+ 
+ assign cnt_en    = !busy || rst;
+ assign glitch    = pre[0] & busy;
+-assign cen       = pre & {W{~busy}};
++assign cen       = pre & {W{~busy & ~hold & ~clr}};
+ assign over      = cencnt > DEN[CW-1:0]-NUM2[CW-1:0];
+ assign cencnt_nx = {1'b0,cencnt}+NUM2[CW:0] - ((over && cnt_en) ? DEN[CW:0] : {CW+1{1'b0}});
+ assign rec_nx    = {1'b0,cencnt}+NUM2[CW:0];
+@@ -52,7 +54,13 @@ function [CW-1:0] clip(input [CW:0]a); begin
+     clip = a[CW] ? MAXOUT : a[CW-1:0];
+ end endfunction
+ 
+-always @(posedge clk) begin
++always @(posedge clk) if(clr) begin
++    cencnt   <= 0;
++    rec      <= 0;
++    toggle   <= 0;
++    toggle_l <= 0;
++    pre      <= 0;
++end else if(!hold) begin
+     cencnt <= clip(cencnt_nx);
+     rec    <= clip(rec_nx);
+     if(glitch) begin
+diff --git a/modules/jtframe/hdl/clocking/jtframe_pxlcen.v b/modules/jtframe/hdl/clocking/jtframe_pxlcen.v
+index 661050bde..ff728c622 100644
+--- a/modules/jtframe/hdl/clocking/jtframe_pxlcen.v
++++ b/modules/jtframe/hdl/clocking/jtframe_pxlcen.v
+@@ -5,6 +5,7 @@
+ `ifdef JTFRAME_PXLCLK
+ module jtframe_pxlcen(
+     input   clk,
++    input   hold,       // netplay: freezes the pixel clock enables with the game
+     output  pxl_cen,
+     output  pxl2_cen
+ );
+@@ -22,6 +23,29 @@ module jtframe_pxlcen(
+         end
+     end
+ 
++`ifdef JTFRAME_NETPLAY
++    // Same pulses as jtframe_frac_cen with n=1 (pxl2_cen every M clocks,
++    // pxl_cen every 2M), but with a clock enable: while hold is high nothing
++    // moves, and the pulse that was due comes right after it.
++    reg [3:0] cnt=0;
++    reg       half=0, p2=0, p1=0;
++
++    always @(posedge clk) if(!hold) begin
++        p2 <= 0;
++        p1 <= 0;
++        if( cnt==M[3:0]-4'd1 ) begin
++            cnt  <= 0;
++            half <= ~half;
++            p2   <= 1;
++            p1   <= ~half;
++        end else begin
++            cnt  <= cnt+4'd1;
++        end
++    end
++
++    assign pxl2_cen = p2 & ~hold;
++    assign pxl_cen  = p1 & ~hold;
++`else
+     jtframe_frac_cen #(.WC(4),.W(2)) u_cen(
+         .clk    ( clk       ),    // 48 or 96 MHz
+         .n      ( 4'd1      ),
+@@ -29,6 +53,7 @@ module jtframe_pxlcen(
+         .cen    ( { pxl_cen, pxl2_cen } ),
+         .cenb   (           )
+     );
++`endif
+ 
+ endmodule
+ `endif
+diff --git a/modules/jtframe/hdl/inc/game_sdram.v b/modules/jtframe/hdl/inc/game_sdram.v
+index ba22507e6..acaa07b64 100644
+--- a/modules/jtframe/hdl/inc/game_sdram.v
++++ b/modules/jtframe/hdl/inc/game_sdram.v
+@@ -11,6 +11,10 @@
+ `endif
+ 
+ module jt{{.Core}}_game_sdram(
++`ifdef JTFRAME_NETPLAY
++    input           np_hold,    // freezes the game's clock enables (netplay)
++    input           np_clr,     // restarts them from zero when a session's frame 0 starts
++`endif
+     `include "jtframe_common_ports.inc"
+     `include "jtframe_mem_ports.inc"
+ );
+@@ -657,6 +661,13 @@ jtframe_gated_cen #(.W({{.W}}),.NUM({{.Mul}}),.DEN({{.Div}}),.MFREQ({{.KHz}})) u
+     .rst    ( rst          ),
+     .clk    ( {{.ClkName}} ),
+     .busy   ( {{.Busy}}    ),
++`ifdef JTFRAME_NETPLAY
++    .hold   ( np_hold      ),
++    .clr    ( np_clr       ),
++`else
++    .hold   ( 1'b0         ),
++    .clr    ( 1'b0         ),
++`endif
+     .cen    ( { {{ .OutStr }} } ),
+     .fave   (              ),
+     .fworst (              )
+diff --git a/modules/jtframe/hdl/inc/jtframe_game_instance.v b/modules/jtframe/hdl/inc/jtframe_game_instance.v
+index 0ef407641..f92591a2e 100644
+--- a/modules/jtframe/hdl/inc/jtframe_game_instance.v
++++ b/modules/jtframe/hdl/inc/jtframe_game_instance.v
+@@ -52,6 +52,10 @@ assign sim_dwnld_busy = dwnld_busy;
+ 
+ `GAMETOP
+ u_game(
++`ifdef JTFRAME_NETPLAY
++    .np_hold     ( np_hold        ),
++    .np_clr      ( np_clr         ),
++`endif
+     .rst         ( game_rst       ),
+     // The main clock is always the same one as the SDRAM
+     .clk         ( clk_rom        ),
+diff --git a/modules/jtframe/hdl/jtframe_board.v b/modules/jtframe/hdl/jtframe_board.v
+index 752da22da..efc02b4b2 100644
+--- a/modules/jtframe/hdl/jtframe_board.v
++++ b/modules/jtframe/hdl/jtframe_board.v
+@@ -15,6 +15,9 @@ module jtframe_board #(parameter
+ )(
+     output              rst,
+     output              rst_n,
++`ifdef JTFRAME_NETPLAY
++    input               np_hold,    // netplay: freezes the pixel clock enables
++`endif
+     output              game_rst,
+     output              game_rst_n,
+     output              sdram_init,
+@@ -228,6 +231,11 @@ assign base_rgb  = { cross_r, cross_g, cross_b };
+ `ifdef JTFRAME_PXLCLK
+     jtframe_pxlcen u_pxlcen(
+         .clk        ( clk_rom   ),
++`ifdef JTFRAME_NETPLAY
++        .hold       ( np_hold   ),
++`else
++        .hold       ( 1'b0      ),
++`endif
+         .pxl_cen    ( pxl_cen   ),
+         .pxl2_cen   ( pxl2_cen  )
+     );
+diff --git a/modules/jtframe/hdl/ver/game_test.v b/modules/jtframe/hdl/ver/game_test.v
+index 7eb42370a..a7241a01e 100644
+--- a/modules/jtframe/hdl/ver/game_test.v
++++ b/modules/jtframe/hdl/ver/game_test.v
+@@ -100,6 +100,20 @@ module game_test(
+     output [1:0]    SDRAM_BA,       // SDRAM Bank Address
+     output          SDRAM_CLK,      // SDRAM Clock
+     output          SDRAM_CKE,      // SDRAM Clock Enable
++`ifdef JTFRAME_NETPLAY
++    // netplay mailbox channel (toggle handshake) and observation
++    output [31:3]   np_ddr_addr,
++    output [63:0]   np_ddr_din,
++    input  [63:0]   np_ddr_dout,
++    output          np_ddr_we,
++    output          np_ddr_req,
++    input           np_ddr_ack,
++    input           np_dip_wr,
++    output [ 2:0]   np_state,
++    output [31:0]   np_frame,
++    output [ 7:0]   np_error,
++    output          np_hold_o,
++`endif
+     // input  [21:0]   SDRAM_BA_ADDR0,
+     // input  [21:0]   SDRAM_BA_ADDR1,
+     // input  [21:0]   SDRAM_BA_ADDR2,
+@@ -532,19 +546,81 @@ assign burst_addr=0, burst_ba=0, burst_rd=0, burst_wr=0, burst_din=0,
+ `endif
+ /* verilator tracing_on */
+ //////// GAME MODULE
++// Netplay (jtframe_np_board.sv): the same logic as on MiSTer, with the
++// DDR3 mailbox channel on the test bench's ports
++wire        g_rst, g_service, g_tilt, g_test, g_pause, np_hold, np_clr;
++wire [ 9:0] g_joy1, g_joy2;
++wire [ 3:0] g_start, g_coin;
++`ifdef JTFRAME_NETPLAY
++jtframe_np_board #(
++    .GAME_INPUTS_ACTIVE_LOW( 1'b1   ),
++    .COLORW                ( COLORW )
++) u_np_board(
++    .clk            ( clk_rom       ),
++    .rst            ( rst           ),
++    .downloading    ( ioctl_rom     ),
++    .dip_wr         ( np_dip_wr     ),
++    .lvbl           ( LVBL          ),
++    .lhbl           ( LHBL          ),
++    .pxl_cen        ( pxl_cen       ),
++    .red            ( red[COLORW-1:0]   ),
++    .green          ( green[COLORW-1:0] ),
++    .blue           ( blue[COLORW-1:0]  ),
++    .bd_game_rst    ( rst           ),
++    .bd_joystick1   ( joystick1     ),
++    .bd_joystick2   ( joystick2     ),
++    .bd_coin        ( coin          ),
++    .bd_start       ( cab_1p        ),
++    .bd_service     ( service       ),
++    .bd_tilt        ( tilt          ),
++    .bd_dip_test    ( dip_test      ),
++    .bd_dip_pause   ( dip_pause     ),
++    .game_rst       ( g_rst         ),
++    .game_joystick1 ( g_joy1        ),
++    .game_joystick2 ( g_joy2        ),
++    .game_coin      ( g_coin        ),
++    .game_start     ( g_start       ),
++    .game_service   ( g_service     ),
++    .game_tilt      ( g_tilt        ),
++    .dip_test       ( g_test        ),
++    .dip_pause      ( g_pause       ),
++    .np_hold        ( np_hold       ),
++    .np_clr         ( np_clr        ),
++    .np_stall       (               ),
++    .ddr_addr       ( np_ddr_addr   ),
++    .ddr_din        ( np_ddr_din    ),
++    .ddr_dout       ( np_ddr_dout   ),
++    .ddr_we         ( np_ddr_we     ),
++    .ddr_req        ( np_ddr_req    ),
++    .ddr_ack        ( np_ddr_ack    ),
++    .np_state       ( np_state      ),
++    .np_frame       ( np_frame      ),
++    .np_error       ( np_error      )
++);
++assign np_hold_o = np_hold;
++`else
++assign { g_rst, g_service, g_tilt, g_test, g_pause, np_hold, np_clr } =
++       { rst,   service,   tilt,   dip_test, dip_pause, 1'b0, 1'b0 };
++assign { g_joy1, g_joy2, g_start, g_coin } = { joystick1, joystick2, cab_1p, coin };
++`endif
++
+ `GAMETOP
+ u_game(
+-    .rst         ( rst            ),
++`ifdef JTFRAME_NETPLAY
++    .np_hold     ( np_hold        ),
++    .np_clr      ( np_clr         ),
++`endif
++    .rst         ( g_rst          ),
+     // The main clock is always the same one as the SDRAM
+     .clk         ( clk_rom        ),
+     .clk96       ( clk96          ),
+-    .rst96       ( rst            ),
++    .rst96       ( g_rst          ),
+ `ifdef JTFRAME_CLK48
+     .clk48       ( clk48          ),
+-    .rst48       ( rst            ),
++    .rst48       ( g_rst          ),
+ `endif
+     .clk24       ( clk24          ),
+-    .rst24       ( rst            ),
++    .rst24       ( g_rst          ),
+     // Video
+     .pxl2_cen    ( pxl2_cen       ),
+     .pxl_cen     ( pxl_cen        ),
+@@ -556,11 +632,11 @@ u_game(
+     .HS          ( HS             ),
+     .VS          ( VS             ),
+ 
+-    .cab_1p      ( cab_1p         ),
+-    .coin        ( coin           ),
++    .cab_1p      ( g_start        ),
++    .coin        ( g_coin         ),
+     // Joysticks
+-    .joystick1   ( joystick1[GAME_BUTTONS+3:0]   ),
+-    .joystick2   ( joystick2[GAME_BUTTONS+3:0]   ),
++    .joystick1   ( g_joy1[GAME_BUTTONS+3:0]      ),
++    .joystick2   ( g_joy2[GAME_BUTTONS+3:0]      ),
+     .joystick3   ( joystick3[GAME_BUTTONS+3:0]   ),
+     .joystick4   ( joystick4[GAME_BUTTONS+3:0]   ),
+ 
+@@ -660,12 +736,12 @@ u_game(
+ `endif
+     // DIP switches
+     .status      ( status[31:0]   ),
+-    .dip_pause   ( dip_pause      ),
++    .dip_pause   ( g_pause        ),
+     .dip_flip    ( dip_flip       ),
+-    .dip_test    ( dip_test       ),
++    .dip_test    ( g_test         ),
+     .dip_fxlevel ( dip_fxlevel    ),
+-    .service     ( service        ),
+-    .tilt        ( tilt           ),
++    .service     ( g_service      ),
++    .tilt        ( g_tilt         ),
+     .dipsw       ( dipsw          ),
+ 
+ `ifdef JTFRAME_GAME_UART
+@@ -730,6 +806,7 @@ u_game(
+     /* verilator tracing_off */
+     jtframe_pxlcen u_pxlcen(
+         .clk        ( clk_rom   ),
++        .hold       ( np_hold   ),
+         .pxl_cen    ( pxl_cen   ),
+         .pxl2_cen   ( pxl2_cen  )
+     );
+diff --git a/modules/jtframe/target/mister/cfg/files.yaml b/modules/jtframe/target/mister/cfg/files.yaml
+index f6b798634..1a6cca6d4 100644
+--- a/modules/jtframe/target/mister/cfg/files.yaml
++++ b/modules/jtframe/target/mister/cfg/files.yaml
+@@ -11,6 +11,11 @@ jtframe/target/mister:
+     - sys.qip
+     - pll.qip
+     - joydb15.v
++  - when: [ JTFRAME_NETPLAY ]
++    get:
++      - jtframe_netplay.sv
++      - jtframe_np_ddrarb.sv
++      - jtframe_np_board.sv
+   - when: [ JTFRAME_SAVEGAME ]
+     get:
+       - jtframe_mister_cartsave.v
+diff --git a/modules/jtframe/target/mister/cfgstr b/modules/jtframe/target/mister/cfgstr
+index 2d62b1655..93b970837 100644
+--- a/modules/jtframe/target/mister/cfgstr
++++ b/modules/jtframe/target/mister/cfgstr
+@@ -45,6 +45,7 @@ d5P1oAD,Crop Offset,0,2,4,8,10,12,-12,-10,-8,-6,-4,-2;
+                                     o56,User port,Off,DB15 Joystick,UART; {{ end }}
+     {{ else }}                      o5,User port,Off,DB15 Joystick; {{ end }}
+ {{ if .JTFRAME_CREDITS }} OC,Show credits in pause,On,Off; {{ end }}
++{{ if .JTFRAME_NETPLAY }}        O[127:126],Netplay,netplay.ini,Off,Host,Join; {{ end }}
+ R0,Reset;
+ {{ with .MISTER_EXTRA }} {{ . }} {{ end }}
+ V,v{{ .JTFRAME_COMMIT }};
+diff --git a/modules/jtframe/target/mister/hdl/jtframe_emu.sv b/modules/jtframe/target/mister/hdl/jtframe_emu.sv
+index 3d2912e96..7c2cc99c9 100644
+--- a/modules/jtframe/target/mister/hdl/jtframe_emu.sv
++++ b/modules/jtframe/target/mister/hdl/jtframe_emu.sv
+@@ -194,7 +194,12 @@ assign VGA_F1=field;
+ // unused features
+ assign VGA_SCALER    = 0;
+ assign VGA_DISABLE   = 0;
++`ifdef JTFRAME_NETPLAY
++wire   np_hold, np_clr, np_stall;
++assign HDMI_FREEZE   = np_stall;
++`else
+ assign HDMI_FREEZE   = 0;
++`endif
+ assign HDMI_BLACKOUT = 0;
+ assign HDMI_BOB_DEINT= 0;
+ assign AUDIO_MIX     = 0;
+@@ -460,6 +465,11 @@ jtframe_mister #(
+     .VIDEO_HEIGHT   (`JTFRAME_HEIGHT )
+ )
+ u_frame(
++`ifdef JTFRAME_NETPLAY
++    .np_hold        ( np_hold        ),
++    .np_clr         ( np_clr         ),
++    .np_stall       ( np_stall       ),
++`endif
+     .clk_sys        ( clk_sys        ),
+     .clk_rom        ( clk_rom        ),
+     .clk_pico       ( clk_pico       ),
+diff --git a/modules/jtframe/target/mister/hdl/jtframe_mister.sv b/modules/jtframe/target/mister/hdl/jtframe_mister.sv
+index dc7fabf64..41e8a711f 100644
+--- a/modules/jtframe/target/mister/hdl/jtframe_mister.sv
++++ b/modules/jtframe/target/mister/hdl/jtframe_mister.sv
+@@ -221,6 +221,12 @@ module jtframe_mister #(parameter
+     input     [ 7:0]  debug_view,
+     output    [ 7:0]  st_addr,
+     input     [ 7:0]  st_dout
++`ifdef JTFRAME_NETPLAY
++    // netplay (jtframe_netplay.sv)
++   ,output            np_hold,    // freeze the game's clock enables
++    output            np_clr,     // restart them (first clock of a session)
++    output            np_stall    // held for missing input: HDMI freeze
++`endif
+ );
+ 
+ wire [21:0] gamma_bus;
+@@ -706,6 +712,83 @@ u_arcade_video(
+     .forced_scandoubler( force_scan2x )
+ );
+ 
++// Netplay (SPEC 12.3, jtframe_np_board.sv)
++wire        bd_game_rst, bd_game_rst_n, bd_service, bd_tilt, bd_dip_test, bd_dip_pause;
++wire [ 9:0] bd_joystick1, bd_joystick2;
++wire [ 3:0] bd_coin, bd_start;
++
++`ifdef JTFRAME_NETPLAY
++`ifdef JTFRAME_LF_BUFFER
++    `ifndef JTFRAME_MR_LF_BRAM
++    initial $error("JTFRAME_NETPLAY: the DDR3 line-frame buffer is not supported");
++    `endif
++`endif
++`ifdef JTFRAME_MR_GAME_DDR
++    initial $error("JTFRAME_NETPLAY: game DDR3 access is not supported");
++`endif
++wire [31:3] np_addr;
++wire [63:0] np_din, np_dout;
++wire        np_we, np_req, np_ack;
++
++jtframe_np_board #(
++    .GAME_INPUTS_ACTIVE_LOW( GAME_INPUTS_ACTIVE_LOW ),
++    .COLORW                ( COLORW                 )
++) u_np_board(
++    .clk            ( clk_rom         ),
++    .rst            ( rst             ),
++    .downloading    ( ioctl_rom       ),
++    .dip_wr         ( hps_download && hps_index[7:0]==8'd254 ),
++    .lvbl           ( LVBL            ),
++    .lhbl           ( LHBL            ),
++    .pxl_cen        ( pxl_cen         ),
++    .red            ( game_r          ),
++    .green          ( game_g          ),
++    .blue           ( game_b          ),
++    .bd_game_rst    ( bd_game_rst     ),
++    .bd_joystick1   ( bd_joystick1    ),
++    .bd_joystick2   ( bd_joystick2    ),
++    .bd_coin        ( bd_coin         ),
++    .bd_start       ( bd_start        ),
++    .bd_service     ( bd_service      ),
++    .bd_tilt        ( bd_tilt         ),
++    .bd_dip_test    ( bd_dip_test     ),
++    .bd_dip_pause   ( bd_dip_pause    ),
++    .game_rst       ( game_rst        ),
++    .game_joystick1 ( game_joystick1  ),
++    .game_joystick2 ( game_joystick2  ),
++    .game_coin      ( game_coin       ),
++    .game_start     ( game_start      ),
++    .game_service   ( game_service    ),
++    .game_tilt      ( game_tilt       ),
++    .dip_test       ( dip_test        ),
++    .dip_pause      ( dip_pause       ),
++    .np_hold        ( np_hold         ),
++    .np_clr         ( np_clr          ),
++    .np_stall       ( np_stall        ),
++    .ddr_addr       ( np_addr         ),
++    .ddr_din        ( np_din          ),
++    .ddr_dout       ( np_dout         ),
++    .ddr_we         ( np_we           ),
++    .ddr_req        ( np_req          ),
++    .ddr_ack        ( np_ack          ),
++    .np_state       (                 ),
++    .np_frame       (                 ),
++    .np_error       (                 )
++);
++assign game_rst_n = ~game_rst;
++`else
++assign game_rst       = bd_game_rst;
++assign game_rst_n     = bd_game_rst_n;
++assign game_joystick1 = bd_joystick1;
++assign game_joystick2 = bd_joystick2;
++assign game_start     = bd_start;
++assign game_coin      = bd_coin;
++assign game_service   = bd_service;
++assign game_tilt      = bd_tilt;
++assign dip_test       = bd_dip_test;
++assign dip_pause      = bd_dip_pause;
++`endif
++
+ jtframe_board #(
+     .BUTTONS               ( BUTTONS              ),
+     .GAME_INPUTS_ACTIVE_LOW(GAME_INPUTS_ACTIVE_LOW),
+@@ -717,8 +800,11 @@ jtframe_board #(
+ ) u_board(
+     .rst            ( rst             ),
+     .rst_n          ( rst_n           ),
+-    .game_rst       ( game_rst        ),
+-    .game_rst_n     ( game_rst_n      ),
++`ifdef JTFRAME_NETPLAY
++    .np_hold        ( np_hold         ),
++`endif
++    .game_rst       ( bd_game_rst     ),
++    .game_rst_n     ( bd_game_rst_n   ),
+     .rst_req        ( rst_req         ),
+     .sdram_init     (                 ),
+ 
+@@ -759,14 +845,14 @@ jtframe_board #(
+     .joyana_r2      ( joyana_r2       ),
+     .board_start    ( 4'd0            ),
+     .board_coin     ( 4'd0            ),
+-    .game_joystick1 ( game_joystick1  ),
+-    .game_joystick2 ( game_joystick2  ),
++    .game_joystick1 ( bd_joystick1    ),
++    .game_joystick2 ( bd_joystick2    ),
+     .game_joystick3 ( game_joystick3  ),
+     .game_joystick4 ( game_joystick4  ),
+-    .game_coin      ( game_coin       ),
+-    .game_start     ( game_start      ),
+-    .game_service   ( game_service    ),
+-    .game_tilt      ( game_tilt       ),
++    .game_coin      ( bd_coin         ),
++    .game_start     ( bd_start        ),
++    .game_service   ( bd_service      ),
++    .game_tilt      ( bd_tilt         ),
+     // Mouse & paddle
+     .bd_mouse_dx    ( mouse_dx        ),
+     .bd_mouse_dy    ( mouse_dy        ),
+@@ -794,8 +880,8 @@ jtframe_board #(
+     // DIP and OSD settings
+     .status         ( status          ),
+     .dipsw          ( dipsw           ),
+-    .dip_test       ( dip_test        ),
+-    .dip_pause      ( dip_pause       ),
++    .dip_test       ( bd_dip_test     ),
++    .dip_pause      ( bd_dip_pause    ),
+     .dip_flip       ( dip_flip        ),
+     .dip_fxlevel    ( dip_fxlevel     ),
+     .timestamp      ( timestamp       ),
+@@ -1090,6 +1176,46 @@ wire rot_clk;
+ `endif
+ `endif
+ 
++`ifdef JTFRAME_NETPLAY
++wire [ 7:0] mux_burstcnt, mux_be;
++wire [28:0] mux_addr;
++wire [63:0] mux_din;
++wire        mux_rd, mux_we, mux_busy;
++
++jtframe_np_ddrarb u_np_ddrarb(
++    .rst            ( rst             ),
++    .clk            ( clk_rom         ),
++    .r_burstcnt     ( rot_burstcnt    ),
++    .r_addr         ( rot_addr        ),
++    .r_rd           ( rot_rd          ),
++    .r_we           ( rot_we          ),
++    .r_be           ( rot_be          ),
++    .r_din          ( rot_din         ),
++    .r_busy         ( rot_busy        ),
++    .m_burstcnt     ( mux_burstcnt    ),
++    .m_addr         ( mux_addr        ),
++    .m_rd           ( mux_rd          ),
++    .m_we           ( mux_we          ),
++    .m_be           ( mux_be          ),
++    .m_din          ( mux_din         ),
++    .m_busy         ( mux_busy        ),
++    .ddr_dout       ( DDRAM_DOUT      ),
++    .ddr_dout_ready ( DDRAM_DOUT_READY),
++    .np_addr        ( np_addr         ),
++    .np_din         ( np_din          ),
++    .np_we          ( np_we           ),
++    .np_req         ( np_req          ),
++    .np_ack         ( np_ack          ),
++    .np_dout        ( np_dout         )
++);
++`else
++wire [ 7:0] mux_burstcnt = rot_burstcnt, mux_be = rot_be;
++wire [28:0] mux_addr     = rot_addr;
++wire [63:0] mux_din      = rot_din;
++wire        mux_rd       = rot_rd, mux_we = rot_we, mux_busy;
++assign      rot_busy     = mux_busy;
++`endif
++
+ jtframe_mr_ddrmux u_ddrmux(
+         .rst            ( rst             ),
+         .clk            ( clk_rom         ),
+@@ -1101,13 +1227,13 @@ jtframe_mr_ddrmux u_ddrmux(
+         .ddrld_busy     ( ddrld_busy      ),
+         // Video DDR client
+         .rot_clk        ( rot_clk         ),
+-        .rot_burstcnt   ( rot_burstcnt    ),
+-        .rot_addr       ( rot_addr        ),
+-        .rot_rd         ( rot_rd          ),
+-        .rot_we         ( rot_we          ),
+-        .rot_be         ( rot_be          ),
+-        .rot_din        ( rot_din         ),
+-        .rot_busy       ( rot_busy        ),
++        .rot_burstcnt   ( mux_burstcnt    ),
++        .rot_addr       ( mux_addr        ),
++        .rot_rd         ( mux_rd          ),
++        .rot_we         ( mux_we          ),
++        .rot_be         ( mux_be          ),
++        .rot_din        ( mux_din         ),
++        .rot_busy       ( mux_busy        ),
+         // DDR Signals
+         .ddr_clk        ( DDRAM_CLK       ),
+         .ddr_busy       ( DDRAM_BUSY      ),
+diff --git a/modules/jtframe/target/mister/hdl/jtframe_netplay.sv b/modules/jtframe/target/mister/hdl/jtframe_netplay.sv
+new file mode 100644
+index 000000000..ca7fd5ee0
+--- /dev/null
++++ b/modules/jtframe/target/mister/hdl/jtframe_netplay.sv
+@@ -0,0 +1,421 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++ *
++ * jtframe_netplay.sv
++ *
++ * Delay-based lockstep netplay for jtframe arcade cores on MiSTer.
++ *
++ * Each MiSTer runs the whole game; the network carries only input. This side
++ * never touches the network: it exchanges per-frame input with Main_MiSTer
++ * through a mailbox in DDR3 at BASE (the NES / Game Boy 2P layout):
++ *
++ *   MAGIC  +0x0000  "ARCDNP01"
++ *   STATUS +0x0008  {frame, state, error, stalls}
++ *   CTRL   +0x0010  {"CTRL", session, join, run, enable}
++ *   LOCAL  +0x1000  256 entries {f[11:0], sess, joy[11:0]} in both halves
++ *   CRC    +0x1800  256 entries {f[15:0], crc half} in both halves
++ *   INPUT  +0x2000  256 entries {f[11:0], sess, p2 / p1 joy[11:0]}
++ *
++ * Joy words (active high): 3:0 Right Left Down Up, 9:4 buttons 1-6,
++ * 10 Start, 11 Coin.
++ *
++ * Emulated time. Everything the game does advances on the clock enables made
++ * by jtframe_gated_cen (CPUs, sound) and jtframe_pxlcen (video). `hold`
++ * freezes both without losing or catching up a pulse, so a held cycle does not
++ * exist for the game. A frame starts on the first clock after the game's LVBL
++ * falls (the start of its vertical blank). That clock is always held: INPUT[k]
++ * is applied in it and HOLD_POST more clocks are held so the new input has
++ * reached the game before its next clock enable. If INPUT[k] is not in hand
++ * the hold lasts until it is.
++ *
++ * Session start. In ARMED and PRIME the game is held in reset while its video
++ * timing runs on (jtframe's video timers have no reset). Frame 0 starts at an
++ * LVBL fall once INPUT[0] and INPUT[1] are in hand: reset is released there
++ * and `clr` restarts the clock enable generators from zero, so both sides
++ * start from the same video position and the same clock enable phase. The
++ * line buffers still hold pictures from before the session for a frame, so
++ * the CRC of frames 0 and 1 covers only the input.
++ */
++
++module jtframe_netplay #(
++    parameter int          POLL_INTERVAL = 256,           // clocks between INPUT polls
++    parameter int          CTRL_INTERVAL = 4096,          // clocks between CTRL reads
++    parameter int          HOLD_POST     = 4,             // clocks held after a frame start
++    parameter logic [31:0] BASE          = 32'h3C000000   // physical byte address of the mailbox
++)(
++    input             clk,
++    input             reset,          // power-on only, never on ROM load
++    input             downloading,    // a ROM load is in progress
++    input             dip_wr,         // the DIP switches are being written (download index 254)
++
++    // the game
++    input             lvbl,           // LVBL out of the game (changes only on pxl_cen)
++    input             pix_en,         // pxl_cen & LHBL & LVBL
++    input      [23:0] pix,            // {red, green, blue}
++
++    input      [11:0] local_joy,      // this side's player 1 controls, active high
++
++    output            active,
++    output            hold_reset,     // keep the game in reset
++    output            hold,           // freeze the game's clock enables
++    output            clr,            // restart the clock enable generators
++    output            stall,          // held for missing input or an error (HDMI freeze)
++    output reg        is_join,
++    output reg [11:0] joy_p1,         // what the game sees as player 1 (the host)
++    output reg [11:0] joy_p2,         // and player 2 (the join)
++
++    // DDR3 channel (toggle handshake: req != ack = busy)
++    output reg [31:3] ddr_addr,
++    output reg [63:0] ddr_din,
++    input      [63:0] ddr_dout,
++    output reg        ddr_we,
++    output reg        ddr_req,
++    input             ddr_ack,
++
++    // observation
++    output      [2:0] state_o,
++    output     [31:0] frame_o,
++    output      [7:0] error_o
++);
++
++localparam logic [15:0] OFF_MAGIC  = 16'h0000;
++localparam logic [15:0] OFF_STATUS = 16'h0008;
++localparam logic [15:0] OFF_CTRL   = 16'h0010;
++localparam logic [15:0] OFF_LOCAL  = 16'h1000;
++localparam logic [15:0] OFF_CRC    = 16'h1800;
++localparam logic [15:0] OFF_INPUT  = 16'h2000;
++
++localparam logic [63:0] MAGIC      = 64'h3130504E44435241; // "ARCDNP01"
++// CTRL is only believed with this in its upper half. DDR3 is not cleared when
++// cores change, so a stray word left by another core must never arm netplay.
++localparam logic [31:0] CTRL_MAGIC = 32'h4C525443;          // "CTRL"
++
++localparam logic [2:0] S_IDLE  = 3'd0;
++localparam logic [2:0] S_ARMED = 3'd1;
++localparam logic [2:0] S_PRIME = 3'd2;
++localparam logic [2:0] S_RUN   = 3'd3;
++localparam logic [2:0] S_ERROR = 3'd4;
++
++localparam int ERR_CTRL_DROP = 1;
++localparam int ERR_RELOAD    = 2;
++
++localparam logic [31:0] CRC_INIT = 32'hFFFFFFFF;
++
++function automatic logic [31:0] crc_byte(input logic [31:0] c, input logic [7:0] d);
++    logic [31:0] x;
++    x = c ^ {24'd0, d};
++    for (int i = 0; i < 8; i++)
++        x = x[0] ? ((x >> 1) ^ 32'hEDB88320) : (x >> 1);
++    return x;
++endfunction
++
++function automatic logic [31:0] crc_joy(input logic [11:0] p1, input logic [11:0] p2);
++    return crc_byte(crc_byte(crc_byte(CRC_INIT, p1[7:0]), {p2[3:0], p1[11:8]}), p2[11:4]);
++endfunction
++
++function automatic logic [31:0] crc_pix(input logic [31:0] c, input logic [23:0] p);
++    return crc_byte(crc_byte(crc_byte(c, p[23:16]), p[15:8]), p[7:0]);
++endfunction
++
++function automatic logic [31:3] waddr(input logic [15:3] off);
++    return BASE[31:3] + {16'd0, off};
++endfunction
++
++function automatic logic [15:3] ring(input logic [15:3] base_off, input logic [7:0] slot);
++    return base_off + {5'd0, slot};
++endfunction
++
++// ---------------------------------------------------------------------------
++// State
++
++logic [2:0]  state;
++logic [31:0] frame;
++logic [7:0]  error;
++logic [15:0] stalls;
++logic [7:0]  sess;
++
++// Lookahead: slot 0 holds INPUT[base], slot 1 INPUT[base+1], where base is
++// the first frame not started yet (0 in PRIME, frame+1 in RUN).
++logic        have0, have1;
++logic [11:0] a_p1, a_p2;
++logic [11:0] b_p1, b_p2;
++logic [31:0] crc;
++logic        crc_live;        // pixels count from frame 2 on
++
++logic        lvbl_prev;
++logic        waiting;         // a frame start is due and its INPUT is missing
++logic  [3:0] post;            // clocks still held after a frame start
++
++wire         tick_now = lvbl_prev && !lvbl;                       // first clock of a vertical blank
++wire         run_due  = (state == S_RUN) && (tick_now || waiting); // frame k is due now
++wire         consume  = run_due && have0;                          // frame k starts in this clock
++wire         start0   = (state == S_PRIME) && tick_now && have0 && have1 && !downloading;
++
++assign hold       = run_due || start0 || (post != 4'd0) || (state == S_ERROR && !downloading);
++assign clr        = start0;
++assign stall      = waiting || (state == S_ERROR && !downloading);
++assign active     = (state != S_IDLE);
++assign hold_reset = (state == S_ARMED) || (state == S_PRIME);
++
++assign state_o = state;
++assign frame_o = frame;
++assign error_o = error;
++
++// Pending mailbox work
++logic        p_ctrl_clr, p_magic, p_status, p_local, p_crc;
++logic [15:0] local_frame;
++logic [11:0] local_val;
++logic [15:0] crc_frame;
++logic [31:0] crc_val;
++logic        hold_prev;
++
++// Poll timers
++logic [15:0] poll_cnt, ctrl_cnt;
++logic        poll_due, ctrl_due;
++
++// DDR sequencer
++localparam logic [2:0] OP_NONE    = 3'd0;
++localparam logic [2:0] OP_MAGIC   = 3'd1;
++localparam logic [2:0] OP_CRC     = 3'd2;
++localparam logic [2:0] OP_LOCAL   = 3'd3;
++localparam logic [2:0] OP_STATUS  = 3'd4;
++localparam logic [2:0] OP_CTRL    = 3'd5;
++localparam logic [2:0] OP_INPUT   = 3'd6;
++localparam logic [2:0] OP_CTRLCLR = 3'd7;
++
++logic [2:0]  op;
++logic [31:0] op_frame;
++wire         ddr_done = (op != OP_NONE) && (ddr_req == ddr_ack);
++
++wire  [31:0] base       = (state == S_PRIME) ? 32'd0 : frame + 32'd1;
++wire         fetching   = (state == S_PRIME) || (state == S_RUN);
++wire         need_input = fetching && !(have0 && have1);
++wire  [31:0] want_frame = have0 ? base + 32'd1 : base;
++
++wire         ctrl_ok  = (ddr_dout[63:32] == CTRL_MAGIC);
++wire         ctrl_en  = ctrl_ok & ddr_dout[0];
++wire         ctrl_run = ctrl_ok & ddr_dout[1];
++
++wire  [63:0] status_word = {frame, 5'd0, state, error, stalls};
++
++wire  [31:0] in_hi = ddr_dout[63:32];
++wire  [31:0] in_lo = ddr_dout[31:0];
++wire         in_ok = (in_hi[31:20] == op_frame[11:0]) && (in_lo[31:20] == op_frame[11:0])
++                  && (in_hi[19:12] == sess)           && (in_lo[19:12] == sess);
++
++wire         reload = downloading || dip_wr;
++
++always_ff @(posedge clk) begin
++    hold_prev <= hold;
++    lvbl_prev <= lvbl;
++    if (post != 4'd0) post <= post - 4'd1;
++
++    if (poll_cnt == POLL_INTERVAL[15:0] - 16'd1) begin poll_cnt <= 16'd0; poll_due <= 1'b1; end
++    else poll_cnt <= poll_cnt + 16'd1;
++    if (ctrl_cnt == CTRL_INTERVAL[15:0] - 16'd1) begin ctrl_cnt <= 16'd0; ctrl_due <= 1'b1; end
++    else ctrl_cnt <= ctrl_cnt + 16'd1;
++
++    // -----------------------------------------------------------------------
++    // Per-frame work in RUN
++    if (state == S_RUN) begin
++        if (hold && !hold_prev && !consume && stalls != 16'hFFFF) stalls <= stalls + 16'd1;
++        if (tick_now && !have0) waiting <= 1'b1;
++
++        if (consume) begin
++            waiting     <= 1'b0;
++            post        <= 4'(HOLD_POST);
++            frame       <= frame + 32'd1;
++            joy_p1      <= a_p1;
++            joy_p2      <= a_p2;
++            have0       <= have1;
++            a_p1        <= b_p1;
++            a_p2        <= b_p2;
++            have1       <= 1'b0;
++
++            crc_frame   <= frame[15:0];
++            crc_val     <= crc;
++            p_crc       <= 1'b1;
++
++            local_frame <= frame[15:0] + 16'd1;
++            local_val   <= local_joy;
++            p_local     <= 1'b1;
++
++            p_status    <= 1'b1;
++            crc         <= crc_joy(a_p1, a_p2);
++            if (frame >= 32'd1) crc_live <= 1'b1;   // frame 2 starts now
++        end
++        else if (pix_en && crc_live) begin
++            crc <= crc_pix(crc, pix);
++        end
++
++        if (reload) begin
++            error[ERR_RELOAD] <= 1'b1;
++            state    <= S_ERROR;
++            p_status <= 1'b1;
++        end
++    end
++
++    if (state == S_PRIME && reload) begin
++        error[ERR_RELOAD] <= 1'b1;
++        state    <= S_ERROR;
++        p_status <= 1'b1;
++    end
++
++    // PRIME -> RUN at a vertical blank once INPUT[0] and INPUT[1] are in hand.
++    if (start0 && !dip_wr) begin
++        state       <= S_RUN;
++        frame       <= 32'd0;
++        waiting     <= 1'b0;
++        post        <= 4'(HOLD_POST);
++        joy_p1      <= a_p1;
++        joy_p2      <= a_p2;
++        have0       <= 1'b1;
++        a_p1        <= b_p1;
++        a_p2        <= b_p2;
++        have1       <= 1'b0;
++        local_frame <= 16'd0;
++        local_val   <= local_joy;
++        p_local     <= 1'b1;
++        p_status    <= 1'b1;
++        crc         <= crc_joy(a_p1, a_p2);
++        crc_live    <= 1'b0;
++    end
++
++    // -----------------------------------------------------------------------
++    // DDR sequencer: one outstanding request at a time.
++    if (op == OP_NONE) begin
++        if (p_ctrl_clr) begin
++            op <= OP_CTRLCLR; ddr_addr <= waddr(OFF_CTRL[15:3]);   ddr_din <= 64'd0;       ddr_we <= 1'b1; ddr_req <= ~ddr_req;
++        end
++        else if (p_magic) begin
++            op <= OP_MAGIC;   ddr_addr <= waddr(OFF_MAGIC[15:3]);  ddr_din <= MAGIC;       ddr_we <= 1'b1; ddr_req <= ~ddr_req;
++        end
++        else if (p_crc) begin
++            op <= OP_CRC;     ddr_addr <= waddr(ring(OFF_CRC[15:3], crc_frame[7:0]));
++            ddr_din <= {crc_frame, crc_val[31:16], crc_frame, crc_val[15:0]};
++            ddr_we <= 1'b1; ddr_req <= ~ddr_req;
++        end
++        else if (p_local) begin
++            op <= OP_LOCAL;   ddr_addr <= waddr(ring(OFF_LOCAL[15:3], local_frame[7:0]));
++            ddr_din <= {local_frame[11:0], sess, local_val, local_frame[11:0], sess, local_val};
++            ddr_we <= 1'b1; ddr_req <= ~ddr_req;
++        end
++        else if (p_status) begin
++            op <= OP_STATUS;  ddr_addr <= waddr(OFF_STATUS[15:3]); ddr_din <= status_word; ddr_we <= 1'b1; ddr_req <= ~ddr_req;
++        end
++        else if (ctrl_due) begin
++            op <= OP_CTRL;    ddr_addr <= waddr(OFF_CTRL[15:3]);   ddr_we <= 1'b0; ddr_req <= ~ddr_req;
++        end
++        else if (poll_due && need_input) begin
++            op <= OP_INPUT;   ddr_addr <= waddr(ring(OFF_INPUT[15:3], want_frame[7:0]));
++            op_frame <= want_frame;
++            ddr_we <= 1'b0; ddr_req <= ~ddr_req;
++        end
++    end
++    else if (ddr_done) begin
++        op <= OP_NONE;
++        case (op)
++            OP_CTRLCLR: p_ctrl_clr <= 1'b0;
++            OP_MAGIC:   p_magic    <= 1'b0;
++            OP_CRC:     p_crc      <= 1'b0;
++            OP_LOCAL:   p_local    <= 1'b0;
++            OP_STATUS:  p_status   <= 1'b0;
++            OP_INPUT: begin
++                poll_due <= 1'b0;
++                // A frame starting in this very clock shifts the lookahead: drop
++                // the word and let the next poll fetch it again.
++                if (in_ok && fetching && !consume && !start0) begin
++                    if (!have0 && op_frame == base) begin
++                        a_p1  <= in_lo[11:0];
++                        a_p2  <= in_hi[11:0];
++                        have0 <= 1'b1;
++                    end
++                    else if (have0 && !have1 && op_frame == base + 32'd1) begin
++                        b_p1  <= in_lo[11:0];
++                        b_p2  <= in_hi[11:0];
++                        have1 <= 1'b1;
++                    end
++                end
++            end
++            OP_CTRL: begin
++                ctrl_due <= 1'b0;
++                case (state)
++                    S_IDLE: if (ctrl_en) begin
++                        state     <= S_ARMED;
++                        sess      <= ddr_dout[15:8];
++                        is_join   <= ddr_dout[2];
++                        error     <= 8'd0;
++                        stalls    <= 16'd0;
++                        frame     <= 32'd0;
++                        have0     <= 1'b0;
++                        have1     <= 1'b0;
++                        waiting   <= 1'b0;
++                        p_status  <= 1'b1;
++                    end
++                    S_ARMED: begin
++                        if (!ctrl_en)      begin state <= S_IDLE;  p_status <= 1'b1; end
++                        else if (ctrl_run) begin state <= S_PRIME; p_status <= 1'b1; end
++                    end
++                    S_PRIME, S_ERROR: if (!ctrl_en && !start0) begin
++                        state    <= S_IDLE;
++                        p_status <= 1'b1;
++                        p_local  <= 1'b0;
++                        p_crc    <= 1'b0;
++                    end
++                    S_RUN: if (!ctrl_en) begin
++                        error[ERR_CTRL_DROP] <= 1'b1;
++                        state    <= S_IDLE;
++                        waiting  <= 1'b0;
++                        p_status <= 1'b1;
++                        p_local  <= 1'b0;
++                        p_crc    <= 1'b0;
++                    end
++                    default: ;
++                endcase
++            end
++            default: ;
++        endcase
++    end
++
++    if (reset) begin
++        state      <= S_IDLE;
++        frame      <= 32'd0;
++        error      <= 8'd0;
++        stalls     <= 16'd0;
++        sess       <= 8'd0;
++        is_join    <= 1'b0;
++        have0      <= 1'b0;
++        have1      <= 1'b0;
++        a_p1       <= 12'd0;
++        a_p2       <= 12'd0;
++        b_p1       <= 12'd0;
++        b_p2       <= 12'd0;
++        joy_p1     <= 12'd0;
++        joy_p2     <= 12'd0;
++        crc        <= CRC_INIT;
++        crc_live   <= 1'b0;
++        waiting    <= 1'b0;
++        post       <= 4'd0;
++        p_ctrl_clr <= 1'b1;
++        p_magic    <= 1'b1;
++        p_status   <= 1'b1;
++        p_local    <= 1'b0;
++        p_crc      <= 1'b0;
++        poll_cnt   <= 16'd0;
++        ctrl_cnt   <= 16'd0;
++        poll_due   <= 1'b0;
++        ctrl_due   <= 1'b1;
++        op         <= OP_NONE;
++        op_frame   <= 32'd0;
++        ddr_we     <= 1'b0;
++        ddr_addr   <= '0;
++        ddr_din    <= '0;
++        local_frame <= 16'd0;
++        local_val   <= 12'd0;
++        crc_frame   <= 16'd0;
++        crc_val     <= 32'd0;
++        hold_prev   <= 1'b0;
++        // ddr_req is not reset: it must keep matching ddr_ack across a reset
++    end
++end
++
++endmodule
+diff --git a/modules/jtframe/target/mister/hdl/jtframe_np_board.sv b/modules/jtframe/target/mister/hdl/jtframe_np_board.sv
+new file mode 100644
+index 000000000..3aaaeef41
+--- /dev/null
++++ b/modules/jtframe/target/mister/hdl/jtframe_np_board.sv
+@@ -0,0 +1,113 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++ *
++ * jtframe_np_board.sv
++ *
++ * Netplay between jtframe's board logic and the game (SPEC 12.3): the
++ * game-side controls, reset, pause, test, service and tilt go through here.
++ * While a session is active the game sees the session's input (the host is
++ * player 1, the join player 2), is reset only by the session, and cannot be
++ * paused. Shared by jtframe_mister.sv and the Verilator test bench
++ * (hdl/ver/game_test.v), so both run the same logic.
++ */
++
++module jtframe_np_board #(parameter
++    GAME_INPUTS_ACTIVE_LOW = 1'b1,
++    COLORW                 = 4
++)(
++    input             clk,            // clk_rom
++    input             rst,            // jtframe's power-on reset
++    input             downloading,    // ROM load
++    input             dip_wr,         // DIP switch download (index 254)
++
++    // the game's video
++    input             lvbl,
++    input             lhbl,
++    input             pxl_cen,
++    input [COLORW-1:0] red, green, blue,
++
++    // from the board
++    input             bd_game_rst,
++    input       [9:0] bd_joystick1, bd_joystick2,
++    input       [3:0] bd_coin, bd_start,
++    input             bd_service, bd_tilt, bd_dip_test, bd_dip_pause,
++
++    // to the game
++    output            game_rst,
++    output      [9:0] game_joystick1, game_joystick2,
++    output      [3:0] game_coin, game_start,
++    output            game_service, game_tilt, dip_test, dip_pause,
++
++    // clock enables
++    output            np_hold,
++    output            np_clr,
++    output            np_stall,
++
++    // DDR3 mailbox channel (toggle handshake)
++    output     [31:3] ddr_addr,
++    output     [63:0] ddr_din,
++    input      [63:0] ddr_dout,
++    output            ddr_we,
++    output            ddr_req,
++    input             ddr_ack,
++
++    // observation
++    output      [2:0] np_state,
++    output     [31:0] np_frame,
++    output      [7:0] np_error
++);
++
++localparam [0:0] INACT = GAME_INPUTS_ACTIVE_LOW[0];   // level of a released input
++
++wire        active, hold_reset, is_join;
++wire [11:0] p1, p2, local_joy;
++wire [23:0] pix;
++
++// this side's player 1, active high: {coin, start, buttons 6-1, U, D, L, R}
++assign local_joy = INACT ? ~{ bd_coin[0], bd_start[0], bd_joystick1 }
++                         :  { bd_coin[0], bd_start[0], bd_joystick1 };
++
++function [7:0] c8(input [COLORW-1:0] c);
++    c8 = 8'd0;
++    c8[7-:COLORW] = c;
++endfunction
++assign pix = { c8(red), c8(green), c8(blue) };
++
++jtframe_netplay u_netplay(
++    .clk        ( clk           ),
++    .reset      ( rst           ),
++    .downloading( downloading   ),
++    .dip_wr     ( dip_wr        ),
++    .lvbl       ( lvbl          ),
++    .pix_en     ( pxl_cen & lhbl & lvbl ),
++    .pix        ( pix           ),
++    .local_joy  ( local_joy     ),
++    .active     ( active        ),
++    .hold_reset ( hold_reset    ),
++    .hold       ( np_hold       ),
++    .clr        ( np_clr        ),
++    .stall      ( np_stall      ),
++    .is_join    ( is_join       ),
++    .joy_p1     ( p1            ),
++    .joy_p2     ( p2            ),
++    .ddr_addr   ( ddr_addr      ),
++    .ddr_din    ( ddr_din       ),
++    .ddr_dout   ( ddr_dout      ),
++    .ddr_we     ( ddr_we        ),
++    .ddr_req    ( ddr_req       ),
++    .ddr_ack    ( ddr_ack       ),
++    .state_o    ( np_state      ),
++    .frame_o    ( np_frame      ),
++    .error_o    ( np_error      )
++);
++
++assign game_rst       = active ? (rst | hold_reset) : bd_game_rst;
++assign game_joystick1 = active ? (INACT ? ~p1[9:0] : p1[9:0]) : bd_joystick1;
++assign game_joystick2 = active ? (INACT ? ~p2[9:0] : p2[9:0]) : bd_joystick2;
++assign game_start     = active ? { {2{INACT}}, INACT ^ p2[10], INACT ^ p1[10] } : bd_start;
++assign game_coin      = active ? { {2{INACT}}, INACT ^ p2[11], INACT ^ p1[11] } : bd_coin;
++assign game_service   = active ? INACT : bd_service;
++assign game_tilt      = active ? INACT : bd_tilt;
++assign dip_test       = active ? INACT : bd_dip_test;
++assign dip_pause      = active ? 1'b1  : bd_dip_pause;   // active low
++
++endmodule
+diff --git a/modules/jtframe/target/mister/hdl/jtframe_np_ddrarb.sv b/modules/jtframe/target/mister/hdl/jtframe_np_ddrarb.sv
+new file mode 100644
+index 000000000..ebb98cd67
+--- /dev/null
++++ b/modules/jtframe/target/mister/hdl/jtframe_np_ddrarb.sv
+@@ -0,0 +1,83 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++ *
++ * jtframe_np_ddrarb.sv
++ *
++ * Puts the netplay mailbox (jtframe_netplay, one 64-bit word at a time,
++ * toggle handshake) on the video DDR3 client of jtframe_mr_ddrmux. The video
++ * client (screen rotation) keeps priority; the mailbox takes the bus only
++ * between two of its requests. Screen rotation only writes, so no read data
++ * of it can be in flight when the mailbox reads. Cores whose video client
++ * reads DDR3 (line-frame buffer in DDR3, game DDR3) are not supported.
++ */
++
++module jtframe_np_ddrarb(
++    input             rst,
++    input             clk,
++    // video client
++    input      [ 7:0] r_burstcnt,
++    input      [28:0] r_addr,
++    input             r_rd,
++    input             r_we,
++    input      [ 7:0] r_be,
++    input      [63:0] r_din,
++    output            r_busy,
++    // towards jtframe_mr_ddrmux (its rot_* port)
++    output     [ 7:0] m_burstcnt,
++    output     [28:0] m_addr,
++    output            m_rd,
++    output            m_we,
++    output     [ 7:0] m_be,
++    output     [63:0] m_din,
++    input             m_busy,
++    input      [63:0] ddr_dout,
++    input             ddr_dout_ready,
++    // netplay mailbox
++    input      [31:3] np_addr,
++    input      [63:0] np_din,
++    input             np_we,
++    input             np_req,
++    output reg        np_ack,
++    output reg [63:0] np_dout
++);
++
++localparam [1:0] ST_VIDEO = 2'd0,
++                 ST_REQ   = 2'd1,
++                 ST_READ  = 2'd2;
++
++reg [1:0] st;
++wire      np = st != ST_VIDEO;
++
++assign m_burstcnt = np ? 8'd1          : r_burstcnt;
++assign m_addr     = np ? np_addr[31:3] : r_addr;
++assign m_rd       = np ? (st == ST_REQ && !np_we) : r_rd;
++assign m_we       = np ? (st == ST_REQ &&  np_we) : r_we;
++assign m_be       = np ? 8'hff         : r_be;
++assign m_din      = np ? np_din        : r_din;
++assign r_busy     = np | m_busy;
++
++always @(posedge clk) begin
++    if( rst ) begin
++        st     <= ST_VIDEO;
++        np_ack <= np_req;
++    end else begin
++        case( st )
++            ST_VIDEO: if( np_req != np_ack && !r_we && !r_rd ) st <= ST_REQ;
++            ST_REQ: if( !m_busy ) begin
++                if( np_we ) begin
++                    np_ack <= np_req;
++                    st     <= ST_VIDEO;
++                end else begin
++                    st     <= ST_READ;
++                end
++            end
++            ST_READ: if( ddr_dout_ready ) begin
++                np_dout <= ddr_dout;
++                np_ack  <= np_req;
++                st      <= ST_VIDEO;
++            end
++            default: st <= ST_VIDEO;
++        endcase
++    end
++end
++
++endmodule
+diff --git a/modules/jtframe/ver/clocking/gated_cen/test.v b/modules/jtframe/ver/clocking/gated_cen/test.v
+index 738814065..00c74b923 100644
+--- a/modules/jtframe/ver/clocking/gated_cen/test.v
++++ b/modules/jtframe/ver/clocking/gated_cen/test.v
+@@ -57,6 +57,8 @@ jtframe_gated_cen #(.W(1),.NUM(48),.DEN(125),.MFREQ(48000)) uut(
+     .rst    ( rst       ),
+     .clk    ( clk       ),
+     .busy   ( busy      ),
++    .hold   ( 1'b0 ),
++    .clr    ( 1'b0 ),
+     .cen    ( cen       ),
+     .fave   (           ),
+     .fworst (           )
+diff --git a/modules/jtframe/verilator/np_test.cpp b/modules/jtframe/verilator/np_test.cpp
+new file mode 100644
+index 000000000..b3a2bb5cc
+--- /dev/null
++++ b/modules/jtframe/verilator/np_test.cpp
+@@ -0,0 +1,270 @@
++/* SPDX-License-Identifier: GPL-3.0-or-later
++ *
++ * np_test.cpp: netplay test bench for jtframe cores (T2a, SPEC 12.7).
++ *
++ * Two MiSTers (host and join) in one process, each a full game_test model
++ * built with JTFRAME_NETPLAY (jtframe_np_board + jtframe_netplay), with its
++ * own SDRAM model, a fake HPS (SPEC 4: session start, combining LOCAL into
++ * INPUT) and a network with random latency between them. The mailbox port is
++ * served after a random number of clocks. The join starts its session at a
++ * random later moment (another video and SDRAM refresh phase), optionally
++ * after running the game with other input first (--dirty), so the session
++ * start must make both sides equal. Passes when both post the same CRC for
++ * every frame and the picture changes.
++ *
++ * Built by bin/np_sim.sh, which puts this file as test.cpp next to a copy of
++ * jtframe's own test.cpp (jtsim_test.cpp) and runs jtsim. Options come from
++ * the environment variable NP_ARGS:
++ *   --frames N    frames to compare (default 600)
++ *   --seed S      random seed (default 1)
++ *   --delay D     input delay in frames (default 3)
++ *   --latency C   maximum network latency in clocks (default 400000)
++ *   --dirty F     the join plays F frames with random input before its session
++ */
++
++#define main jtsim_main
++#define _JTFRAME_SIM_SKIP_FRAME_DUMP
++#include "jtsim_test.cpp"
++#undef main
++
++#include <deque>
++#include <map>
++#include <random>
++#include <set>
++
++static const uint32_t NP_BASE    = 0x3C000000;
++static const uint32_t OFF_MAGIC  = 0x0000, OFF_STATUS = 0x0008, OFF_CTRL = 0x0010;
++static const uint32_t OFF_LOCAL  = 0x1000, OFF_CRC    = 0x1800, OFF_INPUT = 0x2000;
++static const uint64_t NP_MAGIC   = 0x3130504E44435241ULL;   // "ARCDNP01"
++static const uint64_t CTRL_MAGIC = 0x4C525443ULL;           // "CTRL"
++
++struct Side {
++    const char *name;
++    UUT   *m;
++    JTSim *sim;
++    std::map<uint32_t, uint64_t> ddr;
++    std::mt19937_64 rng;
++    int   ddr_wait = -1;
++    uint64_t held = 0;
++    uint16_t pad = 0;        // this side's player 1, active high {coin, start, buttons, U, D, L, R}
++
++    void apply_pad() {
++        // game_test's inputs are active low
++        m->joystick1 = (~pad) & 0x3ff;
++        m->joystick2 = 0x3ff;
++        m->cab_1p    = 0xe | (((~pad) >> 10) & 1);
++        m->coin      = 0xe | (((~pad) >> 11) & 1);
++        m->service   = 1;
++        m->tilt      = 1;
++        m->dip_pause = 1;
++        m->np_dip_wr = 0;
++    }
++
++    void step() {
++        apply_pad();
++        sim->clock(1);
++        held += m->np_hold_o;
++        // the mailbox port (toggle handshake), served after a random 4..40 clocks
++        if (m->np_ddr_req != m->np_ddr_ack) {
++            if (ddr_wait < 0) ddr_wait = 4 + rng() % 37;
++            else if (ddr_wait-- == 0) {
++                uint32_t a = (uint32_t)m->np_ddr_addr << 3;
++                if (m->np_ddr_we) ddr[a] = m->np_ddr_din;
++                else { auto it = ddr.find(a); m->np_ddr_dout = it == ddr.end() ? 0 : it->second; }
++                m->np_ddr_ack = m->np_ddr_req;
++                ddr_wait = -1;
++            }
++        }
++    }
++    bool loaded() { return !m->rst && !m->dwnld_busy && !m->ioctl_rom; }
++};
++
++struct FakeHps {
++    Side &s;
++    bool host;
++    int delay;
++    uint8_t sess;
++    int phase = 0;                      // 0 wait, 1 armed (DIPs), 2 running
++    uint64_t arm_at = 0;
++    uint64_t t_armed = 0;
++    uint64_t settle = 200000;
++    uint32_t next_local = 0;
++    std::map<uint32_t, uint16_t> mine, peer;
++    uint32_t next_input;
++    std::map<uint32_t, uint32_t> crcs;
++    uint32_t next_crc = 0;
++
++    FakeHps(Side &ss, bool h, int d, uint8_t sid) : s(ss), host(h), delay(d), sess(sid), next_input(d) {}
++
++    uint64_t rd(uint32_t off) { auto it = s.ddr.find(NP_BASE + off); return it == s.ddr.end() ? 0 : it->second; }
++    void wr(uint32_t off, uint64_t v) { s.ddr[NP_BASE + off] = v; }
++    uint32_t half(uint32_t f, uint16_t v) { return ((f & 0xFFF) << 20) | ((uint32_t)sess << 12) | (v & 0xFFF); }
++    uint64_t input_word(uint32_t f, uint16_t p1, uint16_t p2) { return ((uint64_t)half(f, p2) << 32) | half(f, p1); }
++    int state() { return (rd(OFF_STATUS) >> 24) & 7; }
++    uint64_t ctrl(bool run) { return (CTRL_MAGIC << 32) | ((uint64_t)sess << 8) | (host ? 0 : 4) | (run ? 2 : 0) | 1; }
++
++    void poll(uint64_t now, std::vector<std::pair<uint32_t, uint16_t>> &send) {
++        if (phase == 0) {
++            if (now < arm_at || !s.loaded() || rd(OFF_MAGIC) != NP_MAGIC) return;
++            for (uint32_t i = 0; i < 256; i++) {
++                wr(OFF_LOCAL + i * 8, 0xFFF0000000000000ULL);
++                wr(OFF_CRC   + i * 8, 0xFFFF000000000000ULL);
++                wr(OFF_INPUT + i * 8, 0xFFF0000000000000ULL);
++            }
++            wr(OFF_CTRL, ctrl(false));
++            phase = 1;
++            return;
++        }
++        if (phase == 1) {
++            if (state() != 1) return;           // ARMED: the game is in reset, Main sends the DIP switches
++            if (!t_armed) t_armed = now;
++            if (now - t_armed < settle) return;
++            for (int f = 0; f < delay; f++) wr(OFF_INPUT + (f & 0xFF) * 8, input_word(f, 0, 0));
++            wr(OFF_CTRL, ctrl(true));
++            phase = 2;
++            return;
++        }
++        for (;;) {
++            uint64_t w = rd(OFF_LOCAL + (next_local & 0xFF) * 8);
++            uint32_t hi = w >> 32, lo = (uint32_t)w;
++            if (hi != lo || (hi >> 20) != (next_local & 0xFFF) || ((hi >> 12) & 0xFF) != sess) break;
++            mine[next_local] = lo & 0xFFF;
++            send.push_back({next_local, (uint16_t)(lo & 0xFFF)});
++            next_local++;
++        }
++        for (;;) {
++            uint32_t f = next_input - delay;
++            if (!mine.count(f) || !peer.count(f)) break;
++            uint16_t p1 = host ? mine[f] : peer[f], p2 = host ? peer[f] : mine[f];
++            wr(OFF_INPUT + (next_input & 0xFF) * 8, input_word(next_input, p1, p2));
++            next_input++;
++        }
++        for (;;) {
++            uint64_t w = rd(OFF_CRC + (next_crc & 0xFF) * 8);
++            uint32_t hi = w >> 32, lo = (uint32_t)w;
++            uint32_t tag = next_crc & 0xFFFF;
++            if ((hi >> 16) != tag || (lo >> 16) != tag) break;
++            crcs[next_crc] = ((hi & 0xFFFF) << 16) | (lo & 0xFFFF);
++            next_crc++;
++        }
++    }
++};
++
++// Player input: mostly the joystick and button 1/2, a coin and Start now and then
++static uint16_t random_pad(std::mt19937_64 &r, uint32_t frame) {
++    uint16_t p = 0;
++    if (frame % 600 == 60)  p |= 1 << 11;      // coin
++    if (frame % 600 == 120) p |= 1 << 10;      // start
++    p |= r() & 0x3f;                           // directions, buttons 1-2
++    if ((p & 3) == 3) p &= ~1;                 // not Right and Left together
++    if ((p & 12) == 12) p &= ~4;               // not Down and Up together
++    return p;
++}
++
++int main(int argc, char *argv[]) {
++    int frames = 600, delay = 3, dirty = 0;
++    uint64_t seed = 1, max_lat = 400000;
++    {
++        const char *e = getenv("NP_ARGS");
++        std::vector<std::string> a;
++        if (e) { std::string s = e; size_t p = 0; while (p < s.size()) { size_t q = s.find(' ', p); if (q == std::string::npos) q = s.size(); if (q > p) a.push_back(s.substr(p, q - p)); p = q + 1; } }
++        for (size_t k = 0; k < a.size(); k++) {
++            auto next = [&]() { return k + 1 < a.size() ? a[++k].c_str() : "0"; };
++            if (a[k] == "--frames") frames = atoi(next());
++            else if (a[k] == "--seed") seed = strtoull(next(), 0, 0);
++            else if (a[k] == "--delay") delay = atoi(next());
++            else if (a[k] == "--latency") max_lat = strtoull(next(), 0, 0);
++            else if (a[k] == "--dirty") dirty = atoi(next());
++            else { fprintf(stderr, "np_test: unknown option %s\n", a[k].c_str()); return 2; }
++        }
++    }
++    VerilatedContext context;
++    context.commandArgs(argc, argv);
++    makeCRCTable();
++    try {
++        UUT mh{&context, "H"}, mj{&context, "J"};
++        for (UUT *m : {&mh, &mj}) { m->np_ddr_ack = 0; m->np_ddr_dout = 0; m->np_dip_wr = 0; }
++        Side H{"host", &mh}, J{"join", &mj};
++        JTSim sh(mh, argc, argv), sj(mj, argc, argv);
++        H.sim = &sh; J.sim = &sj;
++        H.rng.seed(seed * 7 + 1); J.rng.seed(seed * 13 + 2);
++
++        FakeHps hh(H, true, delay, 0x5A), hj(J, false, delay, 0x5A);
++        std::mt19937_64 r(seed);
++        const uint64_t FRAME_CLK = 811000;   // 48 MHz / 59.19 Hz
++        hh.arm_at = 2 * FRAME_CLK;
++        hj.arm_at = 2 * FRAME_CLK + (uint64_t)dirty * FRAME_CLK + r() % (3 * FRAME_CLK);
++        hj.settle += r() % FRAME_CLK;
++        fprintf(stderr, "\nnp_test: join arms %llu clocks after the host%s; delay %d, latency up to %llu clocks, seed %llu\n",
++            (unsigned long long)(hj.arm_at - hh.arm_at), dirty ? " (after playing with other input)" : "",
++            delay, (unsigned long long)max_lat, (unsigned long long)seed);
++
++        struct Pkt { uint64_t at; uint32_t f; uint16_t joy; };
++        std::deque<Pkt> to_j, to_h;
++        std::mt19937_64 ph(seed * 31 + 5), pj(seed * 37 + 11);
++        uint64_t now = 0;
++        uint64_t loaded_at = 0;
++        uint32_t last_report = 0, h_last = ~0u, j_last = ~0u;
++        for (;;) {
++            H.step(); J.step(); now++;
++            if (!loaded_at) {
++                if (!H.loaded() || !J.loaded()) { if (now > 400ull * FRAME_CLK) { fputs("FAIL: ROM load did not finish\n", stderr); return 1; } continue; }
++                loaded_at = now;
++                hh.arm_at += now; hj.arm_at += now;
++                fprintf(stderr, "np_test: ROM loaded at clock %llu\n", (unsigned long long)now);
++            }
++            // the pads change once per frame of each side (or every ~frame before its session)
++            uint32_t hf = hh.phase == 2 ? mh.np_frame : (uint32_t)(now / FRAME_CLK);
++            uint32_t jf = hj.phase == 2 ? mj.np_frame : (uint32_t)(now / FRAME_CLK) + 1000;
++            if (hf != h_last) { h_last = hf; H.pad = random_pad(ph, hf); }
++            if (jf != j_last) { j_last = jf; J.pad = (hj.phase == 2 || dirty) ? random_pad(pj, jf) : 0; }
++            if (now % 64) continue;
++
++            std::vector<std::pair<uint32_t, uint16_t>> s_h, s_j;
++            hh.poll(now, s_h); hj.poll(now, s_j);
++            for (auto &x : s_h) to_j.push_back({ now + r() % (max_lat + 1), x.first, x.second });
++            for (auto &x : s_j) to_h.push_back({ now + r() % (max_lat + 1), x.first, x.second });
++            for (auto it = to_j.begin(); it != to_j.end();) { if (it->at <= now) { hj.peer[it->f] = it->joy; it = to_j.erase(it); } else ++it; }
++            for (auto it = to_h.begin(); it != to_h.end();) { if (it->at <= now) { hh.peer[it->f] = it->joy; it = to_h.erase(it); } else ++it; }
++            if (mh.np_error || mj.np_error || mh.np_state == 4 || mj.np_state == 4) {
++                fprintf(stderr, "\nFAIL: netplay error host %02x join %02x\n", mh.np_error, mj.np_error);
++                return 1;
++            }
++            uint32_t n = std::min(hh.next_crc, hj.next_crc);
++            if (n && n / 60 != last_report) {
++                last_report = n / 60;
++                fprintf(stderr, "\nnp_test: frame %u: stalls host %u join %u, held clocks host %llu join %llu\n", n,
++                    (unsigned)(hh.rd(OFF_STATUS) & 0xFFFF), (unsigned)(hj.rd(OFF_STATUS) & 0xFFFF),
++                    (unsigned long long)H.held, (unsigned long long)J.held);
++                for (uint32_t f = 0; f < n; f++)
++                    if (hh.crcs[f] != hj.crcs[f]) {
++                        fprintf(stderr, "FAIL: CRC mismatch at frame %u: host %08x join %08x\n", f, hh.crcs[f], hj.crcs[f]);
++                        return 1;
++                    }
++            }
++            if (n > (uint32_t)frames) break;
++            if (now > loaded_at + hj.arm_at + (uint64_t)(frames + 60) * FRAME_CLK * 3) {
++                fprintf(stderr, "\nFAIL: timeout at %u frames (host state %d, join state %d)\n", n, mh.np_state, mj.np_state);
++                return 1;
++            }
++        }
++        int bad = 0;
++        uint32_t n = std::min(hh.next_crc, hj.next_crc);
++        for (uint32_t f = 0; f < n; f++)
++            if (hh.crcs[f] != hj.crcs[f]) { if (bad++ < 5) fprintf(stderr, "CRC mismatch frame %u: host %08x join %08x\n", f, hh.crcs[f], hj.crcs[f]); }
++        std::set<uint32_t> distinct;
++        for (auto &x : hh.crcs) distinct.insert(x.second);
++        fprintf(stderr, "\nnp_test: %u frames compared, %d CRC mismatches, %zu distinct CRCs; held clocks host %llu join %llu; "
++            "stalls host %u join %u\n", n, bad, distinct.size(), (unsigned long long)H.held, (unsigned long long)J.held,
++            (unsigned)(hh.rd(OFF_STATUS) & 0xFFFF), (unsigned)(hj.rd(OFF_STATUS) & 0xFFFF));
++        bool ok = n > (uint32_t)frames && !bad && distinct.size() > 10;
++        fprintf(stderr, "%s netplay\n", ok ? "PASS" : "FAIL");
++        return ok ? 0 : 1;
++    } catch (const char *error) {
++        fprintf(stderr, "%s\n", error);
++        return 1;
++    } catch (const std::exception &error) {
++        fprintf(stderr, "ERROR: %s\n", error.what());
++        return 1;
++    }
++}
+-- 
+2.43.0
+

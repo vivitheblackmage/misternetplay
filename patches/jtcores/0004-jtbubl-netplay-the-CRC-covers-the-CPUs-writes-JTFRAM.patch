@@ -1,0 +1,328 @@
+From 23be2ed85bf75f1a1c808f201bcc44c016d2661a Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sun, 8 Nov 2026 21:03:54 +0100
+Subject: [PATCH 4/6] jtbubl netplay: the CRC covers the CPUs' writes
+ (JTFRAME_NP_STATE), not the picture whose lines wait for the SDRAM; np_test
+ --corrupt
+---
+ cores/bubl/cfg/macros.def                      |  1 +
+ cores/bubl/hdl/jtbubl_game.v                   |  7 +++++++
+ cores/bubl/hdl/jtbubl_main.v                   | 18 +++++++++++++++++-
+ modules/jtframe/doc/macros.md                  |  1 +
+ modules/jtframe/hdl/inc/game_sdram.v           |  8 ++++++++
+ .../jtframe/hdl/inc/jtframe_game_instance.v    |  4 ++++
+ modules/jtframe/hdl/inc/jtframe_game_ports.inc |  4 ++++
+ modules/jtframe/hdl/ver/game_test.v            | 12 ++++++++++++
+ .../jtframe/target/mister/hdl/jtframe_emu.sv   |  8 ++++++++
+ .../target/mister/hdl/jtframe_mister.sv        |  6 +++++-
+ .../target/mister/hdl/jtframe_np_board.sv      |  9 +++++++++
+ modules/jtframe/verilator/np_test.cpp          |  7 +++++++
+ 12 files changed, 83 insertions(+), 2 deletions(-)
+
+diff --git a/cores/bubl/cfg/macros.def b/cores/bubl/cfg/macros.def
+index 92d1ec4c3..3462c861c 100644
+--- a/cores/bubl/cfg/macros.def
++++ b/cores/bubl/cfg/macros.def
+@@ -21,3 +21,4 @@ JTFRAME_HEADER=4
+ JTFRAME_ARX=5
+ JTFRAME_ARY=4
+ JTFRAME_NETPLAY
++JTFRAME_NP_STATE
+diff --git a/cores/bubl/hdl/jtbubl_game.v b/cores/bubl/hdl/jtbubl_game.v
+index 163260b49..84f66eb08 100644
+--- a/cores/bubl/hdl/jtbubl_game.v
++++ b/cores/bubl/hdl/jtbubl_game.v
+@@ -74,8 +74,15 @@ assign { main_rok, sub_rok, snd_rok } = { main_ok, sub_ok, snd_ok };
+ assign { main_rdata, sub_rdata, snd_rdata } = { main_data, sub_data, snd_data };
+ `endif
+ 
++`ifndef JTFRAME_NP_STATE
++wire        np_st_en;
++wire [23:0] np_st;
++`endif
++
+ jtbubl_main u_main(
+     .np_ram         ( np_ram        ),
++    .np_st_en       ( np_st_en      ),
++    .np_st          ( np_st         ),
+     .rst            ( rst           ),
+     .clk            ( clk           ),        // 24 MHz
+     .cen6           ( cen6          ),
+diff --git a/cores/bubl/hdl/jtbubl_main.v b/cores/bubl/hdl/jtbubl_main.v
+index 72adfc52e..0887e1da4 100644
+--- a/cores/bubl/hdl/jtbubl_main.v
++++ b/cores/bubl/hdl/jtbubl_main.v
+@@ -63,7 +63,10 @@ module jtbubl_main(
+     input               tilt,
+     input      [ 7:0]   dipsw_a,
+     input      [ 7:0]   dipsw_b,
+-    input      [ 7:0]   debug_bus
++    input      [ 7:0]   debug_bus,
++    // netplay (SPEC 12.3): what the game state changes by, for the CRC
++    output              np_st_en,
++    output     [23:0]   np_st
+ );
+ 
+ `ifndef NOMAIN
+@@ -79,6 +82,7 @@ reg  [ 7:0] cab_dout;
+ reg         h1;
+ wire [11:0] mcu_bus;
+ wire [15:0] main_addr, sub_addr;
++reg         main_wl, sub_wl;
+ wire        main_mreq_n, main_iorq_n, main_rdn, main_wrn, main_rfsh_n;
+ wire        sub_mreq_n,  sub_iorq_n,  sub_rd_n,  sub_wrn, sub_rfsh_n;
+ reg         main_macc_n, sub_macc_n;
+@@ -597,4 +601,16 @@ initial begin
+     main_rom_cs=0; sub_rom_cs=0;
+ end
+ `endif
++// Netplay's CRC (JTFRAME_NP_STATE): every write of the main and sub CPUs,
++// address and data, taken in its first clock. It covers the game state and
++// not the picture, whose line buffers wait for the SDRAM (the graphics).
++always @(posedge clk) begin
++    main_wl <= ~main_wrn;
++    sub_wl  <= ~sub_wrn;
++end
++wire main_wst = ~main_wrn & ~main_wl;
++wire sub_wst  = ~sub_wrn  & ~sub_wl;
++assign np_st_en = main_wst | sub_wst;
++assign np_st    = main_wst ? { main_addr, main_dout } : { sub_addr, sub_dout };
++
+ endmodule
+diff --git a/modules/jtframe/doc/macros.md b/modules/jtframe/doc/macros.md
+index b774d0fde..c7600a8b2 100644
+--- a/modules/jtframe/doc/macros.md
++++ b/modules/jtframe/doc/macros.md
+@@ -68,6 +68,7 @@ JTFRAME_MOUSE_NOEMU      |         | Disables mouse emulation via joystick
+ JTFRAME_MR_DDR           | MiSTer  | Defined internally when MiSTer DDR is used. Do not define manually.
+ JTFRAME_MR_DDRLOAD       | MiSTer  | ROM download process uses the DDR as proxy
+ JTFRAME_MR_GAME_DDR      | MiSTer  | Game module gets the DDR3 port (ddr_* signals on clk_rom, see sdram.md). Not with rotation, LF buffer or DDR load
++JTFRAME_NP_STATE         | MiSTer  | With JTFRAME_NETPLAY: the game outputs np_st_en/np_st (its CPU writes) and netplay's CRC covers them instead of the picture
+ JTFRAME_NETPLAY          | MiSTer  | Lockstep netplay with Main_MiSTer (target/mister/hdl/jtframe_netplay.sv): mailbox in DDR3 at 0x3C000000, OSD option O[127:126]. Needs mem.yaml clocks; not with game DDR3 or the DDR3 LF buffer
+ JTFRAME_MR_LF_BRAM       | MiSTer  | Use BRAM instead of DDR for JTFRAME_LF_BUFFER. Automatically set when JTFRAME_VERTICAL is also enabled
+ JTFRAME_MR_FASTIO        | MiSTer  | 16-bit ROM load in MiSTer. Set by default if CLK96 is set
+diff --git a/modules/jtframe/hdl/inc/game_sdram.v b/modules/jtframe/hdl/inc/game_sdram.v
+index 47b153aec..88bbcbc30 100644
+--- a/modules/jtframe/hdl/inc/game_sdram.v
++++ b/modules/jtframe/hdl/inc/game_sdram.v
+@@ -15,6 +15,10 @@ module jt{{.Core}}_game_sdram(
+     input           np_hold,    // freezes the game's clock enables (netplay)
+     input           np_clr,     // restarts them from zero when a session's frame 0 starts
+     input   [ 1:0]  np_ram,     // clears the game's RAM (jtframe_np_ramclr)
++`ifdef JTFRAME_NP_STATE
++    output          np_st_en,   // the game state for netplay's CRC
++    output  [23:0]  np_st,
++`endif
+ `endif
+     `include "jtframe_common_ports.inc"
+     `include "jtframe_mem_ports.inc"
+@@ -137,6 +141,10 @@ jtframe_rsthold u_hold(
+ jt{{if .Game}}{{.Game}}{{else}}{{.Core}}{{end}}_game u_game(
+ `ifdef JTFRAME_NETPLAY
+     .np_ram     ( np_ram    ),
++`endif
++`ifdef JTFRAME_NP_STATE
++    .np_st_en   ( np_st_en  ),
++    .np_st      ( np_st     ),
+ `endif
+     .rst        ( rst_h     ),
+     .clk        ( clk       ),
+diff --git a/modules/jtframe/hdl/inc/jtframe_game_instance.v b/modules/jtframe/hdl/inc/jtframe_game_instance.v
+index d60627572..af28c0fcd 100644
+--- a/modules/jtframe/hdl/inc/jtframe_game_instance.v
++++ b/modules/jtframe/hdl/inc/jtframe_game_instance.v
+@@ -56,6 +56,10 @@ u_game(
+     .np_hold     ( np_hold        ),
+     .np_clr      ( np_clr         ),
+     .np_ram      ( np_ram         ),
++`ifdef JTFRAME_NP_STATE
++    .np_st_en    ( np_st_en       ),
++    .np_st       ( np_st          ),
++`endif
+ `endif
+     .rst         ( game_rst       ),
+     // The main clock is always the same one as the SDRAM
+diff --git a/modules/jtframe/hdl/inc/jtframe_game_ports.inc b/modules/jtframe/hdl/inc/jtframe_game_ports.inc
+index 0162d7b2b..d7c5919e7 100644
+--- a/modules/jtframe/hdl/inc/jtframe_game_ports.inc
++++ b/modules/jtframe/hdl/inc/jtframe_game_ports.inc
+@@ -1,3 +1,7 @@
++`ifdef JTFRAME_NP_STATE
++    output          np_st_en,   // netplay CRC: a step of the game state
++    output  [23:0]  np_st,
++`endif
+ `ifdef JTFRAME_NETPLAY
+     input   [ 1:0]  np_ram,     // netplay: 1 = clear the game's RAM, 2 = fill it (tests), jtframe_np_ramclr
+ `endif
+diff --git a/modules/jtframe/hdl/ver/game_test.v b/modules/jtframe/hdl/ver/game_test.v
+index 2ed632816..b12de4985 100644
+--- a/modules/jtframe/hdl/ver/game_test.v
++++ b/modules/jtframe/hdl/ver/game_test.v
+@@ -553,6 +553,12 @@ assign burst_addr=0, burst_ba=0, burst_rd=0, burst_wr=0, burst_din=0,
+ // DDR3 mailbox channel on the test bench's ports
+ wire        g_rst, g_service, g_tilt, g_test, g_pause, np_hold, np_clr;
+ wire [ 1:0] np_ram;
++wire        np_st_en;
++wire [23:0] np_st;
++`ifndef JTFRAME_NP_STATE
++assign np_st_en = 1'b0;
++assign np_st    = 24'd0;
++`endif
+ wire [ 9:0] g_joy1, g_joy2;
+ wire [ 3:0] g_start, g_coin;
+ `ifdef JTFRAME_NETPLAY
+@@ -593,6 +599,8 @@ jtframe_np_board #(
+     .np_stall       (               ),
+     .np_ram         ( np_ram        ),
+     .ram_dirty      ( np_ram_dirty  ),
++    .st_en          ( np_st_en      ),
++    .st             ( np_st         ),
+     .ddr_addr       ( np_ddr_addr   ),
+     .ddr_din        ( np_ddr_din    ),
+     .ddr_dout       ( np_ddr_dout   ),
+@@ -622,6 +630,10 @@ u_game(
+     .np_hold     ( np_hold        ),
+     .np_clr      ( np_clr         ),
+     .np_ram      ( np_ram         ),
++`ifdef JTFRAME_NP_STATE
++    .np_st_en    ( np_st_en       ),
++    .np_st       ( np_st          ),
++`endif
+ `endif
+     .rst         ( g_rst          ),
+     // The main clock is always the same one as the SDRAM
+diff --git a/modules/jtframe/target/mister/hdl/jtframe_emu.sv b/modules/jtframe/target/mister/hdl/jtframe_emu.sv
+index af2f785aa..7755f3618 100644
+--- a/modules/jtframe/target/mister/hdl/jtframe_emu.sv
++++ b/modules/jtframe/target/mister/hdl/jtframe_emu.sv
+@@ -197,6 +197,12 @@ assign VGA_DISABLE   = 0;
+ `ifdef JTFRAME_NETPLAY
+ wire   np_hold, np_clr, np_stall;
+ wire [1:0] np_ram;
++wire        np_st_en;
++wire [23:0] np_st;
++`ifndef JTFRAME_NP_STATE
++assign np_st_en = 1'b0;
++assign np_st    = 24'd0;
++`endif
+ assign HDMI_FREEZE   = np_stall;
+ `else
+ assign HDMI_FREEZE   = 0;
+@@ -471,6 +477,8 @@ u_frame(
+     .np_clr         ( np_clr         ),
+     .np_stall       ( np_stall       ),
+     .np_ram         ( np_ram         ),
++    .np_st_en       ( np_st_en       ),
++    .np_st          ( np_st          ),
+ `endif
+     .clk_sys        ( clk_sys        ),
+     .clk_rom        ( clk_rom        ),
+diff --git a/modules/jtframe/target/mister/hdl/jtframe_mister.sv b/modules/jtframe/target/mister/hdl/jtframe_mister.sv
+index a87bb26da..9294bab1d 100644
+--- a/modules/jtframe/target/mister/hdl/jtframe_mister.sv
++++ b/modules/jtframe/target/mister/hdl/jtframe_mister.sv
+@@ -226,7 +226,9 @@ module jtframe_mister #(parameter
+    ,output            np_hold,    // freeze the game's clock enables
+     output            np_clr,     // restart them (first clock of a session)
+     output            np_stall,   // held for missing input: HDMI freeze
+-    output    [1:0]   np_ram      // clear the game's RAM
++    output    [1:0]   np_ram,     // clear the game's RAM
++    input             np_st_en,   // the game state for the CRC (JTFRAME_NP_STATE)
++    input     [23:0]  np_st
+ `endif
+ );
+ 
+@@ -768,6 +770,8 @@ jtframe_np_board #(
+     .np_stall       ( np_stall        ),
+     .np_ram         ( np_ram          ),
+     .ram_dirty      ( 1'b0            ),
++    .st_en          ( np_st_en        ),
++    .st             ( np_st           ),
+     .ddr_addr       ( np_addr         ),
+     .ddr_din        ( np_din          ),
+     .ddr_dout       ( np_dout         ),
+diff --git a/modules/jtframe/target/mister/hdl/jtframe_np_board.sv b/modules/jtframe/target/mister/hdl/jtframe_np_board.sv
+index b1b717248..69b49c576 100644
+--- a/modules/jtframe/target/mister/hdl/jtframe_np_board.sv
++++ b/modules/jtframe/target/mister/hdl/jtframe_np_board.sv
+@@ -43,6 +43,8 @@ module jtframe_np_board #(parameter
+     output            np_stall,
+     output      [1:0] np_ram,         // to jtframe_np_ramclr: 1 clear (ARMED, PRIME), 2 fill
+     input             ram_dirty,      // test bench only: fill the RAM with a pattern
++    input             st_en,          // JTFRAME_NP_STATE: a step of the game state
++    input      [23:0] st,
+ 
+     // DDR3 mailbox channel (toggle handshake)
+     output     [31:3] ddr_addr,
+@@ -80,8 +82,15 @@ jtframe_netplay u_netplay(
+     .downloading( downloading   ),
+     .dip_wr     ( dip_wr        ),
+     .lvbl       ( lvbl          ),
++`ifdef JTFRAME_NP_STATE
++    // the CRC covers the game state, not the picture (the graphics wait for
++    // the SDRAM, whose latency differs between MiSTers: a late line is no desync)
++    .pix_en     ( st_en         ),
++    .pix        ( st            ),
++`else
+     .pix_en     ( pxl_cen & lhbl & lvbl ),
+     .pix        ( pix           ),
++`endif
+     .local_joy  ( local_joy     ),
+     .active     ( active        ),
+     .hold_reset ( hold_reset    ),
+diff --git a/modules/jtframe/verilator/np_test.cpp b/modules/jtframe/verilator/np_test.cpp
+index 0a891d31e..c246d4656 100644
+--- a/modules/jtframe/verilator/np_test.cpp
++++ b/modules/jtframe/verilator/np_test.cpp
+@@ -23,6 +23,8 @@
+  *   --dirty-ram   the join fills the game's RAM with a pattern before its
+  *                 session (as a MiSTer that played before: high scores etc.);
+  *                 the session start must clear it (jtframe_np_ramclr)
++ *   --corrupt F   the join's INPUT for frame F has player 1's buttons changed
++ *                 (a real desync: the test must FAIL with a CRC mismatch)
+  *   --stalls N    each side, about once every N of its frames, holds its next
+  *                 INPUT back for up to two frames (a late packet; 0 = off), so
+  *                 the two sides freeze at different moments and for different
+@@ -117,6 +119,7 @@ struct FakeHps {
+     uint64_t late_until = 0;            // --stalls: INPUT is held back until then
+     uint32_t late_frame = 0;
+     int      stalls = 0;
++    int64_t  corrupt = -1;             // --corrupt: this frame's INPUT differs (join)
+     std::mt19937_64 lr;
+ 
+     FakeHps(Side &ss, bool h, int d, uint8_t sid) : s(ss), host(h), delay(d), sess(sid), next_input(d) {}
+@@ -166,6 +169,7 @@ struct FakeHps {
+             uint32_t f = next_input - delay;
+             if (!mine.count(f) || !peer.count(f)) break;
+             uint16_t p1 = host ? mine[f] : peer[f], p2 = host ? peer[f] : mine[f];
++            if (!host && (int64_t)next_input == corrupt) p1 ^= 0x030;   // buttons 1 and 2
+             wr(OFF_INPUT + (next_input & 0xFF) * 8, input_word(next_input, p1, p2));
+             next_input++;
+         }
+@@ -194,6 +198,7 @@ static uint16_t random_pad(std::mt19937_64 &r, uint32_t frame) {
+ int main(int argc, char *argv[]) {
+     int frames = 600, delay = 3, dirty = 0, stalls = 0;
+     bool dirty_ram = false;
++    int64_t corrupt = -1;
+     uint64_t seed = 1, max_lat = 400000;
+     {
+         const char *e = getenv("NP_ARGS");
+@@ -208,6 +213,7 @@ int main(int argc, char *argv[]) {
+             else if (a[k] == "--dirty") dirty = atoi(next());
+             else if (a[k] == "--stalls") stalls = atoi(next());
+             else if (a[k] == "--dirty-ram") dirty_ram = true;
++            else if (a[k] == "--corrupt") corrupt = atoll(next());
+             else { fprintf(stderr, "np_test: unknown option %s\n", a[k].c_str()); return 2; }
+         }
+     }
+@@ -224,6 +230,7 @@ int main(int argc, char *argv[]) {
+ 
+         FakeHps hh(H, true, delay, 0x5A), hj(J, false, delay, 0x5A);
+         hh.stalls = hj.stalls = stalls;
++        hj.corrupt = corrupt;
+         hh.lr.seed(seed * 41 + 3); hj.lr.seed(seed * 43 + 7);
+         std::mt19937_64 r(seed);
+         const uint64_t FRAME_CLK = 811000;   // 48 MHz / 59.19 Hz
+-- 
+2.43.0
+

@@ -1,0 +1,83 @@
+From e618141082be81e58e723b9ec366205304e45d8b Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sun, 8 Nov 2026 17:51:58 +0100
+Subject: [PATCH 22/22] netplay: arcade detection and the core version read past the
+ empty item jtframe strings have after the core name
+---
+ support/netplay/netplay.cpp          | 32 ++++++++++++++++++----------
+ support/netplay/test/udp_harness.cpp |  5 ++++-
+ 2 files changed, 25 insertions(+), 12 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 695b37c..62d6343 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -1513,15 +1513,26 @@ static bool room_of(const std::string &full, uint32_t seq, RoomFile *out)
+ 
+ // Arcade (SPEC.md 12): a core loaded from an MRA whose configuration string
+ // has the OSD option "O[127:126],Netplay,..." (the jtframe cores built with netplay)
+-static bool arcade_has_netplay()
++// The core's configuration string item by item. user_io_get_confstr() gives
++// NULL for an empty item as well as past the end, and jtframe strings have an
++// empty item right after the core name ("JTBUBL;;DIP;..."), so an empty item
++// does not end the scan; 16 in a row do.
++template <typename F> static bool confstr_any(F f)
+ {
+-	if (!is_arcade()) return false;
+-	for (int i = 0; ; i++)
++	for (int i = 0, empty = 0; i < 1024 && empty < 16; i++)
+ 	{
+ 		char *p = user_io_get_confstr(i);
+-		if (!p) return false;
+-		if (strstr(p, "[127:126]") && strstr(p, ",Netplay,")) return true;
++		if (!p) { empty++; continue; }
++		empty = 0;
++		if (f(p)) return true;
+ 	}
++	return false;
++}
++
++static bool arcade_has_netplay()
++{
++	if (!is_arcade()) return false;
++	return confstr_any([](const char *p) { return strstr(p, "[127:126]") && strstr(p, ",Netplay,"); });
+ }
+ 
+ // The loaded core: SYS_NES, SYS_SNES, SYS_GB2P, SYS_ARCADE, or -1 for one without netplay
+@@ -1609,12 +1620,11 @@ static uint8_t snes_refused(const char *name)
+ static void core_build(uint8_t out[16])
+ {
+ 	memset(out, 0, 16);
+-	for (int i = 0; ; i++)
+-	{
+-		char *p = user_io_get_confstr(i);
+-		if (!p) break;
+-		if (p[0] == 'V' && p[1] == ',') { strncpy((char *)out, p + 2, 16); break; }
+-	}
++	confstr_any([out](const char *p) {
++		if (p[0] != 'V' || p[1] != ',') return false;
++		strncpy((char *)out, p + 2, 16);
++		return true;
++	});
+ }
+ 
+ static bool md5_file(const char *path, uint8_t out[16], uint8_t *hdr, size_t hdr_len)
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index 58a95ca..6de1fbc 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -63,7 +63,10 @@ char *user_io_get_confstr(int index)
+ {
+ 	static char a[] = "NES", sa[] = "SNES", ga[] = "GAMEBOY2P", b[] = "V,v261030";
+ 	static char aa[] = "JTBUBL", an[] = "O[127:126],Netplay,netplay.ini,Off,Host,Join";
+-	if (arcade) return index == 0 ? aa : index == 1 ? an : index == 2 ? b : nullptr;
++	// as jtframe sends it: "JTBUBL;;DIP;...;O[127:126],Netplay,...;R0,Reset;V,v..."
++	// (an empty item after the name, which user_io_get_confstr() returns as NULL)
++	static char ad[] = "DIP", ar[] = "R0,Reset";
++	if (arcade) return index == 0 ? aa : index == 1 ? nullptr : index == 2 ? ad : index == 3 ? an : index == 4 ? ar : index == 5 ? b : nullptr;
+ 	return index == 0 ? (gb2p ? ga : snes ? sa : a) : index == 1 ? b : nullptr;
+ }
+ 
+-- 
+2.43.0
+

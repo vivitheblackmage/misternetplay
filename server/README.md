@@ -52,13 +52,16 @@ key=3f9c...        ; the same key in the players' netplay.ini
 roms=roms          ; games the server hands out (in RAM only on the MiSTers):
                    ; roms/NES (or roms itself), roms/SNES and roms/GB
 catalog=catalog.txt ; "md5 name" per line: versions everyone brings themselves
+public_page=yes    ; the status page needs no key (anyone can see rooms, player names and
+                   ; the game list); no = it needs ?key= too. Joining and downloading
+                   ; always need the key.
 ```
 
 Forward **port 7845, UDP and TCP**, in the router to the computer running the
 server. Give it a fixed address in the router, and a name with for example
 DuckDNS.
 
-Rooms and games show in a web browser: `http://<server>:7845/?key=<key>`.
+Rooms and games show in a web browser: `http://<server>:7845/`.
 `netplay-server -make-catalog <folder>` prints catalog lines for the files in a
 folder.
 
@@ -68,6 +71,12 @@ Game Boy 2P the files in `roms/GB` (`.gb`/`.gbc`, up to 8 MB).
 Rooms are per core too: an SNES room only shows on MiSTers running the SNES core.
 A Game Boy 2P room can hold two different games (one per Game Boy); its folder
 on the MiSTer then has both files, and loading either one joins the room.
+Arcade cores (jtframe cores built with netplay) never get games from the
+server: each player loads the game's MRA with their own ROM zip, and the room
+is matched on the md5 of the ROM as the MiSTer assembled it. The joining player
+picks the room in the game's OSD (*Join room*) or in the Arcade list, folder
+`_Netplay`. Arcade rooms show the core's name, e.g. `JTBUBL`, and are listed on
+the status page's *Arcade* tab.
 
 Only put games in `roms` that you are allowed to share, such as your own games
 and homebrew.
@@ -85,7 +94,8 @@ delay=4
 - **Open a room:** OSD **Netplay → Host**, load a game.
 - **Join:** open the folder **_Netplay/Rooms** in the file browser, open a room
   and pick the game in it. (Or **Netplay → Join** and load the same game: you
-  land in the oldest room with exactly that game.)
+  land in the room with exactly that game when it is the only one open; with
+  several the server answers `<n> rooms with this game: pick one`.)
 - The server's games are in **_Netplay/Server games**.
 - The list is refreshed every 3 seconds; leave and re-open the folder to see
   new rooms.

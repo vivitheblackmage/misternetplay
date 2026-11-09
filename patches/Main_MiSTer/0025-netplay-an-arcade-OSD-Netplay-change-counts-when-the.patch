@@ -1,0 +1,119 @@
+From 2197af2d15ed26f33cb0274604456a988396ed87 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sun, 8 Nov 2026 19:37:36 +0100
+Subject: [PATCH 25/25] netplay: an arcade OSD Netplay change counts when the OSD
+ closes or after 1.5 s, not on every step through the choices
+---
+ support/netplay/netplay.cpp          | 18 +++++++++++++++---
+ support/netplay/test/Makefile        |  1 +
+ support/netplay/test/run_udp_test.sh |  7 ++++++-
+ support/netplay/test/udp_harness.cpp | 17 +++++++++++++++++
+ 4 files changed, 39 insertions(+), 4 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 70b6d90..8b01292 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -2169,11 +2169,23 @@ void netplay_poll(void)
+ 	// change of the OSD option starts (or stops) one (SPEC.md 12.2)
+ 	if (core_armed && core_sys == SYS_ARCADE && !arc_xml.empty())
+ 	{
++		// Stepping through Off, Host, Join in the OSD must not start and stop
++		// sessions: the choice counts once the OSD is closed, or after it has
++		// stood for 1.5 s with the OSD open.
++		static uint32_t pend = ~0u;
++		static uint64_t pend_t = 0;
+ 		uint32_t o = user_io_status_get(osd_netplay_bits());
+-		if (o != arc_osd_seen)
++		if (o == arc_osd_seen) pend = ~0u;
++		else
+ 		{
+-			arc_osd_seen = o;
+-			begin_session(arc_xml.c_str(), 0, 0);
++			uint64_t t = now_ms();
++			if (o != pend) { pend = o; pend_t = t; }
++			if (!user_io_osd_is_visible() || t - pend_t >= 1500)
++			{
++				arc_osd_seen = o;
++				pend = ~0u;
++				begin_session(arc_xml.c_str(), 0, 0);
++			}
+ 		}
+ 	}
+ 
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index 57d3877..38fa448 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -19,6 +19,7 @@ test: test_netplay udp_harness
+ 	NP_SYSTEM=gb2p NP_TWO=1 NP_OSD=1 ./run_udp_test.sh
+ 	NP_SYSTEM=arcade ./run_udp_test.sh
+ 	NP_SYSTEM=arcade NP_OSD=1 ./run_udp_test.sh
++	NP_SYSTEM=arcade NP_OSD=1 NP_OSD_STEPS=1 ./run_udp_test.sh
+ 	@srv=../../../../server/build/netplay-server-linux-amd64; \
+ 	if [ -x $$srv ]; then srv=$$(cd $$(dirname $$srv) && pwd)/$$(basename $$srv); \
+ 	  NP_SERVER_BIN=$$srv ./run_udp_test.sh && \
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+index 74f418a..70d7161 100755
+--- a/support/netplay/test/run_udp_test.sh
++++ b/support/netplay/test/run_udp_test.sh
+@@ -40,7 +40,7 @@ h=$(grep RESULT "$tmp/host.log"); j=$(grep RESULT "$tmp/join.log")
+ echo "host: $h"
+ echo "join: $j"
+ hd=${h##*digest=}; jd=${j##*digest=}
+-label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_TWO:+ (two games)}${NP_OSD:+ (OSD mode)}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}"
++label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_TWO:+ (two games)}${NP_OSD:+ (OSD mode${NP_OSD_STEPS:+, stepping})}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}"
+ ok=0
+ [ $hr -eq 0 ] && [ $jr -eq 0 ] && [ -n "$hd" ] && [ "$hd" = "$jd" ] && ok=1
+ # through a server: the path the session took, and the names
+@@ -68,6 +68,11 @@ if [ $ok -eq 1 ] && [ -n "${NP_SERVER_BIN:-}" ]; then
+ 		fi
+ 	fi
+ fi
++# NP_OSD_STEPS: stepping past the other choice must not have started a session
++if [ $ok -eq 1 ] && [ -n "${NP_OSD_STEPS:-}" ]; then
++	grep -q "connecting to host\|joining\|peer=" "$tmp/host.log" && { echo "host: a join session started while stepping through the OSD"; ok=0; }
++	grep -q "waiting for player 2" "$tmp/join.log" && { echo "join: a host session started while stepping through the OSD"; ok=0; }
++fi
+ if [ $ok -eq 1 ]; then
+ 	echo "PASS $label"
+ 	rm -rf "$tmp"
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index c50a21b..beb657b 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -74,6 +74,8 @@ char *user_io_get_confstr(int index)
+ 
+ static uint32_t osd_netplay = 0;            // NES [89:88], SNES [59:58], GB2P [47:46], arcade [127:126]: 0 = netplay.ini, 2 Host, 3 Join
+ 
++static bool osd_visible = false;            // NP_OSD_STEPS: the OSD is open while the option changes
++char user_io_osd_is_visible() { return osd_visible; }
+ uint32_t user_io_status_get(const char *opt, int)
+ {
+ 	if (!strcmp(opt, arcade ? "[127:126]" : gb2p ? "[47:46]" : snes ? "[59:58]" : "[89:88]")) return osd_netplay;
+@@ -223,7 +225,22 @@ static int run_arcade(bool host, bool osd, uint32_t want)
+ 	if (osd)
+ 	{
+ 		for (int i = 0; i < 20; i++) { netplay_poll(); usleep(1000); }
++		if (getenv("NP_OSD_STEPS"))
++		{
++			// the player steps through the option with the OSD open: past the
++			// other choice first (it must not start a session), then on to theirs
++			osd_visible = true;
++			osd_netplay = host ? 3 : 2;
++			for (uint64_t t = now_ms(); now_ms() - t < 1000; usleep(1000)) { fpga->step(now_ms()); netplay_poll(); }
++			osd_netplay = 1;
++			for (uint64_t t = now_ms(); now_ms() - t < 200; usleep(1000)) { fpga->step(now_ms()); netplay_poll(); }
++		}
+ 		osd_netplay = host ? 2 : 3;
++		if (getenv("NP_OSD_STEPS"))
++		{
++			for (uint64_t t = now_ms(); now_ms() - t < 2000; usleep(1000)) { fpga->step(now_ms()); netplay_poll(); }
++			osd_visible = false;
++		}
+ 	}
+ 
+ 	uint64_t t0 = now_ms();
+-- 
+2.43.0
+

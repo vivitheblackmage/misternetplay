@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp -e GOCACHE=/tmp/gocache -v "$PWD":/src -w /src golang:1.22-bookworm sh -c '
-  go vet ./... &&
+  go vet ./... && go test ./... &&
   CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" -o build/netplay-server-linux-amd64 . &&
   GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" -o build/netplay-server.exe . &&
   GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w" -o build/netplay-server-linux-arm64 . &&

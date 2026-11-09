@@ -1,0 +1,32 @@
+From 328013f45666ce2620a8d866d43df9e38410738c Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sun, 8 Nov 2026 22:55:14 +0100
+Subject: [PATCH 5/6] jtframe netplay: no HDMI_FREEZE on stalls (ascal showed a
+ two-frame-old frame once per stall)
+---
+ modules/jtframe/target/mister/hdl/jtframe_emu.sv | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/modules/jtframe/target/mister/hdl/jtframe_emu.sv b/modules/jtframe/target/mister/hdl/jtframe_emu.sv
+index 7755f3618..50f36b679 100644
+--- a/modules/jtframe/target/mister/hdl/jtframe_emu.sv
++++ b/modules/jtframe/target/mister/hdl/jtframe_emu.sv
+@@ -203,10 +203,12 @@ wire [23:0] np_st;
+ assign np_st_en = 1'b0;
+ assign np_st    = 24'd0;
+ `endif
+-assign HDMI_FREEZE   = np_stall;
+-`else
+-assign HDMI_FREEZE   = 0;
+ `endif
++// No HDMI_FREEZE for netplay stalls: a stall starts where a frame ends, and a
++// freeze there makes ascal skip its input buffer switch, so its output shows a
++// frame two frames old once (a visible flicker on every stall). The held pixel
++// enable already stops ascal's input: it simply repeats the newest frame.
++assign HDMI_FREEZE   = 0;
+ assign HDMI_BLACKOUT = 0;
+ assign HDMI_BOB_DEINT= 0;
+ assign AUDIO_MIX     = 0;
+-- 
+2.43.0
+

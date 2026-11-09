@@ -1,0 +1,375 @@
+From c9d491354c9c9eedaf0f675e167467aff5cc55f8 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sun, 8 Nov 2026 18:24:18 +0100
+Subject: [PATCH 23/23] netplay: arcade rooms in _Arcade/_Netplay: one MRA per
+ waiting room, a copy of the player's own with the room id; loading it joins
+ that room
+---
+ support/netplay/netplay.cpp          | 187 ++++++++++++++++++++++++++-
+ support/netplay/test/Makefile        |   1 +
+ support/netplay/test/run_udp_test.sh |   5 +-
+ support/netplay/test/udp_harness.cpp |  42 +++++-
+ 4 files changed, 226 insertions(+), 9 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 62d6343..9fc12fc 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -1190,6 +1190,101 @@ static std::string                      pinned_entry; // the room (entry in room
+ static uint32_t                         pinned_seq = 0;   // ... for the ROM load with this rom_seq
+ static std::string                      my_room;      // the room we host: not listed
+ 
++// Arcade rooms (SPEC.md 12.5): _Arcade/_Netplay is a RAM folder with one MRA
++// per waiting room, "<name> - <game>.mra", a copy of the player's own MRA of
++// that name with the room id in a comment. Loading an MRA reloads the core and
++// restarts Main, so the folder stays mounted across netplay_stop() and the room
++// is read back from the file, not from room_files.
++static bool                             arc_lobby = false;   // the lobby serves an arcade core
++static std::mutex                       arc_mtx;
++static std::map<std::string, std::string> arc_mras;          // lower-case MRA name (no .mra) -> path
++static const char                       ARC_TAG[] = "<!-- netplay room: ";
++
++static std::string lower(std::string v)
++{
++	for (char &c : v) c = (char)tolower((unsigned char)c);
++	return v;
++}
++
++static bool is_mount_point(const std::string &dir)
++{
++	FILE *f = fopen("/proc/mounts", "r");
++	if (!f) return false;
++	char line[1024];
++	bool found = false;
++	while (!found && fgets(line, sizeof(line), f))
++	{
++		char dev[256], mnt[512];
++		if (sscanf(line, "%255s %511s", dev, mnt) == 2 && dir == mnt) found = true;
++	}
++	fclose(f);
++	return found;
++}
++
++// The player's MRA files by name: _Arcade and its folders (not cores, not _Netplay)
++static void arc_index(const std::string &dir, int depth, std::map<std::string, std::string> *out)
++{
++	if (depth > 3 || dl_quit) return;
++	DIR *d = opendir(dir.c_str());
++	if (!d) return;
++	std::vector<std::string> names;
++	while (dirent *e = readdir(d)) names.push_back(e->d_name);
++	closedir(d);
++	for (const std::string &n : names)
++	{
++		if (n.empty() || n[0] == '.' || !strncasecmp(n.c_str(), "_Netplay", 8) || !strcasecmp(n.c_str(), "cores")) continue;
++		std::string p = dir + "/" + n;
++		struct stat st;
++		if (stat(p.c_str(), &st)) continue;
++		if (S_ISDIR(st.st_mode)) { arc_index(p, depth + 1, out); continue; }
++		if (S_ISREG(st.st_mode) && n.size() > 4 && !strcasecmp(n.c_str() + n.size() - 4, ".mra"))
++		{
++			std::string key = lower(n.substr(0, n.size() - 4));
++			if (!out->count(key) || depth == 0) (*out)[key] = p;   // _Arcade itself first
++		}
++	}
++}
++
++// The room's MRA: the player's own, with the room id after the root tag
++static bool arc_room_write(const std::string &src, const std::string &dst, const std::string &id)
++{
++	FILE *in = fopen(src.c_str(), "rb");
++	if (!in) return false;
++	std::string x;
++	char buf[16384];
++	size_t n;
++	while ((n = fread(buf, 1, sizeof(buf), in)) > 0 && x.size() < (1u << 20)) x.append(buf, n);
++	fclose(in);
++	size_t at = x.find("<misterromdescription");
++	if (at == std::string::npos) return false;
++	at = x.find('>', at);
++	if (at == std::string::npos) return false;
++	x.insert(at + 1, std::string("\n    ") + ARC_TAG + id + " -->");
++	FILE *out = fopen(dst.c_str(), "wb");
++	if (!out) return false;
++	bool ok = fwrite(x.data(), 1, x.size(), out) == x.size();
++	if (fclose(out)) ok = false;
++	if (!ok) unlink(dst.c_str());
++	return ok;
++}
++
++// The room id in a room MRA (main thread, at the MRA load)
++static bool arc_room_id(const std::string &path, std::string *id)
++{
++	FILE *f = fopen(path.c_str(), "rb");
++	if (!f) return false;
++	char buf[4096];
++	size_t n = fread(buf, 1, sizeof(buf) - 1, f);
++	fclose(f);
++	buf[n] = 0;
++	const char *p = strstr(buf, ARC_TAG);
++	if (!p) return false;
++	std::string v(p + sizeof(ARC_TAG) - 1, strnlen(p + sizeof(ARC_TAG) - 1, 8));
++	if (!is_hex(v, 8)) return false;
++	*id = v;
++	return true;
++}
++
+ static void download_games(const std::string &key)
+ {
+ 	int got = 0, offered = 0;
+@@ -1330,6 +1425,25 @@ static void update_rooms(const std::string &list)
+ 			if (!src.empty() && copy_failed.count(md5)) src.clear();
+ 			return src;
+ 		};
++		if (core_sys == SYS_ARCADE)
++		{
++			// the player's own MRA of the host's MRA name; none: no room shown
++			std::string mra;
++			{
++				std::lock_guard<std::mutex> g(arc_mtx);
++				auto m = arc_mras.find(lower(game));
++				if (m != arc_mras.end()) mra = m->second;
++			}
++			if (mra.empty()) continue;
++			std::string entry;
++			for (int n = 1; n < 10; n++)
++			{
++				entry = (n == 1 ? base : base + " (" + std::to_string(n) + ")") + ".mra";
++				if (!want.count(entry)) break;
++			}
++			want[entry] = Want { RoomFile { f[0], f[3], entry, "" }, mra, "" };
++			continue;
++		}
+ 		std::string src = find_src(md5a), src2 = two ? find_src(md5b) : "";
+ 		bool missing = src.empty() || (two && src2.empty());
+ 		// The room is a folder with the game(s) under the host's file names, so
+@@ -1377,6 +1491,7 @@ static void update_rooms(const std::string &list)
+ 		auto h = have.find(n);
+ 		bool keep = w != want.end() && h != have.end() && h->second.id == w->second.room.id;
+ 		if (n == pinned && h != have.end()) { now[n] = h->second; continue; }   // our session needs it
++		if (n == pinned && arc_lobby) { if (w != want.end()) now[n] = w->second.room; continue; }   // loaded before Main restarted
+ 		if (keep) { now[n] = h->second; continue; }
+ 		remove_entry(full);
+ 	}
+@@ -1385,8 +1500,13 @@ static void update_rooms(const std::string &list)
+ 	{
+ 		if (now.count(w.first)) continue;
+ 		std::string full = rooms_dir + "/" + w.first;
+-		if (mkdir(full.c_str(), 0755)) continue;
+ 		const RoomFile &rf = w.second.room;
++		if (arc_lobby)
++		{
++			if (arc_room_write(w.second.src, full, rf.id)) now[w.first] = rf;
++			continue;
++		}
++		if (mkdir(full.c_str(), 0755)) continue;
+ 		bool fail1 = !w.second.src.empty() && !copy_file(w.second.src, full + "/" + rf.file1);
+ 		bool fail2 = !fail1 && !w.second.src2.empty() && !copy_file(w.second.src2, full + "/" + rf.file2);
+ 		if (fail1 || fail2)
+@@ -1406,8 +1526,18 @@ static void update_rooms(const std::string &list)
+ static void *lobby_thread(void *)
+ {
+ 	std::string key = "key=" + url_enc(cfg.key[0] ? cfg.key : "-");
+-	download_games(key);
+-	idx_running = pthread_create(&idx_thread, nullptr, index_thread, nullptr) == 0;
++	if (arc_lobby)
++	{
++		std::map<std::string, std::string> m;
++		arc_index(getFullPath("_Arcade"), 0, &m);
++		std::lock_guard<std::mutex> g(arc_mtx);
++		arc_mras.swap(m);
++	}
++	else
++	{
++		download_games(key);
++		idx_running = pthread_create(&idx_thread, nullptr, index_thread, nullptr) == 0;
++	}
+ 	uint64_t last = 0;
+ 	while (!dl_quit)
+ 	{
+@@ -1425,8 +1555,34 @@ static void *lobby_thread(void *)
+ }
+ 
+ // Main thread, at core load.
+-static void server_games_start()
++static bool in_rooms(const std::string &full);
++
++static void server_games_start(const std::string &keep = "")
+ {
++	arc_lobby = core_sys == SYS_ARCADE;
++	if (arc_lobby)
++	{
++		// no server games; the folder survives the restart an MRA load causes
++		np_dir = std::string(getFullPath("_Arcade")) + "/_Netplay";
++		games_dir.clear();
++		rooms_dir = np_dir;
++		mkdir(np_dir.c_str(), 0755);
++		srv_mounted = is_mount_point(np_dir) ||
++		              !mount("tmpfs", np_dir.c_str(), "tmpfs", MS_NOSUID | MS_NODEV | MS_NOEXEC, "size=4m,mode=0755");
++		if (!srv_mounted) post_message("Netplay: no RAM folder for the lobby");
++		{
++			std::lock_guard<std::mutex> g(lobby_mtx);
++			room_files.clear();
++			my_room.clear();
++			// the room MRA just loaded (if it is one) stays until its session is over
++			pinned_entry = in_rooms(keep) ? keep.substr(rooms_dir.size() + 1) : "";
++			pinned_seq = 0;
++		}
++		http_resolved = false;
++		dl_quit = false;
++		dl_running = pthread_create(&dl_thread, nullptr, lobby_thread, nullptr) == 0;
++		return;
++	}
+ 	games_root = getFullPath(user_io_get_core_path(nullptr, 0));
+ 	index_path = std::string(getFullPath("netplay")) + "/index-" + core_name + ".txt";
+ 	// before 2026-11-02 the server games had their own folder
+@@ -1470,8 +1626,10 @@ static void server_games_stop()
+ 	if (dl_running) pthread_join(dl_thread, nullptr);
+ 	if (idx_running) pthread_join(idx_thread, nullptr);
+ 	dl_running = idx_running = false;
+-	if (srv_mounted) umount2(np_dir.c_str(), MNT_DETACH);   // the games and rooms are gone with it
++	// arcade: the folder stays (an MRA from it is loaded after this, SPEC.md 12.5)
++	if (srv_mounted && !arc_lobby) umount2(np_dir.c_str(), MNT_DETACH);   // the games and rooms are gone with it
+ 	srv_mounted = false;
++	arc_lobby = false;
+ }
+ 
+ // The netplay thread tells the lobby which room it hosts (not listed), and
+@@ -1720,6 +1878,9 @@ void netplay_note_arcade(const char *xml, int nvram)
+ 	arc_nvram = nvram != 0;
+ 	dip_applied = false;                 // arcade_send_rom() just sent the player's own
+ 	arc_osd_seen = user_io_status_get(osd_netplay_bits());
++	// the arcade lobby starts here, with the MRA known: one loaded from the
++	// room folder keeps its file there (SPEC.md 12.5)
++	if (cfg.server[0] && !dl_running) server_games_start(getFullPath(arc_xml.c_str()));
+ 	begin_session(arc_xml.c_str(), 0, 0);
+ }
+ 
+@@ -1798,7 +1959,21 @@ static void begin_session(const char *name_in, unsigned char index, char opensav
+ 			std::lock_guard<std::mutex> g(info_mtx);
+ 			seq = rom_seq + 1;               // this load's rom_seq, below
+ 		}
+-		if (osd != 1 && room_of(full, seq, &rf))
++		std::string arc_id;
++		if (core_sys == SYS_ARCADE)
++		{
++			// an MRA from _Arcade/_Netplay joins the room written into it
++			if (osd != 1 && in_rooms(full) && arc_room_id(full, &arc_id))
++			{
++				mode = M_JOIN;
++				room = arc_id;
++				std::lock_guard<std::mutex> g(lobby_mtx);
++				pinned_entry = full.substr(rooms_dir.size() + 1);
++				pinned_seq = seq;
++			}
++			else if (mode == M_JOIN) room = "*";  // the oldest waiting room with this ROM
++		}
++		else if (osd != 1 && room_of(full, seq, &rf))
+ 		{
+ 			mode = M_JOIN;
+ 			room = rf.id;
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index 3c673a1..91a2186 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -32,6 +32,7 @@ test: test_netplay udp_harness
+ 	  NP_SYSTEM=gb2p NP_TWO=1 NP_SERVER_BIN=$$srv ./run_udp_test.sh && \
+ 	  NP_SYSTEM=gb2p NP_TWO=1 NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
+ 	  NP_SYSTEM=gb2p NP_TWO=1 NP_SERVER_BIN=$$srv NP_SAV=1 ./run_udp_test.sh && \
++	  NP_SYSTEM=arcade NP_SERVER_BIN=$$srv ./run_udp_test.sh && \
+ 	  NP_SYSTEM=arcade NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
+ 	  NP_SYSTEM=arcade NP_SERVER_BIN=$$srv NP_DIRECT=no NP_AUTOJOIN=1 ./run_udp_test.sh; \
+ 	else echo "SKIP udp (server): build it with server/build.sh"; fi
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+index b132955..89282f2 100755
+--- a/support/netplay/test/run_udp_test.sh
++++ b/support/netplay/test/run_udp_test.sh
+@@ -58,7 +58,10 @@ if [ $ok -eq 1 ] && [ -n "${NP_SERVER_BIN:-}" ]; then
+ 	if [ -z "${NP_AUTOJOIN:-}" ]; then
+ 		# Game Boy 2P room names keep the extension (it picks GBC or DMG mode)
+ 		if [ "${NP_SYSTEM:-}" = gb2p ]; then g1=game.$ext g2=game2.$ext; else g1=game g2=game2; fi
+-		if [ -n "${NP_TWO:-}" ]; then
++		if [ "${NP_SYSTEM:-}" = arcade ]; then
++			grep -q "room file: Par..Host - Bubble Bobble (Japan, Ver 0.1).mra" "$tmp/join.log" || { echo "join: room file name"; ok=0; }
++			grep -q "room file" "$tmp/host.log" && { echo "host: listed its own room"; ok=0; }
++		elif [ -n "${NP_TWO:-}" ]; then
+ 			grep -qE "room file: Par..Host - $g1 \+ $g2/game2?\.$ext" "$tmp/join.log" || { echo "join: room file name"; ok=0; }
+ 		else
+ 			grep -q "room file: Par..Host - $g1/game.$ext" "$tmp/join.log" || { echo "join: room file name"; ok=0; }
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index 6de1fbc..84b77e8 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -116,6 +116,7 @@ int user_io_file_tx(const char *name, unsigned char index, char opensave, char,
+ const char *getFullPath(const char *name)
+ {
+ 	static char buf[1024];
++	if (name[0] == '/') return name;           // as the real one: absolute paths stay
+ 	snprintf(buf, sizeof(buf), "%s/%s", workdir.c_str(), name);
+ 	return buf;
+ }
+@@ -163,6 +164,17 @@ static void make_rom(const char *path, int salt = 0)   // same bytes on both sid
+ static int run_arcade(bool host, bool osd, uint32_t want)
+ {
+ 	fpga = new FakeFpga(host ? 0 : 1, SYS_ARCADE);
++	// the player's own MRA (the room MRAs are copies of it)
++	mkdir(getFullPath("_Arcade"), 0755);
++	std::string mra = getFullPath("_Arcade/Bubble Bobble (Japan, Ver 0.1).mra");
++	if (FILE *m = fopen(mra.c_str(), "w"))
++	{
++		fprintf(m, "<misterromdescription>\n    <name>Bubble Bobble (Japan, Ver 0.1)</name>\n    <rbf>jtbubl</rbf>\n</misterromdescription>\n");
++		fclose(m);
++	}
++	// through a server without NP_AUTOJOIN: the join picks the host's room in
++	// _Arcade/_Netplay, which reloads the core and restarts Main (SPEC.md 12.5)
++	bool pick = getenv("NP_SERVER") && !host && !getenv("NP_AUTOJOIN");
+ 	netplay_start();
+ 	uint8_t m0[16], m1[16];
+ 	memset(m0, 0x11 + (getenv("NP_ROMSALT") ? atoi(getenv("NP_ROMSALT")) : 0), 16);
+@@ -174,7 +186,33 @@ static int run_arcade(bool host, bool osd, uint32_t want)
+ 	netplay_note_arcade_rom(0, m0);
+ 	netplay_note_arcade_rom(1, m1);
+ 	arcade_sw_send();                          // mra_loader sends the DIP switches before the end
+-	netplay_note_arcade("/media/fat/_Arcade/Bubble Bobble (Japan, Ver 0.1).mra", 0);
++	netplay_note_arcade(mra.c_str(), 0);
++	if (pick)
++	{
++		std::string dir = getFullPath("_Arcade/_Netplay"), room;
++		for (uint64_t t = now_ms(); room.empty() && now_ms() - t < 10000; usleep(10000))
++		{
++			netplay_poll();
++			if (DIR *d = opendir(dir.c_str()))
++			{
++				while (dirent *e = readdir(d))
++				{
++					std::string n = e->d_name;
++					if (n.size() > 4 && n.compare(n.size() - 4, 4, ".mra") == 0) room = n;
++				}
++				closedir(d);
++			}
++		}
++		if (room.empty()) { printf("[harness] no room in _Arcade/_Netplay\n"); return 1; }
++		printf("[harness] room file: %s\n", room.c_str());
++		// loading it: core reload, Main restarts (netplay_stop, netplay_start), the MRA loads
++		netplay_stop();
++		netplay_start();
++		netplay_note_arcade_rom(0, m0);
++		netplay_note_arcade_rom(1, m1);
++		arcade_sw_send();
++		netplay_note_arcade((dir + "/" + room).c_str(), 0);
++	}
+ 	// NP_OSD: netplay.ini says off; the OSD option, set after the MRA is loaded, starts it
+ 	if (osd)
+ 	{
+@@ -243,7 +281,7 @@ int main(int argc, char **argv)
+ 	// NP_DIRECT=no: no hole punching, everything through the server.
+ 	const char *server = getenv("NP_SERVER");
+ 	const char *key = getenv("NP_KEY");
+-	bool autojoin = getenv("NP_AUTOJOIN") != nullptr || arcade;   // arcade: no room folder (SPEC.md 12.5)
++	bool autojoin = getenv("NP_AUTOJOIN") != nullptr;
+ 	FILE *f = fopen(getFullPath("netplay.ini"), "w");
+ 	const char *mode = osd ? "off" : host ? "host" : (server && !autojoin) ? "off" : "join";
+ 	fprintf(f, "; test\n[netplay]\nmode = %s ; comment\npeer=%s\nport=47845\ndelay=3\n",
+-- 
+2.43.0
+

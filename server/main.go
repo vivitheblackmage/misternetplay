@@ -1,4 +1,4 @@
-// netplay-server: a private lobby and relay for MiSTer NES, SNES and Game Boy 2P netplay.
+// netplay-server: a private lobby and relay for MiSTer NES, SNES, Game Boy 2P and arcade netplay.
 //
 // Both MiSTers connect out to this server (UDP), so only the machine running
 // it needs a forwarded port. A host opens a room with a game; the others see
@@ -41,10 +41,11 @@ import (
 const maxRomSize = 16 << 20
 
 type config struct {
-	Port    int
-	Key     string
-	Roms    string
-	Catalog string
+	Port       int
+	Key        string
+	Roms       string
+	Catalog    string
+	PublicPage bool // the status page without the key; the MiSTers' requests always need it
 }
 
 // ---------------------------------------------------------------- settings
@@ -58,7 +59,7 @@ func exeDir() string {
 }
 
 func loadConfig(path string) (config, error) {
-	c := config{Port: 7845, Roms: "roms", Catalog: "catalog.txt"}
+	c := config{Port: 7845, Roms: "roms", Catalog: "catalog.txt", PublicPage: true}
 	f, err := os.Open(path)
 	if os.IsNotExist(err) {
 		b := make([]byte, 9)
@@ -68,7 +69,8 @@ func loadConfig(path string) (config, error) {
 			"port=%d          ; UDP for netplay and TCP for the game list; forward UDP and TCP in the router\n"+
 			"key=%s\n"+
 			"roms=%s          ; folder with the games the server hands out (RAM only on the MiSTers)\n"+
-			"catalog=%s ; \"md5 name\" per line: versions everyone brings themselves\n",
+			"catalog=%s ; \"md5 name\" per line: versions everyone brings themselves\n"+
+			"public_page=yes    ; yes: the status page needs no key (rooms, player names, the game list); no: ?key= as well\n",
 			c.Port, c.Key, c.Roms, c.Catalog)
 		if err := os.WriteFile(path, []byte(text), 0o644); err != nil {
 			return c, err
@@ -102,6 +104,8 @@ func loadConfig(path string) (config, error) {
 			c.Roms = v
 		case "catalog":
 			c.Catalog = v
+		case "public_page":
+			c.PublicPage = !(strings.EqualFold(v, "no") || strings.EqualFold(v, "off") || v == "0" || strings.EqualFold(v, "false"))
 		}
 	}
 	return c, sc.Err()
@@ -217,7 +221,7 @@ func makeCatalog(dir string) {
 	}
 }
 
-func (l *library) serve(key, catalog string, r *relay) http.Handler {
+func (l *library) serve(key, catalog string, public bool, r *relay) http.Handler {
 	ok := func(w http.ResponseWriter, q *http.Request) bool {
 		if subtle.ConstantTimeCompare([]byte(q.URL.Query().Get("key")), []byte(key)) != 1 {
 			http.Error(w, "wrong key", http.StatusForbidden)
@@ -259,10 +263,12 @@ func (l *library) serve(key, catalog string, r *relay) http.Handler {
 	})
 	mux.HandleFunc("/logo.png", serveLogo)
 	mux.HandleFunc("/", func(w http.ResponseWriter, q *http.Request) {
-		if q.URL.Path != "/" || !ok(w, q) {
-			if q.URL.Path != "/" {
-				http.NotFound(w, q)
-			}
+		if q.URL.Path != "/" {
+			http.NotFound(w, q)
+			return
+		}
+		// public_page: anyone may look; joining and downloading still need the key
+		if !public && !ok(w, q) {
 			return
 		}
 		writePage(w, l, catalog, r)
@@ -344,12 +350,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("tcp port %d: %v", c.Port, err)
 	}
-	go http.Serve(ln, lib.serve(c.Key, c.Catalog, r))
+	go http.Serve(ln, lib.serve(c.Key, c.Catalog, c.PublicPage, r))
 	go r.sweep()
 
 	log.Printf("netplay-server on port %d (UDP + TCP), %d games in %s, %d in %s",
 		c.Port, len(lib.list("NES"))+len(lib.list("SNES"))+len(lib.list("GB2P")), c.Roms, len(readCatalog(c.Catalog)), c.Catalog)
-	log.Printf("game lists in a browser: http://localhost:%d/?key=%s", c.Port, c.Key)
+	if c.PublicPage {
+		log.Printf("status page in a browser: http://localhost:%d/  (public_page=yes: no key needed to look)", c.Port)
+	} else {
+		log.Printf("status page in a browser: http://localhost:%d/?key=%s", c.Port, c.Key)
+	}
 	log.Printf("MiSTer netplay.ini:  server=<this address>:%d   key=%s   name=<player>", c.Port, c.Key)
 	r.run()
 }

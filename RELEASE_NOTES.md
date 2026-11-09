@@ -1,5 +1,53 @@
 # Release notes
 
+## v0.4: Arcade netplay (Bubble Bobble)
+
+### New: arcade netplay
+
+- **`jtbubl-netplay.rbf`**: Jotego's Bubble Bobble core (jtbubl) with lockstep
+  netplay. The netplay module is in his framework, jtframe, so other jtframe
+  arcade cores can get it the same way later. The core goes in
+  `_Arcade/cores` next to the normal `jtbubl.rbf`, which is not changed, and is
+  started from its own MRA, **Bubble Bobble (US, Ver 5.1) [netplay]**. It uses
+  the ROM set the MiSTer updater installs for Jotego's core.
+- **Host:** OSD **Netplay → Host**. **Join:** in the game's OSD, **Join room**
+  lists the open rooms; picking one joins it without reloading the game. The
+  same rooms are in the Arcade list, folder **_Netplay**, also from the main
+  menu. Without a server: `peer=` and **Netplay → Join**.
+- Both players need the same ROM set (checked) and the same core version. The
+  host's DIP switches are used during a session, and each player's own come
+  back afterwards. The game's RAM is cleared at the start of a session.
+- The checksum covers the game state (every CPU write), so a desync is caught
+  in the frame it happens.
+- The CPUs read their ROMs from block RAM in the netplay core: SDRAM timing
+  differs between two MiSTers and must not decide the game's timing.
+- When an input is late, HDMI repeats the last picture without a glitch.
+
+Tested on hardware: two MiSTers over the internet through the lobby server on a
+Raspberry Pi, 33 levels in 20 minutes without a desync. In simulation: the whole
+core on two simulated MiSTers in sync, with the same order of every clock
+enable.
+
+### Server
+
+- A join without a picked room (**Netplay → Join** and load the game) only goes
+  into a room when exactly one room with that game is open. With several, the
+  OSD says `<n> rooms with this game: pick one`, so nobody ends up with a
+  stranger by chance. This applies to NES, SNES and Game Boy 2P too.
+- The status page has an **Arcade** tab with the open arcade rooms. It is
+  public by default (no key in the address); `public_page=no` asks for the key.
+- Lighter page (no endless animations).
+- Raspberry Pi: `sudo sh install-linux.sh` in the release's `Server` folder
+  installs or updates the server as a service; settings, key and games stay.
+
+### Known limits
+
+- With `mode=join` in `netplay.ini`, or the OSD on **Join**, a game load joins
+  by itself when exactly one room with the game is open. Keep `mode=off` (the
+  OSD on `netplay.ini`) to pick rooms yourself.
+- Only Bubble Bobble so far. During netplay the pause, test and service
+  switches are off. Analog video may flicker for a moment when an input is late.
+
 ## v0.3: Game Boy link-cable netplay
 
 ### New: Game Boy 2P
