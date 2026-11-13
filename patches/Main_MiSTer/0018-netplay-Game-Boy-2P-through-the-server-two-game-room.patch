@@ -1,8 +1,8 @@
-From 4a11861edd51d368fefca18678a7cf7981f562ad Mon Sep 17 00:00:00 2001
+From 0c761001317438c746451377836f3558200af35a Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sat, 7 Nov 2026 18:03:07 +0100
-Subject: [PATCH] netplay: Game Boy 2P through the server (two-game rooms,
- names with extension) and the game extensions in the settings
+Subject: [PATCH 18/42] netplay: Game Boy 2P through the server (two-game
+ rooms, names with extension) and the game extensions in the settings
 ---
  support/netplay/netplay.cpp           | 149 +++++++++++++++++++-------
  support/netplay/netplay_proto.cpp     |   4 +-

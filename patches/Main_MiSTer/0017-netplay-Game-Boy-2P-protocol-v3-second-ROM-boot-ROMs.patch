@@ -1,8 +1,8 @@
-From 52009f1565d35ac95f61bef8775da39d21c3cf28 Mon Sep 17 00:00:00 2001
+From 22fa01c5d8c169480f9cdf9bc5eb1420f9189e5b Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sat, 7 Nov 2026 16:43:07 +0100
-Subject: [PATCH] netplay: Game Boy 2P (protocol v3: second ROM, boot ROMs and
- RTC time in HELLO, CTRL[2] for the join)
+Subject: [PATCH 17/42] netplay: Game Boy 2P (protocol v3: second ROM, boot
+ ROMs and RTC time in HELLO, CTRL[2] for the join)
 ---
  support/netplay/netplay.cpp           | 256 ++++++++++++++++++++++----
  support/netplay/netplay.h             |   4 +-

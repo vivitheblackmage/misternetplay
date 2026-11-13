@@ -1,7 +1,7 @@
-From 9c764544450e08ed4b3623e853d82a6906761b1e Mon Sep 17 00:00:00 2001
+From 7e16c798be6923d85ecca4bcab6f0af525f3a924 Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sat, 31 Oct 2026 22:14:52 +0100
-Subject: [PATCH] netplay: also write OSD messages to netplay/netplay.log
+Subject: [PATCH 08/42] netplay: also write OSD messages to netplay/netplay.log
 
 So a test run (replay OK / DESYNC) can be checked over SSH without looking
 at the screen.

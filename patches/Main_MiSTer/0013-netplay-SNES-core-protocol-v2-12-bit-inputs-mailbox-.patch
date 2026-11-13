@@ -1,8 +1,8 @@
-From aec67f3698340cab9cb9474514ae92477ff4d816 Mon Sep 17 00:00:00 2001
+From c5835c70d2cdfd06b63b25649572fe8659464dbb Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Tue, 3 Nov 2026 19:54:36 +0100
-Subject: [PATCH] netplay: SNES core (protocol v2, 12-bit inputs, mailbox at
- 0x3FC00000)
+Subject: [PATCH 13/42] netplay: SNES core (protocol v2, 12-bit inputs, mailbox
+ at 0x3FC00000)
 
 The SNES core is recognised by name. Its mailbox, magic and 12-bit
 entry format follow SPEC.md 10.3; HELLO carries a system byte and INPUT

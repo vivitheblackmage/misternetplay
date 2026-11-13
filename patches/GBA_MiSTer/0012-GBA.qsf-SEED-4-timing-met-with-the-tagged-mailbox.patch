@@ -1,0 +1,24 @@
+From 86fe26ff0248c7a5d5cc705ea19db9acbb560e41 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Thu, 12 Nov 2026 18:15:43 +0100
+Subject: [PATCH 12/12] GBA.qsf: SEED 4 (timing met with the tagged mailbox)
+---
+ GBA.qsf | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/GBA.qsf b/GBA.qsf
+index ba0a2b6..43520a0 100644
+--- a/GBA.qsf
++++ b/GBA.qsf
+@@ -49,7 +49,7 @@ set_global_assignment -name PERIPHERY_TO_CORE_PLACEMENT_AND_ROUTING_OPTIMIZATION
+ set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
+ set_global_assignment -name ALM_REGISTER_PACKING_EFFORT LOW
+ set_global_assignment -name PLACEMENT_EFFORT_MULTIPLIER 1.0
+-set_global_assignment -name SEED 2
++set_global_assignment -name SEED 4
+ set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
+ 
+ source sys/sys.tcl
+-- 
+2.43.0
+

@@ -1,8 +1,8 @@
-From a137afa1729bf33bdb9020cf35f7c0b1cdbbffc6 Mon Sep 17 00:00:00 2001
+From 79c15ec63db522e7bbc3a9435b92fd91e1bb9bf8 Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sat, 7 Nov 2026 19:00:51 +0100
-Subject: [PATCH] netplay: create the core's games folder for the lobby when it
- does not exist yet
+Subject: [PATCH 20/42] netplay: create the core's games folder for the lobby
+ when it does not exist yet
 ---
  support/netplay/netplay.cpp          | 5 +++++
  support/netplay/test/udp_harness.cpp | 6 ++----

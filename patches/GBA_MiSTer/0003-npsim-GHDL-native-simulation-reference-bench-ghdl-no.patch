@@ -1,0 +1,544 @@
+From 1fd69d2840ec4784bfc2502e69bc7a7d7bac042d Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 10 Nov 2026 06:58:11 +0100
+Subject: [PATCH 03/12] npsim: GHDL native-simulation reference bench (ghdl/),
+ --nokeys, PC jump trace
+---
+ npsim/gba_sim.cpp     |  22 +++-
+ npsim/ghdl/build.sh   |  23 ++++
+ npsim/ghdl/gba_ghdl.c |  89 +++++++++++++
+ npsim/ghdl/run.sh     |  11 ++
+ npsim/ghdl/tb_gba.vhd | 293 ++++++++++++++++++++++++++++++++++++++++++
+ npsim/vhdl_files.txt  |   2 +-
+ 6 files changed, 438 insertions(+), 2 deletions(-)
+ create mode 100755 npsim/ghdl/build.sh
+ create mode 100644 npsim/ghdl/gba_ghdl.c
+ create mode 100755 npsim/ghdl/run.sh
+ create mode 100644 npsim/ghdl/tb_gba.vhd
+
+diff --git a/npsim/gba_sim.cpp b/npsim/gba_sim.cpp
+index de6f088..5bc9313 100644
+--- a/npsim/gba_sim.cpp
++++ b/npsim/gba_sim.cpp
+@@ -22,6 +22,7 @@
+ #include <string>
+ #include <vector>
+ #include <map>
++#include <set>
+ #include <algorithm>
+ 
+ static std::vector<uint32_t> mem(1u << 24);    // 64 MB flat memory, DWORD addressed
+@@ -61,6 +62,7 @@ int main(int argc, char **argv)
+ 		else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], nullptr, 0);
+ 		else if (!strcmp(argv[i], "--lat") && i + 1 < argc) lat_max = atoi(argv[++i]);
+ 		else if (!strcmp(argv[i], "--keyseed") && i + 1 < argc) keyseed = strtoull(argv[++i], nullptr, 0);
++		else if (!strcmp(argv[i], "--nokeys")) keyseed = 0;
+ 		else if (argv[i][0] != '-') rom = argv[i];
+ 		else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
+ 	}
+@@ -104,6 +106,12 @@ int main(int argc, char **argv)
+ 	Verilated::traceEverOn(true);
+ 	VerilatedVcdC *vcd = nullptr;
+ #endif
++	int pctrace_left = getenv("GBA_PCTRACE") ? atoi(getenv("GBA_PCTRACE")) : 0;
++	bool pctrace_on = false;
++	int pctrace_frame = getenv("GBA_PCTRACE_FRAME") ? atoi(getenv("GBA_PCTRACE_FRAME")) : 0;   // from this frame on
++	bool pctrace_all = getenv("GBA_PCTRACE_ALL") != nullptr;                                     // every jump, not once each
++	std::set<uint64_t> seen_jumps;                // GBA_PCTRACE: each jump once
++	uint32_t last_pc = 0;
+ 	uint64_t dbg_at = 0;                         // GBA_DBGREAD=addr: read it over the debug bus at each frame end
+ 	std::map<uint32_t, uint64_t> pcs;            // --pcs: where the CPU spends its time
+ 	bool want_pcs = getenv("GBA_PCS") != nullptr;
+@@ -112,6 +120,17 @@ int main(int argc, char **argv)
+ 	while (frame < frames && !Verilated::gotFinish())
+ 	{
+ 		if (want_pcs && (cycles & pcs_mask) == 0) pcs[top->cpu_pc & ~3u]++;
++		if (pctrace_left)                        // GBA_PCTRACE=n: the first n PC jumps from the game's start on
++		{
++			uint32_t pc = top->cpu_pc;
++			if (pc >= 0x08000000u) pctrace_on = true;
++			if (pctrace_on && frame >= pctrace_frame && pc != last_pc && pc != last_pc + 4 && pc != last_pc + 2 && (pctrace_all || seen_jumps.insert(((uint64_t)last_pc << 32) | pc).second))
++			{
++				fprintf(stderr, "jump %08x -> %08x (frame %d)\n", last_pc, pc, frame);
++				pctrace_left--;
++			}
++			last_pc = pc;
++		}
+ 		if (cycles == 100) top->gba_on = 1;
+ 		top->clk = 1;
+ 		top->eval();
+@@ -128,11 +147,12 @@ int main(int argc, char **argv)
+ 				frame++;
+ 				// scripted keys, one change per frame from keyseed (same for runs compared)
+ 				uint64_t r = xs(ks);
+-				if ((r & 7) == 0)
++				if (keyseed && (r & 7) == 0)
+ 				{
+ 					uint32_t k = (uint32_t)((r >> 8) & 0x3FF);
+ 					if ((k & 0x0C0) == 0x0C0) k &= ~0x080u;   // not Up and Down together
+ 					if ((k & 0x030) == 0x030) k &= ~0x020u;   // nor Left and Right
++					if ((k & 0x00F) == 0x00F) k &= ~0x004u;   // nor A+B+Select+Start (soft reset)
+ 					top->keys = k;
+ 				}
+ 			}
+diff --git a/npsim/ghdl/build.sh b/npsim/ghdl/build.sh
+new file mode 100755
+index 0000000..86f5f85
+--- /dev/null
++++ b/npsim/ghdl/build.sh
+@@ -0,0 +1,23 @@
++#!/usr/bin/env bash
++# Builds npsim/ghdl/tb_gba with GHDL (LLVM backend, Docker image hdlc/ghdl:llvm)
++# from the same prepared VHDL as the Verilator bench (npsim/build/vhdl).
++#   npsim/ghdl/build.sh
++#   GBA_ROM=game.gba GBA_FRAMES=120 GBA_SEED=1 GBA_LAT=20 npsim/ghdl/run.sh
++set -eu
++cd "$(dirname "$0")"
++here=$PWD
++npsim=$(dirname "$here")
++mkdir -p work
++files=$(sed 's|^[a-z]*:||' ../vhdl_files.txt)
++libs=$(sed -n 's|^\([a-z]*\):.*|\1|p' ../vhdl_files.txt | sort -u)
++script="set -e; cd /src/build/vhdl;"
++for e in $(cat ../vhdl_files.txt); do
++	lib=work; f=$e
++	case $e in *:*) lib=${e%%:*}; f=${e#*:};; esac
++	script="$script ghdl -a --std=08 -frelaxed -fsynopsys -O2 --workdir=/src/ghdl/work -P/src/ghdl/work --work=$lib $f;"
++done
++script="$script cd /src/ghdl; ghdl -a --std=08 -frelaxed -fsynopsys -O2 --workdir=work -Pwork tb_gba.vhd;"
++script="$script gcc -O2 -c gba_ghdl.c -o work/gba_ghdl.o;"
++script="$script ghdl -e --std=08 -frelaxed -fsynopsys -O2 --workdir=work -Pwork -Wl,work/gba_ghdl.o -o work/tb_gba tb_gba;"
++docker run --rm -u $(id -u):$(id -g) -v "$npsim":/src -w /src hdlc/ghdl:llvm sh -c "$script"
++echo "built $here/work/tb_gba"
+diff --git a/npsim/ghdl/gba_ghdl.c b/npsim/ghdl/gba_ghdl.c
+new file mode 100644
+index 0000000..f1b408e
+--- /dev/null
++++ b/npsim/ghdl/gba_ghdl.c
+@@ -0,0 +1,89 @@
++// C side of npsim/ghdl/tb_gba.vhd (VHPIDIRECT). Simulation only.
++// Environment: GBA_ROM (path), GBA_FRAMES (default 60), GBA_SEED (latency
++// seed, default 1), GBA_LAT (max latency in clocks, default 0), GBA_KEYSEED
++// (scripted keys, 0 = none, default 7). Prints one line per frame:
++//   frame <n> crc <crc32 of the picture>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++static uint32_t *mem;                 // 64 MB, DWORD addressed
++#define MEM_DW (1u << 24)
++static uint64_t lat_state[2], key_state;
++static int lat_max, frames_max = 60, frame;
++static uint32_t crc = 0xFFFFFFFFu, crc_table[256], keys_now;
++static int rom_size, has_flash1m, init_done;
++static uint64_t keyseed = 7;
++static time_t t0;
++
++static uint64_t xs(uint64_t *s) { *s ^= *s << 13; *s ^= *s >> 7; *s ^= *s << 17; return *s; }
++
++static void init(void)
++{
++	if (init_done) return;
++	init_done = 1;
++	mem = calloc(MEM_DW, 4);
++	const char *rom = getenv("GBA_ROM");
++	if (getenv("GBA_FRAMES")) frames_max = atoi(getenv("GBA_FRAMES"));
++	if (getenv("GBA_LAT")) lat_max = atoi(getenv("GBA_LAT"));
++	uint64_t seed = getenv("GBA_SEED") ? strtoull(getenv("GBA_SEED"), 0, 0) : 1;
++	if (getenv("GBA_KEYSEED")) keyseed = strtoull(getenv("GBA_KEYSEED"), 0, 0);
++	lat_state[0] = seed * 0x9E3779B97F4A7C15ull + 1;
++	lat_state[1] = seed * 0xC2B2AE3D27D4EB4Full + 3;
++	key_state = keyseed * 0x2545F4914F6CDD1Dull + 5;
++	for (uint32_t i = 0; i < 256; i++)
++	{
++		uint32_t c = i;
++		for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
++		crc_table[i] = c;
++	}
++	FILE *f = rom ? fopen(rom, "rb") : 0;
++	if (!f) { fprintf(stderr, "GBA_ROM not readable\n"); exit(1); }
++	static uint8_t data[32u << 20];
++	rom_size = (int)fread(data, 1, sizeof(data), f);
++	fclose(f);
++	const uint32_t base = 65536 + 131072;  // Softmap_GBA_Gamerom_ADDR (DWORDs)
++	for (int i = 0; i < rom_size; i += 4)
++	{
++		uint32_t w = 0;
++		for (int b = 0; b < 4 && i + b < rom_size; b++) w |= (uint32_t)data[i + b] << (8 * b);
++		mem[base + i / 4] = w;
++	}
++	for (int i = 0; i + 9 <= rom_size; i++) if (!memcmp(data + i, "FLASH1M_V", 9)) { has_flash1m = 1; break; }
++	t0 = time(0);
++}
++
++int max_pak_addr(void) { init(); return (rom_size - 1) >> 2; }
++int flash_1m(void) { init(); return has_flash1m; }
++int mem_read(int addr) { init(); return (int)mem[(uint32_t)addr & (MEM_DW - 1)]; }
++void mem_write(int addr, int data) { init(); mem[(uint32_t)addr & (MEM_DW - 1)] = (uint32_t)data; }
++int lat_rand(int port) { init(); return lat_max ? (int)(xs(&lat_state[port & 1]) % (uint64_t)(lat_max + 1)) : 0; }
++int keys(void) { return (int)keys_now; }
++
++int pixel(int addr, int data)
++{
++	init();
++	for (int b = 0; b < 3; b++) crc = crc_table[(crc ^ ((uint32_t)data >> (8 * b))) & 0xFF] ^ (crc >> 8);
++	if (addr != 38399) return 0;
++	printf("frame %d crc %08x\n", frame, ~crc);
++	fflush(stdout);
++	crc = 0xFFFFFFFFu;
++	frame++;
++	uint64_t r = xs(&key_state);
++	if (keyseed && (r & 7) == 0)
++	{
++		uint32_t k = (uint32_t)((r >> 8) & 0x3FF);
++		if ((k & 0x0C0) == 0x0C0) k &= ~0x080u;   // not Up and Down together
++		if ((k & 0x030) == 0x030) k &= ~0x020u;   // nor Left and Right
++		if ((k & 0x00F) == 0x00F) k &= ~0x004u;   // nor A+B+Select+Start (soft reset)
++		keys_now = k;
++	}
++	if (frame >= frames_max)
++	{
++		fprintf(stderr, "%d frames in %ld s\n", frame, (long)(time(0) - t0));
++		return 1;
++	}
++	return 0;
++}
+diff --git a/npsim/ghdl/run.sh b/npsim/ghdl/run.sh
+new file mode 100755
+index 0000000..c82887b
+--- /dev/null
++++ b/npsim/ghdl/run.sh
+@@ -0,0 +1,11 @@
++#!/usr/bin/env bash
++# Runs npsim/ghdl/work/tb_gba (Docker, the image's runtime). ROM path relative to
++# the netplay workspace or absolute under it. Env: GBA_ROM GBA_FRAMES GBA_SEED GBA_LAT GBA_KEYSEED
++set -eu
++cd "$(dirname "$0")"
++ws=$(cd ../../.. && pwd)
++rom=$(realpath "${GBA_ROM:?GBA_ROM}")
++docker run --rm -u $(id -u):$(id -g) -v "$ws":"$ws" -w "$PWD" \
++  -e GBA_ROM="$rom" -e GBA_FRAMES="${GBA_FRAMES:-60}" -e GBA_SEED="${GBA_SEED:-1}" \
++  -e GBA_LAT="${GBA_LAT:-0}" -e GBA_KEYSEED="${GBA_KEYSEED:-7}" \
++  hdlc/ghdl:llvm ./work/tb_gba --ieee-asserts=disable-at-0 --unbuffered 2>&1 | grep -v "^ *$"
+diff --git a/npsim/ghdl/tb_gba.vhd b/npsim/ghdl/tb_gba.vhd
+new file mode 100644
+index 0000000..dc67f06
+--- /dev/null
++++ b/npsim/ghdl/tb_gba.vhd
+@@ -0,0 +1,293 @@
++-- Determinism test bench of the GBA core in GHDL's own simulator
++-- (research/gba2p-plan.md, phase 0). Simulation only. Same test as
++-- npsim/sim_top.sv, but VHDL semantics exactly (resolved signals, the
++-- core's tristate register bus), so no translation can change behaviour.
++-- One gba_top with both memory ports on one flat memory in C (VHPIDIRECT,
++-- gba_ghdl.c); every request is answered after a random number of clocks.
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++
++package tb_c is
++   function mem_read(addr : integer) return integer;
++   attribute foreign of mem_read : function is "VHPIDIRECT mem_read";
++   procedure mem_write(addr : integer; data : integer);
++   attribute foreign of mem_write : procedure is "VHPIDIRECT mem_write";
++   function lat_rand(port_n : integer) return integer;
++   attribute foreign of lat_rand : function is "VHPIDIRECT lat_rand";
++   -- one pixel; returns 1 when the run is over
++   function pixel(addr : integer; data : integer) return integer;
++   attribute foreign of pixel : function is "VHPIDIRECT pixel";
++   function keys return integer;
++   attribute foreign of keys : function is "VHPIDIRECT keys";
++   function max_pak_addr return integer;
++   attribute foreign of max_pak_addr : function is "VHPIDIRECT max_pak_addr";
++   function flash_1m return integer;
++   attribute foreign of flash_1m : function is "VHPIDIRECT flash_1m";
++end package;
++
++package body tb_c is
++   function mem_read(addr : integer) return integer is begin assert false severity failure; return 0; end;
++   procedure mem_write(addr : integer; data : integer) is begin assert false severity failure; end;
++   function lat_rand(port_n : integer) return integer is begin assert false severity failure; return 0; end;
++   function pixel(addr : integer; data : integer) return integer is begin assert false severity failure; return 0; end;
++   function keys return integer is begin assert false severity failure; return 0; end;
++   function max_pak_addr return integer is begin assert false severity failure; return 0; end;
++   function flash_1m return integer is begin assert false severity failure; return 0; end;
++end package body;
++
++library ieee;
++use ieee.std_logic_1164.all;
++use ieee.numeric_std.all;
++use std.env.all;
++use work.tb_c.all;
++
++entity tb_gba is
++end entity;
++
++architecture sim of tb_gba is
++   signal clk        : std_logic := '0';
++   signal gba_on     : std_logic := '0';
++   signal key        : std_logic_vector(9 downto 0) := (others => '0');
++   signal maxpak     : std_logic_vector(24 downto 0) := (others => '0');
++   signal fl1m       : std_logic := '0';
++
++   signal rom_req    : std_logic;
++   signal rom_addr   : std_logic_vector(24 downto 0);
++   signal rom_done   : std_logic := '0';
++   signal rom_d1     : std_logic_vector(31 downto 0) := (others => '0');
++   signal rom_d2     : std_logic_vector(31 downto 0) := (others => '0');
++
++   signal bus_din    : std_logic_vector(31 downto 0);
++   signal bus_dout   : std_logic_vector(31 downto 0) := (others => '0');
++   signal bus_adr    : std_logic_vector(25 downto 0);
++   signal bus_rnw    : std_logic;
++   signal bus_ena    : std_logic;
++   signal bus_done   : std_logic := '0';
++
++   signal save_ena   : std_logic;
++   signal save_done  : std_logic := '0';
++   signal fb_req     : std_logic;
++   signal fb_done    : std_logic := '0';
++
++   signal pixel_addr : integer range 0 to 38399;
++   signal pixel_data : std_logic_vector(17 downto 0);
++   signal pixel_we   : std_logic;
++
++   function to_int(v : std_logic_vector) return integer is
++   begin
++      return to_integer(signed(v));
++   end function;
++   function to_slv32(i : integer) return std_logic_vector is
++   begin
++      return std_logic_vector(to_signed(i, 32));
++   end function;
++begin
++
++   clk <= not clk after 5 ns;
++
++   process
++   begin
++      maxpak <= std_logic_vector(to_unsigned(max_pak_addr, 25));
++      fl1m   <= '1' when flash_1m /= 0 else '0';
++      wait for 1 us;
++      wait until rising_edge(clk);
++      gba_on <= '1';
++      wait;
++   end process;
++
++   -- ROM port
++   process (clk)
++      variable busy : boolean := false;
++      variable w    : integer := 0;
++      variable a    : integer := 0;
++   begin
++      if rising_edge(clk) then
++         rom_done <= '0';
++         if rom_req = '1' then
++            a    := to_integer(unsigned(rom_addr));
++            w    := lat_rand(0);
++            busy := true;
++         elsif busy then
++            if w /= 0 then
++               w := w - 1;
++            else
++               rom_d1   <= to_slv32(mem_read(a));
++               rom_d2   <= to_slv32(mem_read(a + 1));
++               rom_done <= '1';
++               busy     := false;
++            end if;
++         end if;
++      end if;
++   end process;
++
++   -- bus port (WRAM large, SRAM/Flash/EEPROM)
++   process (clk)
++      variable busy : boolean := false;
++      variable w    : integer := 0;
++      variable a    : integer := 0;
++      variable d    : integer := 0;
++      variable r    : std_logic := '1';
++   begin
++      if rising_edge(clk) then
++         bus_done <= '0';
++         if bus_ena = '1' then
++            a    := to_integer(unsigned(bus_adr));
++            d    := to_int(bus_din);
++            r    := bus_rnw;
++            w    := lat_rand(1);
++            busy := true;
++         elsif busy then
++            if w /= 0 then
++               w := w - 1;
++            else
++               if r = '1' then bus_dout <= to_slv32(mem_read(a));
++               else mem_write(a, d); end if;
++               bus_done <= '1';
++               busy     := false;
++            end if;
++         end if;
++      end if;
++   end process;
++
++   -- savestate port and large image: unused, answered at once
++   process (clk)
++   begin
++      if rising_edge(clk) then
++         save_done <= save_ena;
++         fb_done   <= fb_req;
++      end if;
++   end process;
++
++   -- picture: CRC per frame in C; keys change once per frame
++   process (clk)
++   begin
++      if rising_edge(clk) then
++         if pixel_we = '1' then
++            if pixel(pixel_addr, to_integer(unsigned(pixel_data))) /= 0 then
++               finish;
++            end if;
++            if pixel_addr = 38399 then
++               key <= std_logic_vector(to_unsigned(keys, 10));
++            end if;
++         end if;
++      end if;
++   end process;
++
++   igba : entity work.gba_top
++   generic map (
++      is_simu                  => '0',
++      Softmap_GBA_FLASH_ADDR   => 0,
++      Softmap_GBA_EEPROM_ADDR  => 0,
++      Softmap_GBA_WRam_ADDR    => 131072,
++      Softmap_GBA_Gamerom_ADDR => 65536 + 131072,
++      Softmap_SaveState_ADDR   => 58720256,
++      Softmap_Rewind_ADDR      => 33554432,
++      turbosound               => '1'
++   )
++   port map (
++      clk100                => clk,
++      GBA_on                => gba_on,
++      GBA_lockspeed         => '1',
++      GBA_cputurbo          => '0',
++      GBA_flash_1m          => fl1m,
++      CyclePrecalc          => std_logic_vector(to_unsigned(100, 16)),
++      Underclock            => "00",
++      MaxPakAddr            => maxpak,
++      CyclesMissing         => open,
++      CyclesVsyncSpeed      => open,
++      SramFlashEnable       => '1',
++      memory_remap          => '0',
++      matrix_mapper         => '0',
++      increaseSSHeaderCount => '0',
++      save_state            => '0',
++      load_state            => '0',
++      interframe_blend      => "00",
++      maxpixels             => '0',
++      shade_mode            => "000",
++      hdmode2x_bg           => '0',
++      hdmode2x_obj          => '0',
++      specialmodule         => '0',
++      solar_in              => "000",
++      tilt                  => '0',
++      rewind_on             => '0',
++      rewind_active         => '0',
++      savestate_number      => 0,
++      RTC_timestampNew      => '0',
++      RTC_timestampIn       => (others => '0'),
++      RTC_timestampSaved    => (others => '0'),
++      RTC_savedtimeIn       => (others => '0'),
++      RTC_saveLoaded        => '0',
++      RTC_timestampOut      => open,
++      RTC_savedtimeOut      => open,
++      RTC_inuse             => open,
++      cheat_clear           => '0',
++      cheats_enabled        => '0',
++      cheat_on              => '0',
++      cheat_in              => (others => '0'),
++      cheats_active         => open,
++      sdram_read_ena        => rom_req,
++      sdram_read_done       => rom_done,
++      sdram_read_addr       => rom_addr,
++      sdram_read_data       => rom_d1,
++      sdram_second_dword    => rom_d2,
++      bus_out_Din           => bus_din,
++      bus_out_Dout          => bus_dout,
++      bus_out_Adr           => bus_adr,
++      bus_out_rnw           => bus_rnw,
++      bus_out_ena           => bus_ena,
++      bus_out_done          => bus_done,
++      SAVE_out_Din          => open,
++      SAVE_out_Dout         => (others => '0'),
++      SAVE_out_Adr          => open,
++      SAVE_out_rnw          => open,
++      SAVE_out_ena          => save_ena,
++      SAVE_out_active       => open,
++      SAVE_out_be           => open,
++      SAVE_out_done         => save_done,
++      save_eeprom           => open,
++      save_sram             => open,
++      save_flash            => open,
++      load_done             => open,
++      KeyA                  => key(0),
++      KeyB                  => key(1),
++      KeySelect             => key(2),
++      KeyStart              => key(3),
++      KeyRight              => key(4),
++      KeyLeft               => key(5),
++      KeyUp                 => key(6),
++      KeyDown               => key(7),
++      KeyR                  => key(8),
++      KeyL                  => key(9),
++      AnalogTiltX           => (others => '0'),
++      AnalogTiltY           => (others => '0'),
++      Rumble                => open,
++      GBA_BusAddr           => (others => '0'),
++      GBA_BusRnW            => '1',
++      GBA_BusACC            => "00",
++      GBA_BusWriteData      => (others => '0'),
++      GBA_BusReadData       => open,
++      GBA_Bus_written       => '0',
++      pixel_out_x           => open,
++      pixel_out_y           => open,
++      pixel_out_addr        => pixel_addr,
++      pixel_out_data        => pixel_data,
++      pixel_out_we          => pixel_we,
++      largeimg_out_base     => open,
++      largeimg_out_addr     => open,
++      largeimg_out_data     => open,
++      largeimg_out_req      => fb_req,
++      largeimg_out_done     => fb_done,
++      largeimg_newframe     => '0',
++      largeimg_singlebuf    => '0',
++      sound_out_left        => open,
++      sound_out_right       => open,
++      debug_cpu_pc          => open,
++      debug_cpu_mixed       => open,
++      debug_irq             => open,
++      debug_dma             => open,
++      debug_mem             => open
++   );
++
++end architecture;
+diff --git a/npsim/vhdl_files.txt b/npsim/vhdl_files.txt
+index 468bd62..6d15700 100644
+--- a/npsim/vhdl_files.txt
++++ b/npsim/vhdl_files.txt
+@@ -16,12 +16,12 @@ rtl/gba_bios.vhd
+ rtl/gba_cpu.vhd
+ rtl/gba_dma_module.vhd
+ rtl/gba_dma.vhd
++rtl/gba_gpu_timing.vhd
+ rtl/gba_drawer_merge.vhd
+ rtl/gba_drawer_mode0.vhd
+ rtl/gba_drawer_mode2.vhd
+ rtl/gba_drawer_mode345.vhd
+ rtl/gba_drawer_obj.vhd
+-rtl/gba_gpu_timing.vhd
+ rtl/gba_gpu_drawer.vhd
+ rtl/gba_gpu_colorshade.vhd
+ rtl/gba_gpu.vhd
+-- 
+2.43.0
+

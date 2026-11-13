@@ -1,0 +1,840 @@
+From 1842d9b501066f0c0749d74d7202f846b115431e Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 10 Nov 2026 18:11:19 +0100
+Subject: [PATCH 28/42] netplay: the GBA Wireless Adapter emulated on the HPS
+ (rfu.cpp, ported from gpSP), T3w engine test
+---
+ support/netplay/rfu.cpp           | 509 ++++++++++++++++++++++++++++++
+ support/netplay/rfu.h             |  80 +++++
+ support/netplay/test/Makefile     |   9 +-
+ support/netplay/test/test_rfu.cpp | 183 +++++++++++
+ 4 files changed, 779 insertions(+), 2 deletions(-)
+ create mode 100644 support/netplay/rfu.cpp
+ create mode 100644 support/netplay/rfu.h
+ create mode 100644 support/netplay/test/test_rfu.cpp
+
+diff --git a/support/netplay/rfu.cpp b/support/netplay/rfu.cpp
+new file mode 100644
+index 0000000..c7ba45b
+--- /dev/null
++++ b/support/netplay/rfu.cpp
+@@ -0,0 +1,509 @@
++// rfu.cpp — the GBA Wireless Adapter (RFU), emulated on the HPS (SPEC.md 13.4).
++//
++// Ported from gpSP's rfu.c, Copyright (C) 2023 David Guillen Fandos
++// <david@davidgf.net>, GPL-2.0-or-later. Changes: a class instead of globals,
++// time in milliseconds instead of GBA cycles, packets to "peer n" instead of
++// RetroArch netpacket client IDs, and every length and index taken from a
++// packet is checked (packets come from the network; Main runs as root).
++
++#include "rfu.h"
++#include <string.h>
++
++namespace {
++
++// command numbers (afska's names in comments)
++enum : uint8_t {
++	CMD_INIT1 = 0x10,        // Hello
++	CMD_LINKPWR = 0x11,      // SignalLevel
++	CMD_SYSVER = 0x12,       // VersionStatus
++	CMD_SYSSTAT = 0x13,      // SystemStatus
++	CMD_SLOTSTAT = 0x14,     // SlotStatus
++	CMD_CFGSTAT = 0x15,      // ConfigStatus
++	CMD_BCST_DATA = 0x16,    // Broadcast
++	CMD_SYSCFG = 0x17,       // Setup
++	CMD_HOST_START = 0x19,   // StartHost
++	CMD_HOST_ACCEPT = 0x1a,  // PollConnections
++	CMD_HOST_STOP = 0x1b,    // EndHost
++	CMD_BCRD_START = 0x1c,   // BroadcastReadStart
++	CMD_BCRD_FETCH = 0x1d,   // BroadcastReadPoll
++	CMD_BCRD_STOP = 0x1e,    // BroadcastReadEnd
++	CMD_CONNECT = 0x1f,      // Connect
++	CMD_ISCONNECTED = 0x20,  // IsConnectionComplete
++	CMD_CONCOMPL = 0x21,     // FinishConnection
++	CMD_SEND_DATA = 0x24,    // SendData
++	CMD_SEND_DATAW = 0x25,   // SendDataWait
++	CMD_RECV_DATA = 0x26,    // ReceiveData
++	CMD_WAIT = 0x27,         // Wait
++	CMD_DISCONNECT = 0x30,   // DisconnectClient
++	CMD_RTX_WAIT = 0x37,     // RetransmitAndWait
++	CMD_INIT2 = 0x3d,        // Bye
++	// pushed by the adapter while it is clock master
++	EVT_TIMEOUT = 0x27,
++	EVT_DATA = 0x28,
++	EVT_DISC = 0x29,
++};
++
++const uint32_t CONN_INPROGRESS = 0x01000000;
++const uint32_t CONN_FAILED = 0x02000000;
++const uint32_t CONN_COMP_FAIL = 0x01000000;
++
++// network packets (gpSP's RFU1)
++const uint32_t NET_HEADER = 0x52465531;   // "RFU1"
++enum : uint32_t {
++	NET_BROADCAST = 0, NET_CONNECT_REQ = 1, NET_CONNECT_ACK = 2, NET_CONNECT_NACK = 3,
++	NET_DISCONNECT = 4, NET_HOST_SEND = 5, NET_CLIENT_SEND = 6, NET_CLIENT_ACK = 7,
++};
++
++const unsigned BCST_ANNOUNCE_FRAMES = 30;     // broadcast twice per second
++const unsigned CLIENT_TIMEOUT_FRAMES = 240;   // host drops a silent client after 4 s
++
++uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
++uint32_t le32(const uint8_t *p) { return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
++void put_be32(uint8_t *p, uint32_t v) { p[0] = v >> 24; p[1] = v >> 16; p[2] = v >> 8; p[3] = v; }
++
++}
++
++Rfu::Rfu(Send send, uint32_t seed) : send_(send), rng_(seed ? seed : 1)
++{
++	reset();
++}
++
++uint32_t Rfu::rand()
++{
++	rng_ ^= rng_ << 13;
++	rng_ ^= rng_ >> 17;
++	rng_ ^= rng_ << 5;
++	return rng_;
++}
++
++uint16_t Rfu::new_devid()
++{
++	for (;;)
++	{
++		uint16_t n = (uint16_t)rand();
++		if (n) return n;
++	}
++}
++
++void Rfu::reset()
++{
++	state_ = IDLE;
++	waiting_ = false;
++	timeout_frames_ = 32;
++	rtx_max_ = 4;
++	memset(&tx_, 0, sizeof(tx_));
++	memset(&host_, 0, sizeof(host_));
++	memset(&client_, 0, sizeof(client_));
++	memset(peer_bcst_, 0, sizeof(peer_bcst_));
++}
++
++void Rfu::send_cmd(int peer, uint32_t ptype, uint32_t h)
++{
++	uint8_t pkt[16] = {};
++	put_be32(pkt, NET_HEADER);
++	put_be32(pkt + 4, ptype);
++	put_be32(pkt + 8, h);
++	send_(peer, pkt, sizeof(pkt));
++}
++
++void Rfu::send_bcast(uint32_t ptype, uint32_t h, const uint32_t *pload)
++{
++	uint8_t pkt[36];
++	put_be32(pkt, NET_HEADER);
++	put_be32(pkt + 4, ptype);
++	put_be32(pkt + 8, h);
++	for (int i = 0; i < 6; i++) put_be32(pkt + 12 + 4 * i, pload[i]);
++	send_(-1, pkt, sizeof(pkt));
++}
++
++void Rfu::send_data(int peer, uint32_t ptype, uint32_t h, const uint32_t *pload, unsigned plen)
++{
++	uint8_t pkt[104] = {};
++	put_be32(pkt, NET_HEADER);
++	put_be32(pkt + 4, ptype);
++	put_be32(pkt + 8, h);
++	if (plen > 92) plen = 92;
++	// data goes little endian over the air
++	for (unsigned i = 0; i < plen; i++) pkt[12 + i] = (uint8_t)(pload[i / 4] >> (8 * (i & 3)));
++	send_(peer, pkt, sizeof(pkt));
++}
++
++bool Rfu::data_avail() const
++{
++	if (state_ == CLIENT) return client_.pkts[0].len != 0;
++	if (state_ == HOST)
++		for (int i = 0; i < 4; i++)
++			if (host_.clients[i].devid && host_.clients[i].pkts[0].len) return true;
++	return false;
++}
++
++int Rfu::command(uint8_t cmd, const uint32_t *data, int len, uint32_t *out)
++{
++	if (len < 0) len = 0;
++	if (len > MAX_WORDS) len = MAX_WORDS;
++	if (len) memcpy(buf_, data, len * sizeof(uint32_t));
++	int cnt = 0;
++
++	switch (cmd)
++	{
++	case CMD_INIT1:
++	case CMD_INIT2:
++	case CMD_WAIT:              // the FPGA turns the clock around after the ack
++	case CMD_BCRD_START:
++		return 0;
++
++	case CMD_SYSCFG:
++		if (len < 1) return 0;
++		timeout_frames_ = (uint8_t)buf_[0];
++		rtx_max_ = (uint8_t)(buf_[0] >> 8);
++		return 0;
++
++	case CMD_SYSVER:
++		out[0] = 0x00830117;
++		return 1;
++
++	case CMD_SYSSTAT:
++		if (state_ == HOST) out[0] = (1u << 24) | host_.devid;
++		else if (state_ == CLIENT) out[0] = (5u << 24) | ((1u << client_.clnum) << 16) | client_.devid;
++		else out[0] = 0;
++		return 1;
++
++	case CMD_SLOTSTAT:
++		if (state_ != HOST) return 0;
++		out[cnt++] = 0;
++		for (int i = 0; i < 4; i++)
++			if (host_.clients[i].devid)
++			{
++				out[0]++;
++				out[cnt++] = host_.clients[i].devid | (uint32_t)i << 16;
++			}
++		return cnt;
++
++	case CMD_CFGSTAT:
++		return 0;
++
++	case CMD_LINKPWR:
++		if (state_ == HOST)
++			out[0] = (host_.clients[0].devid ? 0x000000ffu : 0) | (host_.clients[1].devid ? 0x0000ff00u : 0) |
++			         (host_.clients[2].devid ? 0x00ff0000u : 0) | (host_.clients[3].devid ? 0xff000000u : 0);
++		else out[0] = state_ == CLIENT ? 0xffffffffu : 0;
++		return 1;
++
++	case CMD_BCRD_FETCH:
++	case CMD_BCRD_STOP:
++	{
++		// up to four broadcasting peers, starting at a random one (as gpSP)
++		int first = (int)(rand() % MAX_PEERS);
++		for (int j = 0; j < MAX_PEERS && cnt < 4 * 7; j++)
++		{
++			const Bcst &b = peer_bcst_[(first + j) % MAX_PEERS];
++			if (!b.valid) continue;
++			out[cnt++] = b.devid;
++			memcpy(&out[cnt], b.data, sizeof(b.data));
++			cnt += 6;
++		}
++		return cnt;
++	}
++
++	case CMD_BCST_DATA:
++		if (len == 6) memcpy(host_.bdata, buf_, sizeof(host_.bdata));
++		return 0;
++
++	case CMD_HOST_START:
++		if (state_ == CLIENT) return -1;
++		if (state_ == IDLE)
++		{
++			host_.devid = new_devid();
++			memset(host_.clients, 0, sizeof(host_.clients));
++			state_ = HOST;
++		}
++		host_.tx_ttl = 0xff;   // broadcast on the next frame
++		return 0;
++
++	case CMD_HOST_STOP:
++		if (state_ == IDLE) return -1;
++		if (state_ == HOST)
++		{
++			for (int i = 0; i < 4; i++)
++				if (host_.clients[i].devid) return 0;   // keeps hosting its clients
++			state_ = IDLE;
++		}
++		return 0;
++
++	case CMD_HOST_ACCEPT:
++		if (state_ == IDLE) return -1;
++		for (int i = 0; i < 4; i++)
++			if (host_.clients[i].devid) out[cnt++] = host_.clients[i].devid | (uint32_t)i << 16;
++		return cnt;
++
++	case CMD_CONNECT:
++		if (state_ == HOST) return -1;
++		if (len >= 1)
++		{
++			uint16_t reqid = (uint16_t)buf_[0];
++			for (int i = 0; i < MAX_PEERS; i++)
++				if (peer_bcst_[i].valid && peer_bcst_[i].devid == reqid)
++				{
++					send_cmd(i, NET_CONNECT_REQ, reqid);
++					state_ = CONNECTING;
++					return 0;
++				}
++		}
++		return 0;   // unknown ID: IsConnectionComplete fails later
++
++	case CMD_ISCONNECTED:
++		if (state_ == HOST) return -1;
++		if (state_ == CONNECTING) out[0] = CONN_INPROGRESS;
++		else if (state_ == IDLE) out[0] = CONN_FAILED;
++		else out[0] = client_.devid | (uint32_t)client_.clnum << 16;
++		return 1;
++
++	case CMD_CONCOMPL:
++		if (state_ == HOST) return -1;
++		if (state_ == CLIENT) out[0] = client_.devid | (uint32_t)client_.clnum << 16;
++		else
++		{
++			out[0] = CONN_COMP_FAIL;
++			state_ = IDLE;
++		}
++		return 1;
++
++	case CMD_SEND_DATAW:
++	case CMD_SEND_DATA:
++		if (!len) return 0;
++		if (state_ == HOST) tx_.blen = buf_[0] & 0x7f;
++		else if (state_ == CLIENT) tx_.blen = (buf_[0] >> (8 + client_.clnum * 5)) & 0x1f;
++		if (state_ == HOST || state_ == CLIENT)
++		{
++			int words = len - 1;
++			if (words > 23) words = 23;
++			memcpy(tx_.buf, &buf_[1], words * sizeof(uint32_t));
++			if (tx_.blen > words * 4) tx_.blen = (uint8_t)(words * 4);   // never more than the game gave
++		}
++		/* fallthrough */
++	case CMD_RTX_WAIT:
++		if (state_ == HOST)
++		{
++			if (tx_.blen <= 90)
++				for (int i = 0; i < 4; i++)
++					if (host_.clients[i].devid)
++						send_data(host_.clients[i].peer, NET_HOST_SEND, tx_.blen, tx_.buf, tx_.blen);
++		}
++		else if (state_ == CLIENT)
++		{
++			if (tx_.blen <= 16)
++				send_data(client_.host_peer, NET_CLIENT_SEND,
++				          (uint32_t)tx_.blen << 24 | (uint32_t)client_.clnum << 16 | client_.devid, tx_.buf, tx_.blen);
++		}
++		else return -1;   // neither connected nor hosting
++		return 0;
++
++	case CMD_RECV_DATA:
++		if (state_ == HOST)
++		{
++			uint8_t tmp[16 * 4] = {};
++			unsigned bytes = 0;
++			out[cnt++] = 0;   // byte counts per client as a bitfield
++			for (int i = 0; i < 4; i++)
++			{
++				Client &c = host_.clients[i];
++				uint32_t dlen = c.pkts[0].len < 16 ? c.pkts[0].len : 16;
++				if (!c.devid || !dlen) continue;
++				memcpy(&tmp[bytes], c.pkts[0].data, dlen);
++				bytes += dlen;
++				out[0] |= dlen << (8 + i * 5);
++				memmove(&c.pkts[0], &c.pkts[1], 3 * sizeof(c.pkts[0]));
++				c.pkts[3].len = 0;
++			}
++			for (unsigned i = 0; i < (bytes + 3) / 4; i++) out[cnt++] = le32(&tmp[i * 4]);
++			return cnt;
++		}
++		if (state_ == CLIENT)
++		{
++			uint32_t dlen = client_.pkts[0].len;
++			out[cnt++] = dlen;
++			for (uint32_t j = 0; j < (dlen + 3) / 4; j++) out[cnt++] = le32(&client_.pkts[0].data[j * 4]);
++			memmove(&client_.pkts[0], &client_.pkts[1], 3 * sizeof(client_.pkts[0]));
++			client_.pkts[3].len = 0;
++			return cnt;
++		}
++		return 0;
++
++	case CMD_DISCONNECT:
++		if (state_ == CLIENT)
++		{
++			send_cmd(client_.host_peer, NET_DISCONNECT, client_.devid | (uint32_t)client_.clnum << 16);
++			state_ = IDLE;
++		}
++		else if (state_ == HOST && len >= 1)
++		{
++			for (int i = 0; i < 4; i++)
++				if (buf_[0] & (1u << i) && host_.clients[i].devid)
++				{
++					send_cmd(host_.clients[i].peer, NET_DISCONNECT, host_.clients[i].devid | (uint32_t)i << 16);
++					memset(&host_.clients[i], 0, sizeof(host_.clients[i]));
++				}
++		}
++		return 0;
++
++	default:
++		return 0;   // unknown commands are acked (as gpSP)
++	}
++}
++
++void Rfu::begin_wait(uint32_t now_ms)
++{
++	wait_start_ = now_ms;
++	waiting_ = true;
++}
++
++int Rfu::wait_poll(uint32_t now_ms, uint32_t *out)
++{
++	if (!waiting_) return 0;
++	uint32_t waited = now_ms - wait_start_;
++	// timeouts as gpSP: Setup's timeout in frames (0: none), and for a host
++	// the retransmissions in adapter "frames" of 1/6 of a GBA frame
++	bool timed_out = timeout_frames_ && waited >= (uint32_t)timeout_frames_ * 1000 / 60;
++	bool rtx_out = waited >= (uint32_t)rtx_max_ * 1000 / 360;
++	int n = 0;
++	if (state_ == IDLE)
++	{
++		out[n++] = 0x99660000 | 1 << 8 | EVT_DISC;
++		out[n++] = 0xF;
++	}
++	else if (data_avail()) out[n++] = 0x99660000 | EVT_DATA;
++	else if (state_ == HOST && rtx_out)
++	{
++		out[n++] = 0x99660000 | 1 << 8 | EVT_DATA;   // clients that did not receive
++		out[n++] = 0x00000F0F;
++	}
++	else if (timed_out) out[n++] = 0x99660000 | EVT_TIMEOUT;
++	else return 0;
++	out[n++] = 0x80000000;
++	waiting_ = false;
++	return n;
++}
++
++void Rfu::frame()
++{
++	for (int i = 0; i < MAX_PEERS; i++)
++		if (peer_bcst_[i].valid && --peer_bcst_[i].ttl == 0) peer_bcst_[i].valid = false;
++	if (state_ != HOST) return;
++	if (host_.tx_ttl++ >= BCST_ANNOUNCE_FRAMES)
++	{
++		host_.tx_ttl = 0;
++		send_bcast(NET_BROADCAST, host_.devid, host_.bdata);
++	}
++	for (int i = 0; i < 4; i++)
++		if (host_.clients[i].devid && ++host_.clients[i].ttl >= CLIENT_TIMEOUT_FRAMES)
++			memset(&host_.clients[i], 0, sizeof(host_.clients[i]));
++}
++
++void Rfu::receive(int peer, const uint8_t *buf, size_t len)
++{
++	if (peer < 0 || peer >= MAX_PEERS || len < 12 || be32(buf) != NET_HEADER) return;
++	uint32_t ptype = be32(buf + 4);
++	uint32_t h = be32(buf + 8);
++	const uint8_t *payl = buf + 12;
++	size_t plen = len - 12;
++
++	switch (ptype)
++	{
++	case NET_BROADCAST:
++		if (plen < 24) return;
++		peer_bcst_[peer].devid = (uint16_t)h;
++		peer_bcst_[peer].valid = true;
++		peer_bcst_[peer].ttl = 0xff;
++		for (int j = 0; j < 6; j++) peer_bcst_[peer].data[j] = be32(payl + 4 * j);
++		break;
++
++	case NET_CONNECT_REQ:
++		if (state_ != HOST)
++		{
++			send_cmd(peer, NET_CONNECT_NACK, 0);
++			return;
++		}
++		for (int i = 0; i < 4; i++)
++			if (host_.clients[i].devid && host_.clients[i].peer == peer) return;   // already in
++		for (int i = 0; i < 4; i++)
++			if (!host_.clients[i].devid)
++			{
++				memset(&host_.clients[i], 0, sizeof(host_.clients[i]));
++				host_.clients[i].devid = new_devid();
++				host_.clients[i].peer = peer;
++				send_cmd(peer, NET_CONNECT_ACK, host_.clients[i].devid | (uint32_t)i << 16);
++				return;
++			}
++		send_cmd(peer, NET_CONNECT_NACK, 0);
++		break;
++
++	case NET_CONNECT_ACK:
++		if (state_ != CONNECTING) return;
++		memset(&client_, 0, sizeof(client_));
++		client_.devid = (uint16_t)h;
++		client_.clnum = (h >> 16) & 3;
++		client_.host_peer = peer;
++		state_ = CLIENT;
++		break;
++
++	case NET_CONNECT_NACK:
++		if (state_ == CONNECTING) state_ = IDLE;
++		break;
++
++	case NET_DISCONNECT:
++		if (state_ == HOST)
++		{
++			uint32_t clnum = (h >> 16) & 3;
++			if (host_.clients[clnum].devid == (uint16_t)h && host_.clients[clnum].peer == peer)
++				memset(&host_.clients[clnum], 0, sizeof(host_.clients[clnum]));
++		}
++		else if (state_ == CLIENT && peer == client_.host_peer)
++		{
++			memset(&client_, 0, sizeof(client_));
++			state_ = IDLE;
++		}
++		break;
++
++	case NET_HOST_SEND:
++		if (state_ != CLIENT || peer != client_.host_peer) return;
++		{
++			uint32_t blen = h & 0x7f;
++			if (blen > plen || blen > sizeof(client_.pkts[0].data)) return;
++			send_cmd(peer, NET_CLIENT_ACK, client_.devid | (uint32_t)client_.clnum << 16);
++			for (int i = 0; i < 4; i++)
++				if (!client_.pkts[i].len)
++				{
++					memcpy(client_.pkts[i].data, payl, blen);
++					client_.pkts[i].len = (uint16_t)blen;
++					return;
++				}
++		}
++		break;
++
++	case NET_CLIENT_SEND:
++		if (state_ != HOST) return;
++		{
++			uint16_t devid = (uint16_t)h;
++			uint32_t clid = (h >> 16) & 3, blen = h >> 24;
++			Client &c = host_.clients[clid];
++			if (c.devid != devid || c.peer != peer || blen > 16 || blen > plen) return;
++			c.ttl = 0;
++			for (int i = 0; i < 4; i++)
++				if (!c.pkts[i].len)
++				{
++					memcpy(c.pkts[i].data, payl, blen);
++					c.pkts[i].len = blen;
++					return;
++				}
++		}
++		break;
++
++	case NET_CLIENT_ACK:
++		if (state_ != HOST) return;
++		{
++			uint32_t clid = (h >> 16) & 3;
++			if (host_.clients[clid].devid == (uint16_t)h && host_.clients[clid].peer == peer) host_.clients[clid].ttl = 0;
++		}
++		break;
++	}
++}
+diff --git a/support/netplay/rfu.h b/support/netplay/rfu.h
+new file mode 100644
+index 0000000..191ab27
+--- /dev/null
++++ b/support/netplay/rfu.h
+@@ -0,0 +1,80 @@
++// rfu.h — the GBA Wireless Adapter (RFU), emulated on the HPS (SPEC.md 13.4).
++//
++// Ported from gpSP's rfu.c (Copyright (C) 2023 David Guillen Fandos,
++// GPL-2.0-or-later); the protocol as documented by afska and davidgfnet in
++// gba-link-connection (docs/wireless_adapter.md). The packets between adapters
++// are gpSP's (RFU1), so a later bridge to RetroArch can carry them unchanged.
++//
++// The core collects a whole command (0x9966LLCC + LL words) and asks once per
++// command; the NINTENDO handshake and the word streaming stay in the FPGA.
++// Not thread-safe: one thread (the netplay thread) owns an Rfu.
++
++#ifndef RFU_H
++#define RFU_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include <functional>
++
++class Rfu
++{
++public:
++	static const int MAX_PEERS = 4;           // other players this adapter can see
++	static const int MAX_WORDS = 255;         // longest answer
++
++	// peer: 0..MAX_PEERS-1, or -1 for every peer (broadcast)
++	using Send = std::function<void(int peer, const uint8_t *buf, size_t len)>;
++
++	Rfu(Send send, uint32_t seed);
++
++	void reset();                             // SD pulse, or the core's reset
++
++	// A complete command from the GBA. Returns the number of answer words in
++	// out (the FPGA sends the ack 0x99660080|cmd|n<<8 before them), or a
++	// negative error code (the FPGA sends 0x996601ee and then -result).
++	int command(uint8_t cmd, const uint32_t *data, int len, uint32_t *out);
++
++	// After the ack of Wait, SendDataWait or RetransmitAndWait the adapter is
++	// clock master: call begin_wait(), then wait_poll() until it returns words
++	// to push to the GBA (the event and its words, 0x80000000 last).
++	static bool waits(uint8_t cmd) { return cmd == 0x27 || cmd == 0x25 || cmd == 0x37; }
++	void begin_wait(uint32_t now_ms);
++	int wait_poll(uint32_t now_ms, uint32_t *out);
++
++	void frame();                             // once per GBA frame (TTLs, host broadcast)
++	void receive(int peer, const uint8_t *buf, size_t len);   // a packet from a peer
++
++	// observation (tests, OSD)
++	enum State { IDLE, HOST, CONNECTING, CLIENT };
++	State state() const { return state_; }
++
++private:
++	Send send_;
++	uint32_t rng_;
++	State state_ = IDLE;
++	uint32_t buf_[MAX_WORDS];                 // command data, then answer
++	uint8_t timeout_frames_ = 32, rtx_max_ = 4;
++	uint32_t wait_start_ = 0;
++	bool waiting_ = false;
++
++	struct { uint32_t buf[23]; uint8_t blen; } tx_ {};
++
++	struct Pkt { uint32_t len; uint8_t data[16]; };
++	struct Client { int peer; uint16_t devid, ttl; Pkt pkts[4]; };
++	struct { uint16_t devid; uint8_t tx_ttl; uint32_t bdata[6]; Client clients[4]; } host_ {};
++
++	struct HPkt { uint16_t len; uint8_t data[128]; };
++	struct { uint16_t devid, clnum; int host_peer; HPkt pkts[4]; } client_ {};
++
++	struct Bcst { bool valid; uint8_t ttl; uint16_t devid; uint32_t data[6]; };
++	Bcst peer_bcst_[MAX_PEERS] {};
++
++	uint16_t new_devid();
++	uint32_t rand();
++	bool data_avail() const;
++	void send_cmd(int peer, uint32_t ptype, uint32_t h);
++	void send_bcast(uint32_t ptype, uint32_t h, const uint32_t *pload);
++	void send_data(int peer, uint32_t ptype, uint32_t h, const uint32_t *pload, unsigned plen);
++};
++
++#endif
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index b91eb20..3cced00 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -8,8 +8,9 @@ ENGINE   := ../netplay_proto.cpp ../netplay_session.cpp
+ HDRS     := ../netplay_proto.h ../netplay_session.h fake_fpga.h
+ 
+ .PHONY: test clean
+-test: test_netplay udp_harness
++test: test_netplay test_rfu udp_harness
+ 	./test_netplay
++	./test_rfu
+ 	./run_udp_test.sh
+ 	NP_OSD=1 ./run_udp_test.sh
+ 	NP_SYSTEM=snes ./run_udp_test.sh
+@@ -44,6 +45,10 @@ test: test_netplay udp_harness
+ test_netplay: $(ENGINE) test_netplay.cpp $(HDRS)
+ 	$(CXX) $(CXXFLAGS) -o $@ $(ENGINE) test_netplay.cpp
+ 
++# T3w: the emulated GBA Wireless Adapter (SPEC.md 13.6)
++test_rfu: test_rfu.cpp ../rfu.cpp ../rfu.h
++	$(CXX) $(CXXFLAGS) -o $@ test_rfu.cpp ../rfu.cpp
++
+ # The real netplay.cpp, with MiSTer functions stubbed in udp_harness.cpp.
+ md5.o: $(ROOT)/lib/md5/md5.c
+ 	$(CC) -O1 -g -fsanitize=address,undefined -c -o $@ $<
+@@ -53,4 +58,4 @@ udp_harness: $(ENGINE) ../netplay.cpp ../netplay.h udp_harness.cpp $(HDRS) md5.o
+ 	  -o $@ $(ENGINE) ../netplay.cpp udp_harness.cpp md5.o -lpthread
+ 
+ clean:
+-	rm -f test_netplay udp_harness md5.o
++	rm -f test_netplay test_rfu udp_harness md5.o
+diff --git a/support/netplay/test/test_rfu.cpp b/support/netplay/test/test_rfu.cpp
+new file mode 100644
+index 0000000..b3db18c
+--- /dev/null
++++ b/support/netplay/test/test_rfu.cpp
+@@ -0,0 +1,183 @@
++// T3w (SPEC.md 13.6), first part: two emulated wireless adapters (rfu.cpp)
++// talking through an in-memory link, driven by the command sequences
++// gba-link-connection's LinkRawWireless sends: host, broadcast read, connect,
++// data both ways, wait events, disconnect, timeout. Then malformed packets.
++
++#include "../rfu.h"
++#include <stdio.h>
++#include <string.h>
++#include <deque>
++#include <vector>
++
++static int fails = 0, checks = 0;
++#define CHECK(c, ...) do { checks++; if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
++
++struct Packet { int to; std::vector<uint8_t> data; };
++static std::deque<Packet> wire;      // packets in flight (to 0 = A, 1 = B)
++
++// A is peer 0 of B and B is peer 0 of A (each sees one other player)
++static Rfu A([](int, const uint8_t *b, size_t n) { wire.push_back({1, std::vector<uint8_t>(b, b + n)}); }, 11);
++static Rfu B([](int, const uint8_t *b, size_t n) { wire.push_back({0, std::vector<uint8_t>(b, b + n)}); }, 22);
++
++static void deliver()
++{
++	while (!wire.empty())
++	{
++		Packet p = wire.front();
++		wire.pop_front();
++		(p.to == 0 ? A : B).receive(0, p.data.data(), p.data.size());
++	}
++}
++
++static uint32_t out[Rfu::MAX_WORDS];
++static int cmd(Rfu &r, uint8_t c, std::vector<uint32_t> d = {})
++{
++	int n = r.command(c, d.data(), (int)d.size(), out);
++	deliver();
++	return n;
++}
++
++int main()
++{
++	// --- setup and hosting (A) ---
++	CHECK(cmd(A, 0x10) == 0, "Hello");
++	CHECK(cmd(A, 0x17, {0x003C0420}) == 0, "Setup");
++	CHECK(cmd(A, 0x16, {0x11, 0x22, 0x33, 0x44, 0x55, 0x66}) == 0, "Broadcast");
++	CHECK(cmd(A, 0x19) == 0 && A.state() == Rfu::HOST, "StartHost");
++	CHECK(cmd(A, 0x13) == 1 && (out[0] >> 24) == 1, "SystemStatus host");
++	uint16_t host_id = out[0] & 0xffff;
++	CHECK(host_id != 0, "host has an ID");
++	A.frame();                  // the first frame after StartHost broadcasts
++	deliver();
++
++	// --- search (B) ---
++	CHECK(cmd(B, 0x10) == 0, "Hello B");
++	CHECK(cmd(B, 0x1c) == 0, "BroadcastReadStart");
++	int n = cmd(B, 0x1d);
++	CHECK(n == 7, "BroadcastReadPoll: one host (%d words)", n);
++	CHECK(out[0] == host_id && out[1] == 0x11 && out[6] == 0x66, "broadcast data %x %x %x", out[0], out[1], out[6]);
++	CHECK(cmd(B, 0x1e) == 7, "BroadcastReadEnd");
++
++	// --- connect (B to A) ---
++	CHECK(cmd(B, 0x1f, {host_id}) == 0 && B.state() == Rfu::CLIENT, "Connect (state %d)", B.state());
++	CHECK(cmd(B, 0x20) == 1 && (out[0] >> 16) == 0, "IsConnectionComplete: client 0 (%x)", out[0]);
++	uint16_t client_id = out[0] & 0xffff;
++	CHECK(cmd(B, 0x21) == 1 && (out[0] & 0xffff) == client_id, "FinishConnection");
++	CHECK(cmd(A, 0x1a) == 1 && out[0] == client_id, "PollConnections: %x", out[0]);
++	CHECK(cmd(A, 0x14) == 2 && out[0] == 1 && out[1] == client_id, "SlotStatus");
++
++	// --- host to client ---
++	CHECK(cmd(A, 0x24, {8, 0xaabbccdd, 0x12345678}) == 0, "host SendData");
++	n = cmd(B, 0x26);
++	CHECK(n == 3 && out[0] == 8 && out[1] == 0xaabbccdd && out[2] == 0x12345678, "client ReceiveData %d %x %x %x", n, out[0], out[1], out[2]);
++	CHECK(cmd(B, 0x26) == 1 && out[0] == 0, "client ReceiveData again: nothing");
++
++	// --- client to host (client 0: header bytes << 8) ---
++	CHECK(cmd(B, 0x24, {4u << 8, 0xcafef00d}) == 0, "client SendData");
++	n = cmd(A, 0x26);
++	CHECK(n == 2 && out[0] == (4u << 8) && out[1] == 0xcafef00d, "host ReceiveData %d %x %x", n, out[0], out[1]);
++
++	// --- wait: the client waits for data from the host ---
++	CHECK(Rfu::waits(0x27) && Rfu::waits(0x25) && !Rfu::waits(0x24), "waiting commands");
++	CHECK(cmd(B, 0x27) == 0, "client Wait");
++	B.begin_wait(1000);
++	CHECK(B.wait_poll(1001, out) == 0, "nothing yet");
++	cmd(A, 0x24, {1, 0x5a});
++	n = B.wait_poll(1002, out);
++	CHECK(n == 2 && out[0] == 0x99660028 && out[1] == 0x80000000, "data event %d %x", n, out[0]);
++	CHECK(cmd(B, 0x26) == 2 && out[0] == 1 && (out[1] & 0xff) == 0x5a, "data after the event");
++
++	// --- wait: timeout (Setup timeout 0x20 frames = 533 ms) ---
++	cmd(B, 0x17, {0x20});
++	B.begin_wait(5000);
++	CHECK(B.wait_poll(5300, out) == 0, "no timeout yet");
++	n = B.wait_poll(5600, out);
++	CHECK(n == 2 && out[0] == 0x99660027, "timeout event %x", out[0]);
++
++	// --- host waits after SendDataWait with no answer: missed clients ---
++	cmd(A, 0x25, {1, 1});
++	A.begin_wait(9000);
++	n = A.wait_poll(9100, out);
++	CHECK(n == 3 && out[0] == 0x99660128 && out[1] == 0x0F0F, "host rtx event %x %x", out[0], out[1]);
++	cmd(B, 0x26);   // the client takes the host's packet
++
++	// --- disconnect: the host drops client 0, the waiting client hears it ---
++	CHECK(cmd(A, 0x30, {1}) == 0, "DisconnectClient");
++	CHECK(B.state() == Rfu::IDLE, "client idle after the host dropped it");
++	B.begin_wait(12000);
++	n = B.wait_poll(12000, out);
++	CHECK(n == 3 && out[0] == 0x99660129 && out[1] == 0xF, "disconnect event %x", out[0]);
++	CHECK(cmd(A, 0x1a) == 0, "host has no clients");
++	CHECK(cmd(B, 0x24, {4u << 8, 1}) < 0, "SendData when idle is an error");
++
++	// --- host timeout of a silent client ---
++	cmd(B, 0x1c);
++	A.frame();
++	for (int i = 0; i < 40; i++) { A.frame(); deliver(); }
++	cmd(B, 0x1d);
++	cmd(B, 0x1e);
++	cmd(B, 0x1f, {host_id});
++	CHECK(B.state() == Rfu::CLIENT, "reconnected");
++	CHECK(cmd(A, 0x1a) == 1, "host sees the client again");
++	for (int i = 0; i < 241; i++) A.frame();
++	wire.clear();
++	CHECK(cmd(A, 0x1a) == 0, "silent client dropped after 4 s");
++
++	// --- malformed and hostile packets must be ignored (run under ASan) ---
++	A.reset();
++	B.reset();
++	cmd(A, 0x19);
++	uint32_t seed = 12345;
++	for (int i = 0; i < 20000; i++)
++	{
++		uint8_t pkt[120];
++		size_t len = 12 + (seed >> 8) % 108;
++		for (size_t k = 0; k < sizeof(pkt); k++) { seed = seed * 1103515245 + 12345; pkt[k] = seed >> 16; }
++		pkt[0] = 'R'; pkt[1] = 'F'; pkt[2] = 'U'; pkt[3] = '1';
++		pkt[4] = pkt[5] = pkt[6] = 0; pkt[7] = i % 9;
++		A.receive(i % 5 - 1, pkt, len);
++		B.receive(0, pkt, len);
++		A.receive(0, pkt, i % 12);
++	}
++	wire.clear();
++	n = cmd(A, 0x26);
++	CHECK(n >= 1 && n <= 1 + 16, "host ReceiveData after junk stays in bounds (%d)", n);
++
++	// hostile packets aimed at a real connection: right IDs, lengths too big
++	A.reset();
++	B.reset();
++	wire.clear();
++	cmd(A, 0x16, {1, 2, 3, 4, 5, 6});
++	cmd(A, 0x19);
++	A.frame();
++	deliver();
++	cmd(B, 0x1c);
++	n = cmd(B, 0x1d);
++	cmd(B, 0x1e);
++	CHECK(n == 7, "B sees A again");
++	cmd(B, 0x1f, {out[0]});
++	CHECK(B.state() == Rfu::CLIENT, "B connected for the hostile test");
++	cmd(B, 0x20);
++	uint32_t cl = out[0];
++	uint32_t a_id = 0;
++	cmd(A, 0x13);
++	a_id = out[0] & 0xffff;
++	for (uint32_t blen = 0; blen < 256; blen += 17)
++	{
++		uint8_t pkt[12 + 20] = {'R', 'F', 'U', '1', 0, 0, 0, 6};
++		uint32_t h = blen << 24 | (cl & 0x30000) | (cl & 0xffff);   // client data, 20 bytes of payload at most
++		pkt[8] = h >> 24; pkt[9] = h >> 16; pkt[10] = h >> 8; pkt[11] = h;
++		A.receive(0, pkt, sizeof(pkt));
++		uint8_t hp[12 + 8] = {'R', 'F', 'U', '1', 0, 0, 0, 5, 0, 0, 0, (uint8_t)(blen & 0x7f)};
++		B.receive(0, hp, sizeof(hp));   // host data longer than the packet
++	}
++	wire.clear();
++	n = cmd(A, 0x26);
++	CHECK(n <= 1 + 4 && (out[0] >> 8 & 0x1f) <= 16, "host keeps client data within 16 bytes (%d, %x)", n, out[0]);
++	n = cmd(B, 0x26);
++	CHECK(n <= 1 + 2 && out[0] <= 8, "client keeps host data within the packet (%d, %x)", n, out[0]);
++	(void)a_id;
++
++	printf("%s: %d checks, %d failed\n", fails ? "FAIL" : "PASS", checks, fails);
++	return fails ? 1 : 0;
++}
+-- 
+2.43.0
+

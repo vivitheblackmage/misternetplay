@@ -222,7 +222,7 @@ func (r *relay) control(pkt string, from *net.UDPAddr, now time.Time) []outgoing
 		} else if rm = r.rooms[id]; rm == nil || !rm.host.live(now) {
 			return reply("ERR room is gone")
 		}
-		if rm.core != core || rm.md5 != sum {
+		if rm.core != core || (rm.md5 != sum && !anyGame(core)) {
 			return reply("ERR not the room's game")
 		}
 		if rm.join.live(now) && rm.join.addr.String() != k {
@@ -261,12 +261,16 @@ func (rm *room) memberName(host bool) string {
 	return rm.join.name
 }
 
+// anyGame: a core whose players need not run the same game. GBA with the
+// wireless adapter (SPEC.md 13.5) is not lockstep: FireRed and LeafGreen talk.
+func anyGame(core string) bool { return strings.EqualFold(core, "GBA") }
+
 // match: the oldest waiting room with this game, and how many are waiting.
 func (r *relay) match(core, sum string, now time.Time) (*room, int) {
 	var best *room
 	n := 0
 	for _, rm := range r.rooms {
-		if rm.core == core && rm.md5 == sum && rm.host.live(now) && !rm.join.live(now) {
+		if rm.core == core && (rm.md5 == sum || anyGame(core)) && rm.host.live(now) && !rm.join.live(now) {
 			n++
 			if best == nil || rm.created.Before(best.created) {
 				best = rm

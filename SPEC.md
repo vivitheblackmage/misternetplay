@@ -1033,3 +1033,148 @@ rings), added in jtframe so every jtframe core gets it:
 | T4 | Quartus build of `jtbubl` with netplay | timing met |
 | T5a | Replay on one MiSTer, ≥ 36000 frames of Bubble Bobble | "replay OK" |
 | T6a | Two MiSTers through the lobby | 30 min of a two-player game without a CRC mismatch |
+
+## 13. GBA Wireless Adapter (v5: T2w, T2w-u, T3w and T4w done; hardware (T5w): a Pokémon FireRed/LeafGreen battle and LinkUniversal_stress (packet loss, packet sync) through the server)
+
+Games that support Nintendo's GBA Wireless Adapter (AGB-015) play over the
+internet: Apotris, Pokémon FireRed, LeafGreen and Emerald, Mario Golf Advance
+Tour and others. Unlike sections 7 to 12 this is **not lockstep**: each MiSTer
+runs one GBA, and the adapter is emulated. The adapter's own protocol already
+lets the game wait for the other side (the "ready" handshake after every word
+and the Wait command), so internet latency only slows the link down; it does not
+desync anything. Link-cable games stay with the lockstep plan (GBA 2P,
+`research/gba2p-plan.md`).
+
+Sources: the adapter protocol as documented by afska and davidgfnet
+(gba-link-connection, `docs/wireless_adapter.md`), and gpSP's adapter
+emulation (`rfu.c`, `serial.c`, GPL-2.0-or-later, David Guillen Fandos), which
+Main's adapter is ported from.
+
+### 13.1 The core
+
+- Base: MiSTer-devel `GBA_MiSTer` `master` (`93790a0`); it runs Apotris on the
+  MiSTer (tested with its own BIOS and the user's). The core's serial port is a
+  stub today (a transfer takes its time and raises its IRQ, no data moves).
+- New: the serial port in **Normal mode, 32 bit**, for the adapter only
+  (OSD *Link port: Off / Wireless Adapter*). With the adapter selected it
+  behaves as gpSP does:
+  - **RCNT** GPIO mode: SD going high resets the adapter.
+  - **Internal clock** (GBA is master): writing SIOCNT with Start sends
+    SIODATA32 to the adapter; the transfer ends (Start cleared, SI = 1, IRQ if
+    enabled) when the adapter's answer word is in SIODATA32. While the adapter
+    has no answer yet, the transfer simply lasts longer.
+  - **SI/SO handshake**: internal clock: SO rising makes SI go low ("adapter
+    ready"); external clock: SO rising makes SI go high, SO falling makes it low.
+  - **External clock** (after Wait, SendDataWait, RetransmitAndWait the adapter
+    is master): when the GBA has Start set with external clock and SI = SO = 0,
+    the adapter's next pushed word lands in SIODATA32, Start clears, IRQ.
+- `gba_rfu` (new, in the core) handles the word level so the HPS is asked
+  **once per command, not per word**:
+  - the NINTENDO handshake (13.2 rule) in the FPGA;
+  - a command `0x9966LLCC` and its LL words are collected; the complete
+    command goes to the mailbox; the answer (ack word with its length, then the
+    data, or `0x996601ee` + error) comes back and is streamed word by word;
+  - pushed words (the adapter's events in Wait mode: `0x99660028` data,
+    `0x99660029` disconnected, `0x99660027` timeout, `0x99660128` with the
+    missed clients) come from the HPS as a list and are sent when the GBA is
+    ready for them;
+  - every other GBA word is answered `0x80000000`.
+- Mailbox: in DDR3, at an address the core does not use (GBA uses DDR3 for the
+  second ROM copy, savestates and rewind: the address is chosen in 13.3), on its
+  own `ddram.sv` channel. Words carry a sequence tag in both halves (SPEC 7
+  rule: Cortex-A9 may tear 64-bit stores).
+
+### 13.2 Handshake rule (in the FPGA)
+
+Reset (SD high, or the core's reset) puts the adapter in RESET. In RESET it
+answers `0` and moves to HANDSHAKE when the GBA's low 16 bits are `0x494E`. In
+HANDSHAKE it answers `(sent << 16) | (~previous_sent & 0xFFFF)` and moves to
+COMMANDS when the GBA sends `0xB0BB8001`.
+
+### 13.3 Mailbox
+
+At `0x3C000000` (byte offsets; every header carries its tag in both 32-bit
+halves; `rtl/gba_rfu.sv` and `support/netplay/rfu_mailbox.cpp`):
+
+| Offset | Content | Written by |
+| --- | --- | --- |
+| `0x000` | magic "GBARFU01" | FPGA |
+| `0x008` | status `{resets16, 16'h0}` x2 (resets: SD pulses) | FPGA |
+| `0x010` | command `{seq16, cmd8, len8}` x2, after its data | FPGA |
+| `0x018` | command data[0..31] `{0, word}` (each word as it arrives) | FPGA |
+| `0x200` | answer `{seq16, flags8, len8}` x2, after its data (flags bit 0: error, data[0] the code) | HPS |
+| `0x208` | answer data[0..63] `{seq16, index16, word}` | HPS |
+| `0x500` | event `{eseq16, 8'h0, n8}` x2, after its data | HPS |
+| `0x508` | event data[0..3] `{eseq16, index16, word}` | HPS |
+
+The HPS's data words carry their header's sequence number and their index,
+and the FPGA reads a word again until its tag is right: the FPGA reads the
+header first and may otherwise see a data word that has not landed yet (the
+HPS writes through the L3, the FPGA reads through its own SDRAM port). The
+event words are read right after their header, so an untagged stale word was
+pushed to the GBA (Pokemon then waits 100 ms in its slave handler and resets
+the adapter: "communication error").
+
+### 13.4 Main_MiSTer: the adapter
+
+- `support/netplay/rfu.cpp`: gpSP's command processing (Hello, Setup,
+  Broadcast, StartHost, EndHost, BroadcastRead start/poll/end, PollConnections,
+  Connect, IsConnectionComplete, FinishConnection, SendData, SendDataWait,
+  ReceiveData, Wait, DisconnectClient, Bye, SignalLevel, VersionStatus,
+  SystemStatus, SlotStatus, ConfigStatus, RetransmitAndWait) on the HPS, in the
+  netplay thread; it answers a command within a few hundred microseconds.
+- A host's Wait after SendDataWait or RetransmitAndWait ends with "sent"
+  (`0x99660028`) as soon as every client has acked the data. Clients that have
+  not acked yet are reported (`0x99660128`, bits 0-3 the clients that got it,
+  bits 8-11 always clear) only after the Setup's retransmissions **and at least
+  250 ms**: a real adapter retransmits within milliseconds, the internet takes
+  tens of them, and Pokemon ends the link with "communication error" when it
+  sees misses. Setup's retransmission count 0 means never report a miss. A
+  silent client is dropped after 4 s.
+- Up to 5 adapters per room (1 host, 4 clients), as the hardware.
+- Started by the OSD option; `netplay.ini` `server=` and `key=` as for the
+  other cores. Without `server=`: `peer=` connects two MiSTers directly.
+
+### 13.5 Network
+
+- v1 is two MiSTers. They pair exactly as the other cores do (OSD Netplay Host
+  or Join, `peer=` or the server's rooms, hole punching, relay; SPEC 7). The room
+  is the core `GBA` with the game's name, but the match does **not** require
+  the same md5: FireRed and LeafGreen talk to each other over the adapter.
+- On top of that pair the game's own wireless menus work as on real hardware:
+  one GBA hosts (StartHost broadcasts), the other searches (BroadcastRead lists
+  the peer's broadcast), connects, sends and receives. gpSP's packets (RFU1:
+  broadcast, connect request/accept/reject, disconnect, host data, client data,
+  client ack) go to "the other player" instead of RetroArch's netpacket peers.
+- They need order and delivery: a reliable channel inside the session
+  (sequence number, ack, in order; the oldest unacked packet is resent after
+  1.5 round trips + 10 ms, 30 to 100 ms, the others after 100 ms: the receiver
+  keeps what came after a gap, and homebrew (gba-link-connection) gives up
+  after 10 frames without new data), a new packet type next
+  to the lockstep ones. Packet: `NPW1` type seq16 ack16 len16 version (2)
+  from32 to32, then the data. `from`/`to` are random session ids, one per
+  loaded game: data and acks of another session are ignored, and a HELLO with a
+  new id means the other player loaded the game again, so both sides start
+  over (sequence 1, nothing old kept). The oldest packet unacked for 3 s, or
+  the other side silent for 10 s: resend once a second.
+- A game load with the same Netplay mode and room as before keeps the place on
+  the server and the way to the other player; only the link starts over (a new
+  session id). A host that opened a new room instead would leave a join that
+  already got the old one asking for a room that is gone.
+- More than two players (the adapter allows five) needs rooms of up to five on
+  the server: later (13.7).
+
+### 13.6 Tests (wireless)
+
+| Test | What | Pass |
+| --- | --- | --- |
+| T2w | `make -C GBA_MiSTer/npsim t2w`: the whole core in Verilator with `gba_rfu`, the mailbox served by Main's own `rfu_mailbox.cpp`/`rfu.cpp`, and a second adapter as the peer; the test ROM `npsim/rfutest.s` resets the adapter (SD), does the handshake and Hello, VersionStatus, Setup, Broadcast, StartHost, SystemStatus, a refused Connect, PollConnections, Wait (event pushed by external clock), ReceiveData, SendData | all 18 results as expected and the peer receives the host's data: `PASS T2w` |
+| T2w-u | `make -C GBA_MiSTer/npsim sertb`: `gba_serial` (GHDL) and `gba_rfu` in Verilator with Main's `rfu.cpp`/`rfu_mailbox.cpp`; the CPU is Pokemon FireRed's librfu (pret: `sio32intr_clock_master`/`_slave`, their SI/SO handshakes and timers) joining a host adapter over a 20-60 ms network: search, Connect, Wait, the host's data 50-275 ms later pushed as `0x99660028`, `0x80000000`, ReceiveData; also with the HPS's mailbox writes late (2-50k clocks) and out of order | `PASS sertb` in all five runs |
+| T3w | `test_rfu` (two adapters in one process: the whole command flow, events, timeouts, junk and hostile packets under ASan), `test_rfu_link` (2000 packets each way over a network that loses, duplicates and reorders: all arrive once and in order; the other side loading its game again mid-game: both start over and data flows again; a peer that never acks gets resends once a second; a lockstep peer and another version are named), and `NP_SYSTEM=gba` UDP runs (direct, through the server, relay only): two Mains with a faked `gba_rfu` side, different games, find each other's room, connect, exchange data both ways; through the server, the host or the join loads its game again after the first exchange and a second exchange follows over the same room | `PASS` |
+| T4w | Quartus build of GBA with the adapter | timing met |
+| T5w | Two MiSTers: afska's `LinkWireless` demo and an Apotris 2-player battle over the wireless adapter through the server | the match runs to the end |
+
+### 13.7 Later
+
+Wireless multiboot; playing against RetroArch gpSP (its own netpacket protocol);
+more than 2 players tested on hardware.

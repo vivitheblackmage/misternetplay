@@ -1,7 +1,8 @@
-From 03e772a9b5e42eeecefb5abbccf4f677a1b1e89a Mon Sep 17 00:00:00 2001
+From 5b304ccfcc4051ce3545d76f525541ab160f1a81 Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sat, 31 Oct 2026 21:25:52 +0100
-Subject: [PATCH] netplay: drop the cheat check, never save an empty recording
+Subject: [PATCH 05/42] netplay: drop the cheat check, never save an empty
+ recording
 
 The Cheats Enabled option is hidden when the game has no cheat file and then
 stays at On, so check_local() refused every such game with no way to fix it

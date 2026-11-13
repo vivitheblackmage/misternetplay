@@ -49,6 +49,11 @@ cp "$bin" "$kit/MiSTer_online"
 cp "$root"/tools/mister-scripts/netplay_on.sh "$root"/tools/mister-scripts/netplay_off.sh "$kit/Scripts/"
 cp "$rom" "$kit/games/NES/NetPong/NetPong.nes"
 chmod +x "$kit/MiSTer_online" "$kit"/Scripts/*.sh
+# GBA with the wireless adapter (SPEC.md 13), when it is built
+gbarbf="$root/GBA_MiSTer/output_files/GBA.rbf"
+if [ -f "$gbarbf" ]; then
+  cp "$gbarbf" "$kit/_Console/GBA_netplay.rbf"
+fi
 # arcade (SPEC.md 12): next to Jotego's jtbubl.rbf, never over it
 arbf="$root/jtcores/release/mister/jtbubl.rbf"
 if [ -f "$arbf" ]; then
@@ -117,6 +122,18 @@ ARCADE (Bubble Bobble): needs Bubble Bobble from the MiSTer updater
    the same rooms are in the Arcade list in the folder _Netplay. Or OSD
    Netplay -> Join: joins only when exactly one room with the game is open.
    The DIP switches are the host's during the session.
+
+GBA WIRELESS ADAPTER (GBA_netplay): games that use Nintendo's GBA Wireless
+   Adapter (Apotris, Pokemon FireRed/LeafGreen/Emerald, Mario Golf ...). Each
+   MiSTer plays its own game, no picture sync. In GBA_netplay's OSD:
+   Hardware -> Link Port: Wireless Adapter (then Reset), and Hardware ->
+   Netplay: Host on one MiSTer, Join on the other, then load the game. In the
+   game's wireless menu one hosts and the other joins, as on real GBAs.
+   The two players may use different games that talk to each other
+   (FireRed and LeafGreen). Savestates and rewind are off with the adapter on.
+   Apotris, a free game with 2-player battles over the adapter, is by
+   akouzoukos: download it from https://akouzoukos.com/apotris/downloads and
+   put Apotris.gba in games/GBA (2 player battle -> wireless).
 
 SWITCHING CORES: to go from NES_netplay to SNES_netplay (or back), reboot from
    the MiSTer's menu first and then start the other core. Jumping straight from

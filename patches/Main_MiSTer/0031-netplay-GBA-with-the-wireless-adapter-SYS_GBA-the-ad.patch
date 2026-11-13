@@ -1,0 +1,271 @@
+From 38a109987494cdc667523dc0bc6445f689794961 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 10 Nov 2026 20:55:46 +0100
+Subject: [PATCH 31/42] netplay: GBA with the wireless adapter (SYS_GBA): the
+ adapter thread serves the mailbox from the core's start, pairs on a game load
+ with Host/Join and carries the adapters' packets over rfu_link
+---
+ support/netplay/netplay.cpp     | 170 +++++++++++++++++++++++++++++++-
+ support/netplay/netplay_proto.h |   2 +-
+ support/netplay/test/Makefile   |   5 +-
+ 3 files changed, 171 insertions(+), 6 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 372e225..ff063c3 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -23,6 +23,9 @@
+ #include <set>
+ #include <vector>
+ #include <pthread.h>
++#include "rfu.h"
++#include "rfu_mailbox.h"
++#include "rfu_link.h"
+ #include <netdb.h>
+ #include <arpa/inet.h>
+ #include <sys/socket.h>
+@@ -908,6 +911,156 @@ static void *netplay_thread(void *)
+ 	return nullptr;
+ }
+ 
++// ---------------------------------------------------------------------------
++// GBA Wireless Adapter (SPEC.md 13): not lockstep. The adapter (rfu.cpp)
++// answers the core's commands through the mailbox all the time; a game loaded
++// with Netplay Host or Join pairs this MiSTer with another one (server room or
++// peer=, as the other cores) and the adapters' packets go over RfuLink.
++
++constexpr uint32_t RFU_MB_PHYS = 0x3C000000;   // gba_rfu.sv MB_BASE (ddram window 0x30000000)
++constexpr uint32_t RFU_MB_MAP  = 0x1000;
++
++static void *gba_wireless_thread(void *)
++{
++	volatile uint64_t *mem = (volatile uint64_t *)shmem_map(RFU_MB_PHYS, RFU_MB_MAP);
++	if (!mem) { post_message("Netplay: cannot map DDR3 mailbox"); return nullptr; }
++	RfuMailbox mbx(mem);
++
++	Udp *udp = nullptr;
++	RfuLink *link = nullptr;
++	Rfu rfu([&link](int, const uint8_t *b, size_t n) { if (link) link->send(b, n); },
++	        (uint32_t)(now_ms() ^ ((uint64_t)getpid() << 16)));
++	uint32_t seen_rom = 0;
++	bool linked = false;
++	const char *told = nullptr;
++	uint64_t next_frame_us = now_ms() * 1000;
++
++	while (!quit)
++	{
++		uint64_t now = now_ms();
++
++		// a game loaded: pair as the OSD (or netplay.ini) says
++		uint32_t seq;
++		{
++			std::lock_guard<std::mutex> g(info_mtx);
++			seq = rom_seq;
++		}
++		if (seq != seen_rom)
++		{
++			seen_rom = seq;
++			delete link; link = nullptr;
++			if (udp) udp->leave();
++			delete udp; udp = nullptr;
++			lobby_host("");
++			linked = false;
++			told = nullptr;
++
++			LocalInfo li;
++			Mode mode;
++			std::string room, path;
++			{
++				std::lock_guard<std::mutex> g(info_mtx);
++				li = rom_info;
++				mode = rom_mode;
++				room = rom_room;
++				path = rom_path;
++			}
++			bool ok = mode == M_HOST || mode == M_JOIN;
++			if (mode == M_JOIN && !cfg.peer[0] && !cfg.server[0])
++			{
++				post_message("Netplay: Join needs peer= or server= in netplay.ini");
++				ok = false;
++			}
++			else if (ok && cfg.server[0])
++			{
++				ServerReg r {};
++				r.host = mode == M_HOST;
++				if (r.host) random_id(r.room, sizeof(r.room));
++				else snprintf(r.room, sizeof(r.room), "%s", room.empty() ? "*" : room.c_str());
++				snprintf(r.core, sizeof(r.core), "%s", srv_core.c_str());
++				memcpy(r.md5, li.rom_md5, 16);
++				memcpy(r.md5b, li.rom_md5, 16);
++				game_name(path, r.game, sizeof(r.game));
++				lobby_host(r.host ? r.room : "");
++				udp = new Udp();
++				if (!udp->open_server(cfg, r))
++				{
++					post_message("Netplay: cannot reach server (check server=)");
++					ok = false;
++				}
++			}
++			else if (ok)
++			{
++				udp = new Udp();
++				if (!udp->open_socket(cfg.port, mode == M_JOIN ? cfg.peer : nullptr))
++				{
++					post_message(mode == M_JOIN ? "Netplay: cannot reach peer (check peer=)" : "Netplay: cannot open port");
++					ok = false;
++				}
++			}
++			if (ok)
++			{
++				link = new RfuLink(udp, mode == M_HOST);
++				post_message(mode == M_HOST ? "Netplay: waiting for player 2 (wireless adapter)" : "Netplay: connecting (wireless adapter)");
++			}
++			else
++			{
++				delete udp;
++				udp = nullptr;
++			}
++		}
++
++		if (udp)
++		{
++			udp->tick(now);
++			if (const char *n = udp->take_notice()) post_message(n);
++		}
++		if (link)
++		{
++			link->tick(now, [&rfu](const uint8_t *b, size_t n) { rfu.receive(0, b, n); });
++			if (link->connected() && !linked)
++			{
++				linked = true;
++				char text[96];
++				if (udp->via_server())
++					snprintf(text, sizeof(text), "Netplay: wireless adapter linked with %s (%s)", udp->peer_name(),
++					         udp->direct() ? "direct" : "through the server");
++				else snprintf(text, sizeof(text), "Netplay: wireless adapter linked");
++				post_message(text);
++			}
++			if (link->refusal() && link->refusal() != told)
++			{
++				told = link->refusal();
++				post_message(told);
++			}
++			if (linked && link->lost(now))
++			{
++				linked = false;
++				post_message("Netplay: connection lost");
++			}
++		}
++
++		// the adapter's own clock: timeouts and broadcasts count GBA frames
++		uint64_t now_us = now * 1000;
++		for (int i = 0; i < 4 && now_us >= next_frame_us; i++)
++		{
++			rfu.frame();
++			next_frame_us += 16743;
++		}
++		if (now_us >= next_frame_us) next_frame_us = now_us;   // after a stall: no burst
++
++		// the game waits for every answer: poll often (one command per poll)
++		mbx.poll((uint32_t)now, rfu);
++		usleep(100);
++	}
++
++	delete link;
++	if (udp) udp->leave();
++	delete udp;
++	shmem_unmap((void *)mem, RFU_MB_MAP);
++	return nullptr;
++}
++
+ // ---------------------------------------------------------------------------
+ // Main-thread side
+ 
+@@ -1042,7 +1195,8 @@ static std::string clean_file(const std::string &in, size_t max)
+ // player's MRAs (SPEC.md 12.5).
+ static bool is_arcade_core(const std::string &c)
+ {
+-	return !c.empty() && strcasecmp(c.c_str(), "NES") && strcasecmp(c.c_str(), "SNES") && strcasecmp(c.c_str(), "GB2P");
++	return !c.empty() && strcasecmp(c.c_str(), "NES") && strcasecmp(c.c_str(), "SNES") && strcasecmp(c.c_str(), "GB2P") &&
++	       strcasecmp(c.c_str(), "GBA");
+ }
+ 
+ static bool is_hex(const std::string &s, size_t n)
+@@ -1704,10 +1858,17 @@ static bool arcade_has_netplay()
+ 	return confstr_any([](const char *p) { return strstr(p, "[127:126]") && strstr(p, ",Netplay,"); });
+ }
+ 
+-// The loaded core: SYS_NES, SYS_SNES, SYS_GB2P, SYS_ARCADE, or -1 for one without netplay
++// GBA with the wireless adapter on its link port (SPEC.md 13.1)
++static bool gba_has_wireless()
++{
++	return confstr_any([](const char *p) { return strstr(p, "O[44],Link Port") != nullptr; });
++}
++
++// The loaded core: SYS_NES, SYS_SNES, SYS_GB2P, SYS_ARCADE, SYS_GBA, or -1 for one without netplay
+ static int netplay_system()
+ {
+ 	const char *n = user_io_get_core_name();
++	if (!strcasecmp(n, "GBA") && gba_has_wireless()) return SYS_GBA;
+ 	if (!strcasecmp(n, "NES")) return SYS_NES;
+ 	if (!strcasecmp(n, "SNES")) return SYS_SNES;
+ 	if (!strcasecmp(n, "GAMEBOY2P")) return SYS_GB2P;
+@@ -1723,6 +1884,7 @@ static const char *osd_netplay_bits()
+ 	case SYS_SNES:   return "[59:58]";
+ 	case SYS_GB2P:   return "[47:46]";
+ 	case SYS_ARCADE: return "[127:126]";
++	case SYS_GBA:    return "[46:45]";
+ 	default:         return "[89:88]";
+ 	}
+ }
+@@ -2145,7 +2307,7 @@ static void start_thread()
+ 	quit = false;
+ 	reload_req = false;
+ 	reload_done = false;
+-	if (pthread_create(&thread, nullptr, netplay_thread, nullptr) == 0) thread_running = true;
++	if (pthread_create(&thread, nullptr, core_sys == SYS_GBA ? gba_wireless_thread : netplay_thread, nullptr) == 0) thread_running = true;
+ 	else printf("netplay: cannot start thread\n");
+ }
+ 
+@@ -2167,6 +2329,8 @@ void netplay_start(void)
+ 	core_armed = true;
+ 	// arcade: no games from the server, no room folder (the games are MRA files, SPEC.md 12.5)
+ 	if (cfg.server[0] && core_sys != SYS_ARCADE) server_games_start();
++	// GBA: the adapter answers the game from the start, paired or not (SPEC.md 13.4)
++	if (core_sys == SYS_GBA && !thread_running) start_thread();
+ }
+ 
+ void netplay_stop(void)
+diff --git a/support/netplay/netplay_proto.h b/support/netplay/netplay_proto.h
+index 06e9e95..b6ef8e2 100644
+--- a/support/netplay/netplay_proto.h
++++ b/support/netplay/netplay_proto.h
+@@ -17,7 +17,7 @@ namespace netplay {
+ // in HELLO (SPEC.md 11.5). Arcade (jtframe cores) is version 4: version 3
+ // plus the DIP switches (SPEC.md 12.4).
+ 
+-enum System : uint8_t { SYS_NES = 0, SYS_SNES = 1, SYS_GB2P = 2, SYS_ARCADE = 3 };
++enum System : uint8_t { SYS_NES = 0, SYS_SNES = 1, SYS_GB2P = 2, SYS_ARCADE = 3, SYS_GBA = 4 };   // SYS_GBA: wireless adapter, not lockstep (SPEC.md 13)
+ 
+ // ---------------------------------------------------------------------------
+ // DDR3 mailbox, shared with rtl/netplay.sv of each core
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index d0bc290..c0dc4c2 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -57,9 +57,10 @@ test_rfu_link: test_rfu_link.cpp ../rfu_link.cpp ../rfu_link.h ../netplay_sessio
+ md5.o: $(ROOT)/lib/md5/md5.c
+ 	$(CC) -O1 -g -fsanitize=address,undefined -c -o $@ $<
+ 
+-udp_harness: $(ENGINE) ../netplay.cpp ../netplay.h udp_harness.cpp $(HDRS) md5.o
++RFU := ../rfu.cpp ../rfu_mailbox.cpp ../rfu_link.cpp
++udp_harness: $(ENGINE) $(RFU) ../netplay.cpp ../netplay.h udp_harness.cpp $(HDRS) md5.o
+ 	$(CXX) $(CXXFLAGS) -Wno-psabi -D_FILE_OFFSET_BITS=64 -I$(ROOT) -I$(ROOT)/lib/md5 \
+-	  -o $@ $(ENGINE) ../netplay.cpp udp_harness.cpp md5.o -lpthread
++	  -o $@ $(ENGINE) $(RFU) ../netplay.cpp udp_harness.cpp md5.o -lpthread
+ 
+ clean:
+ 	rm -f test_netplay test_rfu test_rfu_link udp_harness md5.o
+-- 
+2.43.0
+

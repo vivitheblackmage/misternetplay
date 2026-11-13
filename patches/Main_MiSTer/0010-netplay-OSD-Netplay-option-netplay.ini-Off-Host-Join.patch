@@ -1,8 +1,8 @@
-From 6fe4f60524bd4e69332babb8622f00ff6c3ca5c6 Mon Sep 17 00:00:00 2001
+From 47c56daa82abf64fa46196edd5fc237943600922 Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sun, 1 Nov 2026 00:13:19 +0100
-Subject: [PATCH] netplay: OSD "Netplay" option (netplay.ini/Off/Host/Join)
- picks the mode per ROM
+Subject: [PATCH 10/42] netplay: OSD "Netplay" option
+ (netplay.ini/Off/Host/Join) picks the mode per ROM
 
 The NES core's new OSD option (status [89:88]) is read when a game is
 loaded, so host/join can be chosen without editing netplay.ini or reloading

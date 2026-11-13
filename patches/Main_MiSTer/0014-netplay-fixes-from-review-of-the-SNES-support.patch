@@ -1,7 +1,7 @@
-From f31982a82732222a25d00d59698c5422a38111d2 Mon Sep 17 00:00:00 2001
+From 6414b6034cd5d0a8bee09ba101a3fd2aa7ccbc4f Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Tue, 3 Nov 2026 20:12:24 +0100
-Subject: [PATCH] netplay: fixes from review of the SNES support
+Subject: [PATCH 14/42] netplay: fixes from review of the SNES support
 
 A refusal goes out in the peer's own HELLO version, so a version 1 peer
 (an older build, Mesen) reads the reason instead of timing out. The core

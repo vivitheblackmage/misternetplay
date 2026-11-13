@@ -1,0 +1,56 @@
+From 925366ec99a10e3c631165bdc26ec9449ed4b217 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Thu, 12 Nov 2026 16:41:21 +0100
+Subject: [PATCH 39/42] netplay: wireless mailbox answer and event data carry
+ {seq, index} (the core reads a word again until it has landed)
+---
+ support/netplay/rfu_mailbox.cpp | 12 +++++++++---
+ 1 file changed, 9 insertions(+), 3 deletions(-)
+
+diff --git a/support/netplay/rfu_mailbox.cpp b/support/netplay/rfu_mailbox.cpp
+index 99bb72e..80ded63 100644
+--- a/support/netplay/rfu_mailbox.cpp
++++ b/support/netplay/rfu_mailbox.cpp
+@@ -7,6 +7,12 @@ const uint64_t MAGIC = 0x4742415246553031ull;   // "GBARFU01" as gba_rfu.sv writ
+ const uint32_t OFF_MAGIC = 0x000, OFF_STATUS = 0x008, OFF_CMD = 0x010, OFF_CDATA = 0x018,
+                OFF_ANS = 0x200, OFF_ADATA = 0x208, OFF_EVT = 0x500, OFF_EDATA = 0x508;
+ const int MAX_CMD_WORDS = 32, MAX_ANS_WORDS = 64, MAX_EVT_WORDS = 4;
++
++// answer and event data carry {seq16, index16} in the upper half: the FPGA
++// reads the header first and may see a data word before it has landed (the
++// HPS's writes and the FPGA's reads take different ways to the DDR3); it reads
++// a word again until its tag is right
++uint64_t tagged(uint16_t seq, int i, uint32_t word) { return (uint64_t)((uint32_t)seq << 16 | (uint16_t)i) << 32 | word; }
+ }
+ 
+ bool RfuMailbox::present() const
+@@ -55,13 +61,13 @@ bool RfuMailbox::poll(uint32_t now_ms, Rfu &rfu)
+ 			uint32_t hdr;
+ 			if (n < 0)
+ 			{
+-				wr(OFF_ADATA, (uint32_t)-n);   // error code
++				wr(OFF_ADATA, tagged(seq, 0, (uint32_t)-n));   // error code
+ 				hdr = (uint32_t)seq << 16 | 1 << 8 | 1;
+ 			}
+ 			else
+ 			{
+ 				if (n > MAX_ANS_WORDS) n = MAX_ANS_WORDS;
+-				for (int i = 0; i < n; i++) wr(OFF_ADATA + 8 * i, out[i]);
++				for (int i = 0; i < n; i++) wr(OFF_ADATA + 8 * i, tagged(seq, i, out[i]));
+ 				hdr = (uint32_t)seq << 16 | (uint32_t)n;
+ 			}
+ 			wr(OFF_ANS, twice(hdr));   // after the data
+@@ -84,9 +90,9 @@ bool RfuMailbox::poll(uint32_t now_ms, Rfu &rfu)
+ 		{
+ 			if (n > MAX_EVT_WORDS) n = MAX_EVT_WORDS;
+ 			if (trace) trace('E', 0, nullptr, 0, ev, n);
+-			for (int i = 0; i < n; i++) wr(OFF_EDATA + 8 * i, ev[i]);
+ 			eseq_++;
+ 			if (!eseq_) eseq_ = 1;
++			for (int i = 0; i < n; i++) wr(OFF_EDATA + 8 * i, tagged(eseq_, i, ev[i]));
+ 			wr(OFF_EVT, twice((uint32_t)eseq_ << 16 | (uint32_t)n));
+ 			waiting_ = false;
+ 			did = true;
+-- 
+2.43.0
+

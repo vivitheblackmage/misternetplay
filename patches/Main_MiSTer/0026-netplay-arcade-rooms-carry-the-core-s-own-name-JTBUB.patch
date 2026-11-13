@@ -1,8 +1,8 @@
-From 791b30f0ff226b74f77816913b59f306909f5c1c Mon Sep 17 00:00:00 2001
+From 4ac2d5d6ab0d442f562469ea27571bdd659f10c3 Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Mon, 9 Nov 2026 19:59:28 +0100
-Subject: [PATCH] netplay: arcade rooms carry the core's own name (JTBUBL), the
- menu lobby lists every non-console room
+Subject: [PATCH 26/42] netplay: arcade rooms carry the core's own name
+ (JTBUBL), the menu lobby lists every non-console room
 ---
  support/netplay/netplay.cpp          | 16 +++++++++++++---
  support/netplay/test/udp_harness.cpp |  3 ++-

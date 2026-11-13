@@ -1,4 +1,4 @@
-# NES, SNES, Game Boy and arcade netplay for MiSTer
+# NES, SNES, Game Boy, GBA and arcade netplay for MiSTer
 
 Play NES, Super NES, Game Boy link-cable games and Bubble Bobble (arcade)
 together on two [MiSTer FPGA](https://github.com/MiSTer-devel/Wiki_MiSTer/wiki) boards over the
@@ -6,6 +6,10 @@ internet or a LAN. Both MiSTers run the real core in lockstep: each frame's cont
 run exactly the same frames with the same input. A checksum of the game state
 is compared all the time, so a desync stops the session instead of going on
 silently.
+
+GBA games that use Nintendo's **GBA Wireless Adapter** work differently: each
+MiSTer runs its own game, and the adapter is emulated, so the two GBAs talk to
+each other over the internet as they would over the air.
 
 It comes in these parts:
 
@@ -21,6 +25,11 @@ It comes in these parts:
   arcade cores can follow. It goes next to the normal `jtbubl.rbf`, which stays
   as it is, and is started from its own MRA,
   `Bubble Bobble (US, Ver 5.1) [netplay]`.
+- **GBA core** (`GBA_netplay.rbf`): the MiSTer GBA core with an emulated GBA
+  Wireless Adapter on the link port, for Apotris, Pokémon FireRed, LeafGreen
+  and Emerald, and other games that use the adapter. The adapter's commands
+  are answered by the Main binary (ported from gpSP's adapter emulation), and
+  its packets travel between the two MiSTers.
 - **Main binary** (`MiSTer_online`): the MiSTer main program (menu, file
   browser, input) with the netplay engine and the UDP networking added. Your
   normal MiSTer binary is kept, and you can switch back from the Scripts menu.
@@ -60,6 +69,12 @@ MiSTer-devel project.
   without picture glitches. In simulation (Verilator): the whole jtbubl core on
   two simulated MiSTers stays in sync, with the same order of every clock
   enable, and a changed input is caught as a desync in the frame it happens.
+- GBA Wireless Adapter on hardware: two MiSTers over the internet through the
+  lobby server (on a Raspberry Pi), Pokémon FireRed/LeafGreen battles and a
+  trade in the Union Room, and gba-link-connection's `LinkUniversal_stress` test ROM
+  (packet loss and packet sync: 65,534 packets without a loss). In simulation:
+  the core's serial port and adapter against Pokémon's own wireless library
+  (librfu), with the Main binary's answers late and out of order.
 - Automated tests for the core (Verilator testbench) and for the netplay engine,
   host and join over real UDP, with and without the server.
 
@@ -73,16 +88,20 @@ them; it holds our changes as patches on top of exact upstream commits:
 | NES core (FPGA) | [github.com/MiSTer-devel/NES_MiSTer](https://github.com/MiSTer-devel/NES_MiSTer) | `49a0a66` (2026-09-30) | [`patches/NES_MiSTer/`](patches/NES_MiSTer) |
 | SNES core (FPGA) | [github.com/MiSTer-devel/SNES_MiSTer](https://github.com/MiSTer-devel/SNES_MiSTer) | `4c2b746` (2026-10-31) | [`patches/SNES_MiSTer/`](patches/SNES_MiSTer) |
 | Game Boy 2P core (FPGA) | [github.com/pomstazlesa/Gameboy2PUW_MiSTer](https://github.com/pomstazlesa/Gameboy2PUW_MiSTer) (branch `Gameboy2P`) | `83e167f` (2025-10-05) | [`patches/Gameboy2P_MiSTer/`](patches/Gameboy2P_MiSTer) |
+| GBA core (FPGA) | [github.com/MiSTer-devel/GBA_MiSTer](https://github.com/MiSTer-devel/GBA_MiSTer) | `93790a0` | [`patches/GBA_MiSTer/`](patches/GBA_MiSTer) |
 | Arcade core (FPGA) | [github.com/jotego/jtcores](https://github.com/jotego/jtcores) (jtbubl and jtframe) | `15d60ca` (2026-10-23) | [`patches/jtcores/`](patches/jtcores) |
 | Main binary (ARM) | [github.com/MiSTer-devel/Main_MiSTer](https://github.com/MiSTer-devel/Main_MiSTer) | `0827165` (2026-10-30) | [`patches/Main_MiSTer/`](patches/Main_MiSTer) |
 
 The NES and SNES cores are the work of the MiSTer-devel contributors and of the
 authors credited in their own READMEs; Main_MiSTer likewise. The Game Boy 2P
 core is pomstazlesa's two-player fork of the MiSTer-devel Game Boy core. The
+wireless adapter in the Main binary is ported from gpSP's adapter emulation by
+David Guillen Fandos (GPL-2.0-or-later), with the protocol as documented by
+afska and davidgfnet (gba-link-connection). The
 arcade core and jtframe are Jotego's (jtcores). All are licensed GPL-3.0, and
 so are our patches.
 
-`./setup.sh` clones the five upstream repositories next to it and applies the
+`./setup.sh` clones the six upstream repositories next to it and applies the
 patches on a branch called `netplay`.
 
 Everything else here is our own: the lobby server (`server/`), the tools
@@ -107,8 +126,9 @@ computer. Then on **each** MiSTer:
 1. Copy everything in the folder `SD card` to the root of the MiSTer's SD card
    (where `_Console` is), over the network share or with the card in a
    computer. None of your files is overwritten:
-   - `_Console/NES_netplay.rbf`, `_Console/SNES_netplay.rbf` and
-     `_Console/GAMEBOY2P_netplay.rbf`: the cores, next to the normal ones
+   - `_Console/NES_netplay.rbf`, `_Console/SNES_netplay.rbf`,
+     `_Console/GAMEBOY2P_netplay.rbf` and `_Console/GBA_netplay.rbf`: the
+     cores, next to the normal ones
    - `_Arcade/cores/jtbubl-netplay.rbf` and
      `_Arcade/Bubble Bobble (US, Ver 5.1) [netplay].mra`: the arcade core and
      its MRA, next to Jotego's (which are not changed)
@@ -128,6 +148,8 @@ computer. Then on **each** MiSTer:
    (`.gb`, `.gbc`) in `games/GAMEBOY2P`. Nothing to set up.
 6. Arcade: start **Arcade → Bubble Bobble (US, Ver 5.1) [netplay]**. Nothing
    to set up; the DIP switches are the host's during a session.
+7. GBA: start **Console → GBA_netplay**. In the OSD: **Hardware → Link Port →
+   Wireless Adapter**. See [GBA Wireless Adapter](#gba-wireless-adapter).
 
 **Switching between the netplay cores:** reboot from the MiSTer's menu first,
 then start the other core. Jumping straight from one core to the
@@ -136,8 +158,8 @@ other can leave netplay without the ROM reload at the start of a session.
 ### Playing directly (no server)
 
 - The host forwards **UDP port 7845** in its router to its MiSTer, then picks
-  **Netplay → Host** in the OSD (NES_netplay, SNES_netplay or
-  GAMEBOY2P_netplay) and loads a game.
+  **Netplay → Host** in the OSD (NES_netplay, SNES_netplay,
+  GAMEBOY2P_netplay or GBA_netplay) and loads a game.
 - The other player puts the host's address in `/media/fat/netplay.ini`
   (`peer=<address>`), picks **Netplay → Join** and loads the same game.
 - The OSD shows `Netplay: playing (delay 4)`. Player 1 is the host.
@@ -204,6 +226,28 @@ All settings are described in [`tools/netplay.ini.example`](tools/netplay.ini.ex
 - Pause, test and service switches are off during netplay. While the game waits
   for the other player's input, HDMI repeats the last picture; analog video
   may flicker for that moment.
+
+### GBA Wireless Adapter
+
+- Both start **GBA_netplay** with **Hardware → Link Port → Wireless Adapter**.
+- One picks **Hardware → Netplay → Host**, the other **Join**, and both load
+  their game. With a server, Join finds the open GBA room by itself; without
+  one, `peer=` as above. The OSD says `wireless adapter linked with Alex`.
+- Then play as on real GBAs: in the game's own wireless menu one player hosts
+  and the other joins ([Apotris](https://akouzoukos.com/apotris/downloads), a
+  free game by akouzoukos: 2 player battle → wireless; Pokémon: the Union
+  Room or the wireless club).
+- The two players may run different games that talk to each other, such as
+  Pokémon FireRed and LeafGreen.
+- No lockstep and no desync check here: each GBA runs at its own speed, and
+  the network only delays the packets. Round trips over the internet add to
+  what the game sees as the adapter's delay.
+- Loading the game again keeps the room, and the other player's MiSTer
+  follows. If the host loads the core again, the other player loads their game
+  again too.
+- Savestates and rewind are off while the adapter is on. Two players for now
+  (the adapter itself allows five). Wireless multiboot (playing with one
+  cartridge) is not supported.
 
 ## Running the server
 

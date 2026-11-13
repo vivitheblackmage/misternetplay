@@ -1,0 +1,161 @@
+From 2d05d6a3d22aea174f361c9e87e3db653adc8be3 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 10 Nov 2026 23:11:10 +0100
+Subject: [PATCH 34/42] netplay: wireless link diagnostics in netplay.log every
+ 10 s; no repeated 'linked' after a lost link
+---
+ support/netplay/netplay.cpp  | 48 ++++++++++++++++++++++++++++++++++--
+ support/netplay/rfu_link.cpp |  3 +++
+ support/netplay/rfu_link.h   |  5 +++-
+ 3 files changed, 53 insertions(+), 3 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 20cbaf7..3799731 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -685,6 +685,7 @@ static bool              own_reload = false; // main thread only
+ 
+ static std::mutex        msg_mtx;
+ static std::deque<std::string> msg_queue;    // shown one after the other, each for a while
++static std::deque<std::string> log_queue;    // only for netplay.log (diagnostics), same mutex
+ 
+ static uint64_t now_ms()
+ {
+@@ -693,6 +694,13 @@ static uint64_t now_ms()
+ 	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+ }
+ 
++// A line for netplay.log only (any thread; the main thread writes the file)
++static void log_line(const char *m)
++{
++	std::lock_guard<std::mutex> g(msg_mtx);
++	if (log_queue.size() < 64) log_queue.push_back(m);
++}
++
+ static void post_message(const char *m)
+ {
+ 	std::lock_guard<std::mutex> g(msg_mtx);
+@@ -934,7 +942,8 @@ static void *gba_wireless_thread(void *)
+ 	bool linked = false;
+ 	const char *told = nullptr;
+ 	uint64_t next_frame_us = now_ms() * 1000;
+-	uint64_t last_busy = 0;
++	uint64_t last_busy = 0, last_stats = 0;
++	bool lost_told = false;
+ 
+ 	while (!quit)
+ 	{
+@@ -1019,7 +1028,7 @@ static void *gba_wireless_thread(void *)
+ 		if (link)
+ 		{
+ 			link->tick(now, [&rfu](const uint8_t *b, size_t n) { rfu.receive(0, b, n); });
+-			if (link->connected() && !linked)
++			if (link->connected() && !linked && !lost_told)
+ 			{
+ 				linked = true;
+ 				char text[96];
+@@ -1037,8 +1046,21 @@ static void *gba_wireless_thread(void *)
+ 			if (linked && link->lost(now))
+ 			{
+ 				linked = false;
++				lost_told = true;
+ 				post_message("Netplay: connection lost");
+ 			}
++			if (lost_told && !link->lost(now)) lost_told = false;   // packets again: say "linked" once more
++			// diagnostics in netplay.log every 10 s (packets each way, the path)
++			if (now - last_stats >= 10000)
++			{
++				last_stats = now;
++				char text[160];
++				snprintf(text, sizeof(text), "wireless: sent %u received %u resent %u unacked %u foreign %u %s%s",
++				         link->sent(), link->received(), link->resent(), (unsigned)link->unacked(), link->foreign(),
++				         udp->via_server() ? (udp->direct() ? "direct" : "via server") : "peer=",
++				         link->connected() ? "" : " (not linked)");
++				log_line(text);
++			}
+ 		}
+ 
+ 		// the adapter's own clock: timeouts and broadcasts count GBA frames
+@@ -2474,6 +2496,28 @@ void netplay_poll(void)
+ 			t_shown = now;
+ 		}
+ 	}
++	// diagnostics lines (log_line) go to the file only
++	{
++		std::deque<std::string> lines;
++		{
++			std::lock_guard<std::mutex> g(msg_mtx);
++			lines.swap(log_queue);
++		}
++		if (!lines.empty())
++		{
++			std::string log = getFullPath("netplay");
++			mkdir(log.c_str(), 0777);
++			log += "/netplay.log";
++			if (FILE *f = fopen(log.c_str(), "a"))
++			{
++				time_t t = time(nullptr);
++				char ts[32];
++				strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&t));
++				for (const std::string &l : lines) fprintf(f, "%s %s\n", ts, l.c_str());
++				fclose(f);
++			}
++		}
++	}
+ 	if (show)
+ 	{
+ 		printf("%s\n", text);
+diff --git a/support/netplay/rfu_link.cpp b/support/netplay/rfu_link.cpp
+index a52d452..f446195 100644
+--- a/support/netplay/rfu_link.cpp
++++ b/support/netplay/rfu_link.cpp
+@@ -26,6 +26,7 @@ void RfuLink::put(uint8_t type, uint16_t seq, const uint8_t *data, size_t len)
+ 	put16(pkt + 9, (uint16_t)len);
+ 	if (len) memcpy(pkt + HDR, data, len);
+ 	t_->send(pkt, HDR + len);
++	sent_++;
+ 	last_ack_ = now_;
+ 	ack_due_ = false;
+ }
+@@ -54,6 +55,7 @@ void RfuLink::tick(uint64_t now_ms, const Deliver &deliver)
+ 	{
+ 		if ((size_t)n < HDR || memcmp(buf, MAGIC, 4))
+ 		{
++			foreign_++;
+ 			// something else talks to us: a lockstep core, or junk
+ 			if (n >= 4 && !connected_) refusal_ = "Netplay: the other player is not using the wireless adapter";
+ 			continue;
+@@ -72,6 +74,7 @@ void RfuLink::tick(uint64_t now_ms, const Deliver &deliver)
+ 			locked_ = true;
+ 		}
+ 		last_rx_ = now_ms;
++		received_++;
+ 		if (!connected_)
+ 		{
+ 			connected_ = true;
+diff --git a/support/netplay/rfu_link.h b/support/netplay/rfu_link.h
+index 030f80a..022712e 100644
+--- a/support/netplay/rfu_link.h
++++ b/support/netplay/rfu_link.h
+@@ -32,6 +32,9 @@ public:
+ 	// observation (tests)
+ 	size_t unacked() const { return out_.size(); }
+ 	uint32_t resent() const { return resent_; }
++	uint32_t sent() const { return sent_; }
++	uint32_t received() const { return received_; }
++	uint32_t foreign() const { return foreign_; }
+ 
+ private:
+ 	enum : uint8_t { T_HELLO = 0, T_DATA = 1, T_ACK = 2 };
+@@ -50,7 +53,7 @@ private:
+ 	std::map<uint16_t, std::vector<uint8_t>> early_;   // theirs, ahead of expect_
+ 	uint64_t last_hello_ = 0, last_ack_ = 0, last_rx_ = 0, now_ = 0;
+ 	bool ack_due_ = false;
+-	uint32_t resent_ = 0;
++	uint32_t resent_ = 0, sent_ = 0, received_ = 0, foreign_ = 0;
+ 
+ 	void put(uint8_t type, uint16_t seq, const uint8_t *data, size_t len);
+ 	void on_ack(uint16_t ack);
+-- 
+2.43.0
+

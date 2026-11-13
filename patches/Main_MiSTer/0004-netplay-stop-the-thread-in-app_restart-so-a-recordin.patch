@@ -1,8 +1,8 @@
-From 6093d9d3534b45563ffc771a8c26b567b116fb6f Mon Sep 17 00:00:00 2001
+From 5f3072285d31f33f179ec0f7909627f969107c8f Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sat, 31 Oct 2026 21:17:15 +0100
-Subject: [PATCH] netplay: stop the thread in app_restart so a recording is
- saved on core change
+Subject: [PATCH 04/42] netplay: stop the thread in app_restart so a recording
+ is saved on core change
 
 Loading another core ends the process in app_restart() (_exit after fork).
 netplay_stop() was only reached in the next process, so mode=record never

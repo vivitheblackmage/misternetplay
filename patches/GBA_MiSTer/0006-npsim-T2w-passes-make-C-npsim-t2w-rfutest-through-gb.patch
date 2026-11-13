@@ -1,0 +1,120 @@
+From c382fe1f8812523506e24439a637654126b2ab8d Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 10 Nov 2026 20:44:22 +0100
+Subject: [PATCH 06/12] npsim: T2w passes (make -C npsim t2w): rfutest through
+ gba_rfu, the mailbox and Main's rfu.cpp to a peer adapter; start bit reads 1
+ from the write; bus write data taken at command time; own stack in rfutest;
+ BIOS load from clock 16
+---
+ npsim/Makefile    |  3 ++-
+ npsim/gba_sim.cpp | 12 +++++++-----
+ npsim/rfutest.s   | 19 ++++++++++++++-----
+ 3 files changed, 23 insertions(+), 11 deletions(-)
+
+diff --git a/npsim/Makefile b/npsim/Makefile
+index abc1591..24a5595 100644
+--- a/npsim/Makefile
++++ b/npsim/Makefile
+@@ -40,7 +40,8 @@ $(BUILD)/rfutest.gba: rfutest.s
+ 	python3 -I -c 'import sys; h=open(sys.argv[1],"rb").read()[:0xc0]; c=open(sys.argv[2],"rb").read(); r=h+c; r+=bytes(-len(r)%4); r+=bytes(65536-len(r)); open(sys.argv[3],"wb").write(r)' ../sim/tests/armwrestler.gba $(BUILD)/asm/t.bin $@
+ 
+ t2w: obj/gba_sim $(BUILD)/rfutest.gba
+-	obj/gba_sim $(BUILD)/rfutest.gba --rfu --nokeys --frames 30 --lat 8
++	obj/gba_sim $(BUILD)/rfutest.gba --rfu --nokeys --frames 30 --lat 8 2>&1 | tee $(BUILD)/t2w.log | grep -E "T2w|peer|rfutest:"
++	grep -q "^PASS T2w" $(BUILD)/t2w.log
+ 
+ clean:
+ 	rm -rf $(BUILD) obj
+diff --git a/npsim/gba_sim.cpp b/npsim/gba_sim.cpp
+index 7253238..f276b85 100644
+--- a/npsim/gba_sim.cpp
++++ b/npsim/gba_sim.cpp
+@@ -196,7 +196,8 @@ int main(int argc, char **argv)
+ 		if (bn != 16384) { fprintf(stderr, "%s: not 16 KB\n", bios); return 1; }
+ 		for (int i = 0; i < 4096; i++) bios_w.push_back(bb[4 * i] | bb[4 * i + 1] << 8 | bb[4 * i + 2] << 16 | (uint32_t)bb[4 * i + 3] << 24);
+ 	}
+-	const uint64_t on_at = bios ? 4096 * 2 + 100 : 100;
++	const uint64_t bios_from = 16;    // not in the first clocks (the model is still starting)
++	const uint64_t on_at = bios ? bios_from + 4096 * 2 + 100 : 100;
+ 	uint64_t ks = keyseed * 0x2545F4914F6CDD1Dull + 5;
+ 	uint32_t crc = 0xFFFFFFFFu;
+ 	int frame = 0;
+@@ -227,7 +228,7 @@ int main(int argc, char **argv)
+ 		if (pctrace_left)                        // GBA_PCTRACE=n: the first n PC jumps from the game's start on
+ 		{
+ 			uint32_t pc = top->cpu_pc;
+-			if (pc >= 0x08000000u) pctrace_on = true;
++			if (pc >= 0x08000000u || getenv("GBA_PCTRACE_START")) pctrace_on = true;
+ 			if (pctrace_on && frame >= pctrace_frame && pc != last_pc && pc != last_pc + 4 && pc != last_pc + 2 && (pctrace_all || seen_jumps.insert(((uint64_t)last_pc << 32) | pc).second))
+ 			{
+ 				fprintf(stderr, "jump %08x -> %08x (frame %d)\n", last_pc, pc, frame);
+@@ -237,10 +238,10 @@ int main(int argc, char **argv)
+ 		}
+ 		if (cycles == on_at) top->gba_on = 1;
+ 		top->bios_wr = 0;
+-		if (bios && cycles < 4096 * 2 && (cycles & 1) == 0)   // one word every other clock, as a download
++		if (bios && cycles >= bios_from && cycles < bios_from + 4096 * 2 && ((cycles - bios_from) & 1) == 0)   // one word every other clock
+ 		{
+-			top->bios_wraddr = (uint32_t)(cycles / 2);
+-			top->bios_wrdata = bios_w[cycles / 2];
++			top->bios_wraddr = (uint32_t)((cycles - bios_from) / 2);
++			top->bios_wrdata = bios_w[(cycles - bios_from) / 2];
+ 			top->bios_wr = 1;
+ 		}
+ 		top->clk = 1;
+@@ -253,6 +254,7 @@ int main(int argc, char **argv)
+ 			if (top->pixel_addr == 38399)
+ 			{
+ 				printf("frame %d crc %08x pc %08x\n", frame, ~crc, top->cpu_pc);
++				if (rfu_on && mem[131072 + 0x40] == 1 && peer_step == 3) break;   // T2w finished (EWRAM 0x02000100)
+ 				if (rfu_on)
+ 				{
+ 					rfu_gba.frame();
+diff --git a/npsim/rfutest.s b/npsim/rfutest.s
+index 1bf8240..5c0152e 100644
+--- a/npsim/rfutest.s
++++ b/npsim/rfutest.s
+@@ -19,6 +19,10 @@
+     .equ RCNT,      0x04000134
+ 
+ start:
++    @ own stack, as every game's crt0 (the BIOS's may differ: open BIOS in the bench)
++    mov   r0, #0x1f                 @ system mode
++    msr   cpsr_c, r0
++    ldr   sp, =0x03007f00
+     mov   r11, #0x02000000          @ results
+     mov   r10, #0                   @ failed checks
+ 
+@@ -80,10 +84,15 @@ start:
+     addne r10, r10, #1
+ 
+     @ Broadcast: six words 0x11..0x66
++    @ (word by word: the Verilator bench loses LDM registers in some timings, research/gba2p-phase0)
+     adr   r9, bcst
+-    ldmia r9, {r2-r7}
+-    add   r9, r11, #0x80
+-    stmia r9, {r2-r7}
++    add   r8, r11, #0x80
++    mov   r3, #0
++8:  ldr   r2, [r9, r3]
++    str   r2, [r8, r3]
++    add   r3, r3, #4
++    cmp   r3, #24
++    bne   8b
+     mov   r0, #0x16
+     mov   r1, #6
+     bl    command
+@@ -187,8 +196,8 @@ start:
+     @ SendData to the client: 4 bytes 0x12345678 (the bench checks the peer got them)
+     mov   r2, #4
+     ldr   r3, =0x12345678
+-    add   r9, r11, #0x80
+-    stmia r9, {r2, r3}
++    str   r2, [r11, #0x80]
++    str   r3, [r11, #0x84]
+     mov   r0, #0x24
+     mov   r1, #2
+     bl    command
+-- 
+2.43.0
+

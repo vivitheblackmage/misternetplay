@@ -1,5 +1,65 @@
 # Release notes
 
+## v0.5: GBA Wireless Adapter
+
+### New: GBA wireless games
+
+- **`GBA_netplay.rbf`**: the MiSTer GBA core with an emulated **GBA Wireless
+  Adapter** on the link port. Games that use Nintendo's adapter play over the
+  internet: Apotris, Pokémon FireRed, LeafGreen and Emerald (the Union Room:
+  battles and trades), and homebrew built on gba-link-connection.
+- This is not lockstep: each MiSTer runs its own game, and the two adapters
+  talk to each other over the network. The players may run different games
+  that talk to each other (FireRed and LeafGreen).
+- In the OSD: **Hardware → Link Port → Wireless Adapter**, then **Netplay →
+  Host** on one MiSTer and **Join** on the other, and load the game. Then use
+  the game's own wireless menu, as on real GBAs.
+- The core handles the adapter's handshake and words; the Main binary answers
+  each command (ported from gpSP's adapter emulation, GPL-2.0-or-later) and
+  carries the adapter's packets over a reliable, ordered link between the two
+  MiSTers, directly or through the lobby server.
+- Loading the game again keeps the room: the other player's MiSTer follows
+  without loading its own game again.
+- A lost packet is sent again after about 1.5 round trips, so the game's data
+  is held up for tens of milliseconds, not 100.
+- `netplay.log` shows the link's round trip, resends, and how fast the
+  adapter's commands are answered, every 10 seconds.
+- To try it: **Apotris**, a free game by akouzoukos with 2-player battles over
+  the adapter, from https://akouzoukos.com/apotris/downloads (put
+  `Apotris.gba` in `games/GBA`).
+
+Tested on hardware: two MiSTers over the internet through the lobby server on a
+Raspberry Pi: Pokémon FireRed/LeafGreen battles and a trade in the Union Room, and
+gba-link-connection's `LinkUniversal_stress` ROM (packet loss and packet sync,
+65,534 packets each without a loss; ping 26 to 47 ms with a 20 ms network round
+trip). In simulation: the core's serial port and adapter against Pokémon's own
+wireless library, with the Main binary's answers late and out of order.
+
+### Scripts
+
+- `netplay_on` no longer saves an older netplay binary as `MiSTer_offline`
+  when you update: your normal binary stays there. `netplay_off` says so when
+  `MiSTer_offline` is a netplay binary (from an older `netplay_on`); then
+  `update_all` or `downloader` brings the normal binary back.
+
+### Server
+
+- GBA rooms accept any GBA game, so FireRed and LeafGreen find each other.
+  Update the server too.
+
+### Known limits
+
+- Two players (the adapter allows five). No wireless multiboot (one cartridge
+  for both). Savestates and rewind are off while the adapter is on.
+- Each command the game sends to the adapter is answered by the Main binary,
+  usually in 0.2 to 0.5 ms; about 1 in 100 takes 1 to 3 ms. The games tested
+  handle this. Moving the answers for the data commands into the core is
+  planned.
+- When the host loads the core again (not just the game), the other player
+  loads their game again too.
+- Through a server on the same network as one of the players, the link goes
+  through the server; the extra step is about a millisecond.
+
 ## v0.4: Arcade netplay (Bubble Bobble)
 
 ### New: arcade netplay

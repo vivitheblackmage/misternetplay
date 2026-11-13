@@ -1,7 +1,8 @@
-From 431be812b987c8ebdf6c83428c8a1a18b358cf7c Mon Sep 17 00:00:00 2001
+From acf3a5e003a2aa96e5017ccafbd216b3a76d1893 Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Tue, 3 Nov 2026 23:03:38 +0100
-Subject: [PATCH] netplay tests: NP_NAME sets the player name in udp_harness
+Subject: [PATCH 15/42] netplay tests: NP_NAME sets the player name in
+ udp_harness
 ---
  support/netplay/test/udp_harness.cpp | 3 ++-
  1 file changed, 2 insertions(+), 1 deletion(-)

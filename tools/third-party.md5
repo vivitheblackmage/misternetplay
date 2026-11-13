@@ -1,0 +1,3 @@
+# Third-party files the kit and the releases carry unchanged (md5, name).
+# check_private.sh still looks for the private patterns in them, but not for
+# e-mail addresses: random bytes in a ROM can look like one.

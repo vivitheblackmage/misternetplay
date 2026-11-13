@@ -1,0 +1,218 @@
+From 993a0d391acd11dcda8edc0851c4a5ca08c7b024 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Mon, 9 Nov 2026 23:16:08 +0100
+Subject: [PATCH 02/12] npsim: fix_inout.py (ghdl synth loses the inout
+ register bus), sim BIOS logo wait 1 frame, debug read, PC histogram, trace
+ build
+---
+ npsim/.gitignore     |  2 ++
+ npsim/Makefile       | 12 ++++++++++--
+ npsim/fix_inout.py   | 27 +++++++++++++++++++++++++++
+ npsim/gba_sim.cpp    | 36 +++++++++++++++++++++++++++++++++++-
+ npsim/ghdl_fixes.txt |  2 ++
+ npsim/sim_top.sv     | 14 +++++++++-----
+ 6 files changed, 85 insertions(+), 8 deletions(-)
+ create mode 100644 npsim/fix_inout.py
+
+diff --git a/npsim/.gitignore b/npsim/.gitignore
+index 722a501..a54a997 100644
+--- a/npsim/.gitignore
++++ b/npsim/.gitignore
+@@ -1,2 +1,4 @@
+ build/
+ obj/
++obj_trace/
++trace.vcd
+diff --git a/npsim/Makefile b/npsim/Makefile
+index 184370a..455e773 100644
+--- a/npsim/Makefile
++++ b/npsim/Makefile
+@@ -20,10 +20,18 @@ $(BUILD)/analyzed: vhdl_files.txt ghdl_fixes.txt ghdl_prep.py $(VHDL_SRC)
+ $(BUILD)/vlog/gba_top.v: $(BUILD)/analyzed synth.sh
+ 	./synth.sh
+ 
+-obj/gba_sim: $(BUILD)/vlog/gba_top.v sim_top.sv gba_sim.cpp
+-	verilator --cc --exe --build -j 0 $(VFLAGS) -Mdir obj -o gba_sim sim_top.sv $(BUILD)/vlog/gba_top.v gba_sim.cpp
++# ghdl synth loses the inout register bus (fix_inout.py)
++$(BUILD)/vlog/gba_top_fixed.v: $(BUILD)/vlog/gba_top.v fix_inout.py
++	python3 -I fix_inout.py $< $@
++
++obj/gba_sim: $(BUILD)/vlog/gba_top_fixed.v sim_top.sv gba_sim.cpp
++	verilator --cc --exe --build -j 0 $(VFLAGS) -Mdir obj -o gba_sim sim_top.sv $(BUILD)/vlog/gba_top_fixed.v gba_sim.cpp
+ 
+ clean:
+ 	rm -rf $(BUILD) obj
+ 
+ .PHONY: all clean
++
++# obj_trace/gba_sim: the same with a VCD of 600 clocks from the first GBA_DBGREAD read (trace.vcd)
++obj_trace/gba_sim: $(BUILD)/vlog/gba_top_fixed.v sim_top.sv gba_sim.cpp
++	verilator --cc --exe --build -j 0 $(VFLAGS) --trace -CFLAGS -DGBA_TRACE -Mdir obj_trace -o gba_sim sim_top.sv $(BUILD)/vlog/gba_top_fixed.v gba_sim.cpp
+diff --git a/npsim/fix_inout.py b/npsim/fix_inout.py
+new file mode 100644
+index 0000000..296e455
+--- /dev/null
++++ b/npsim/fix_inout.py
+@@ -0,0 +1,27 @@
++#!/usr/bin/env python3
++"""ghdl synth does not keep a resolved record signal that several instances
++drive through inout ports (the core's register bus gb_bus, proc_bus_gb_type,
++'Z' when not addressed): it declares the record as one vector, drives it with
++`assign V = N'bX; // (signal)` and connects every instance to one-way copies
++`assign nK = V[hi:lo]; // extract`. Then no instance ever sees another's
++drivers (an IO register read returns open bus). This rewrites each such V in
++the Verilog: every nK becomes the slice V[hi:lo] itself (a real inout
++connection), the copies and the X driver go. Verilator then resolves the
++tristate drivers as the FPGA does. Simulation only.
++usage: fix_inout.py in.v out.v"""
++import re, sys
++
++src, dst = sys.argv[1:3]
++text = open(src).read()
++names = re.findall(r"^\s*assign (\w+) = \d+'bX; // \(signal\)$", text, re.M)
++for v in names:
++    ext = dict(re.findall(r"^\s*assign (n\d+) = %s(\[[^\]]+\]); // extract$" % re.escape(v), text, re.M))
++    text = re.sub(r"^\s*assign (n\d+) = %s\[[^\]]+\]; // extract\n" % re.escape(v), "", text, flags=re.M)
++    text = re.sub(r"^\s*assign %s = \d+'bX; // \(signal\)\n" % re.escape(v), "", text, flags=re.M)
++    if ext:
++        pat = re.compile(r"\b(%s)\b" % "|".join(sorted(ext, key=len, reverse=True)))
++        text = pat.sub(lambda m: v + ext[m.group(1)], text)
++        # the declarations "wire [..] V[hi:lo];" that this leaves are dropped
++        text = re.sub(r"^\s*wire(\s*\[[^\]]*\])?\s+%s\[[^\]]+\];\n" % re.escape(v), "", text, flags=re.M)
++    print(f"{v}: {len(ext)} copies replaced")
++open(dst, "w").write(text)
+diff --git a/npsim/gba_sim.cpp b/npsim/gba_sim.cpp
+index 9efdc39..de6f088 100644
+--- a/npsim/gba_sim.cpp
++++ b/npsim/gba_sim.cpp
+@@ -11,6 +11,9 @@
+ // core is deterministic in emulated time.
+ #include "Vsim_top.h"
+ #include "verilated.h"
++#ifdef GBA_TRACE
++#include "verilated_vcd_c.h"
++#endif
+ #include <chrono>
+ #include <cstdint>
+ #include <cstdio>
+@@ -18,6 +21,8 @@
+ #include <cstring>
+ #include <string>
+ #include <vector>
++#include <map>
++#include <algorithm>
+ 
+ static std::vector<uint32_t> mem(1u << 24);    // 64 MB flat memory, DWORD addressed
+ static uint64_t lat_state[2];
+@@ -25,7 +30,12 @@ static int lat_max = 0;
+ 
+ static uint64_t xs(uint64_t &s) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; }
+ 
+-extern "C" int mem_read(int addr) { return (int)mem[(uint32_t)addr & (mem.size() - 1)]; }
++static int memlog = 0;
++extern "C" int mem_read(int addr)
++{
++	if (memlog > 0) { memlog--; fprintf(stderr, "mem_read %08x -> %08x\n", (uint32_t)addr, mem[(uint32_t)addr & (mem.size() - 1)]); }
++	return (int)mem[(uint32_t)addr & (mem.size() - 1)];
++}
+ extern "C" void mem_write(int addr, int data) { mem[(uint32_t)addr & (mem.size() - 1)] = (uint32_t)data; }
+ extern "C" int lat_rand(int port) { return lat_max ? (int)(xs(lat_state[port & 1]) % (uint64_t)(lat_max + 1)) : 0; }
+ 
+@@ -90,8 +100,18 @@ int main(int argc, char **argv)
+ 	int frame = 0;
+ 	uint64_t cycles = 0;
+ 	auto t0 = std::chrono::steady_clock::now();
++#ifdef GBA_TRACE
++	Verilated::traceEverOn(true);
++	VerilatedVcdC *vcd = nullptr;
++#endif
++	uint64_t dbg_at = 0;                         // GBA_DBGREAD=addr: read it over the debug bus at each frame end
++	std::map<uint32_t, uint64_t> pcs;            // --pcs: where the CPU spends its time
++	bool want_pcs = getenv("GBA_PCS") != nullptr;
++	uint64_t pcs_mask = want_pcs ? strtoull(getenv("GBA_PCS"), nullptr, 0) : 0;
++	if (getenv("GBA_MEMLOG")) memlog = atoi(getenv("GBA_MEMLOG"));
+ 	while (frame < frames && !Verilated::gotFinish())
+ 	{
++		if (want_pcs && (cycles & pcs_mask) == 0) pcs[top->cpu_pc & ~3u]++;
+ 		if (cycles == 100) top->gba_on = 1;
+ 		top->clk = 1;
+ 		top->eval();
+@@ -102,6 +122,7 @@ int main(int argc, char **argv)
+ 			if (top->pixel_addr == 38399)
+ 			{
+ 				printf("frame %d crc %08x pc %08x\n", frame, ~crc, top->cpu_pc);
++				if (getenv("GBA_DBGREAD")) { top->dbg_addr = strtoul(getenv("GBA_DBGREAD"), nullptr, 0); dbg_at = cycles + 1; }
+ 				fflush(stdout);
+ 				crc = 0xFFFFFFFFu;
+ 				frame++;
+@@ -116,10 +137,23 @@ int main(int argc, char **argv)
+ 				}
+ 			}
+ 		}
++		top->dbg_written = dbg_at && cycles == dbg_at;
++#ifdef GBA_TRACE
++		if (dbg_at && cycles == dbg_at && !vcd) { vcd = new VerilatedVcdC; top->trace(vcd, 99); vcd->open("trace.vcd"); }
++		if (vcd) { vcd->dump(cycles * 2); if (cycles > dbg_at + 600) { vcd->close(); vcd = nullptr; return 0; } }
++#endif
++		if (dbg_at && cycles == dbg_at + 2000) { fprintf(stderr, "dbg read %07x = %08x\n", top->dbg_addr, top->dbg_data); dbg_at = 0; }
+ 		top->clk = 0;
+ 		top->eval();
+ 		cycles++;
+ 	}
++	if (want_pcs)
++	{
++		std::vector<std::pair<uint64_t, uint32_t>> v;
++		for (auto &p : pcs) v.push_back({p.second, p.first});
++		std::sort(v.rbegin(), v.rend());
++		for (size_t i = 0; i < v.size() && i < (getenv("GBA_PCS_ALL") ? v.size() : 12); i++) fprintf(stderr, "pc %08x %llu\n", v[i].second, (unsigned long long)v[i].first);
++	}
+ 	double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+ 	fprintf(stderr, "%d frames, %llu clocks, %.1f s, %.0f clocks/s\n", frame, (unsigned long long)cycles, s, cycles / s);
+ 	delete top;
+diff --git a/npsim/ghdl_fixes.txt b/npsim/ghdl_fixes.txt
+index 5fe594a..adb0648 100644
+--- a/npsim/ghdl_fixes.txt
++++ b/npsim/ghdl_fixes.txt
+@@ -11,3 +11,5 @@ rtl/gba_memorymux.vhd|integer range 0 to 128;|integer range 0 to 127;|all
+ rtl/gba_top.vhd|integer range 0 to 128;|integer range 0 to 127;|all
+ rtl/gba_gpu.vhd|integer range 0 to 128;|integer range 0 to 127;|all
+ rtl/gba_gpu_drawer.vhd|integer range 0 to 128;|integer range 0 to 127;|all
++# sim speed: the open BIOS waits 0x77 frames (logo) by polling VCOUNT; wait 1 (mov r1,#0x77 -> #1)
++rtl/gba_bios.vhd|x"E3A01077",|x"E3A01001",
+diff --git a/npsim/sim_top.sv b/npsim/sim_top.sv
+index 6aabcf7..3added8 100644
+--- a/npsim/sim_top.sv
++++ b/npsim/sim_top.sv
+@@ -14,7 +14,11 @@ module sim_top(
+     output     [15:0] pixel_addr,
+     output     [17:0] pixel_data,
+     output            pixel_we,
+-    output     [31:0] cpu_pc
++    output     [31:0] cpu_pc,
++    // debug bus (GBA_Bus*): a read of any address, for debugging the bench
++    input      [27:0] dbg_addr,
++    input             dbg_written,
++    output     [31:0] dbg_data
+ );
+ 
+ import "DPI-C" function int  mem_read (input int addr);
+@@ -166,12 +170,12 @@ gba_top u_gba(
+     .AnalogTiltX        ( 8'd0          ),
+     .AnalogTiltY        ( 8'd0          ),
+     .Rumble             (               ),
+-    .GBA_BusAddr        ( 28'd0         ),
++    .GBA_BusAddr        ( dbg_addr      ),
+     .GBA_BusRnW         ( 1'b1          ),
+-    .GBA_BusACC         ( 2'd0          ),
++    .GBA_BusACC         ( 2'd2          ),
+     .GBA_BusWriteData   ( 32'd0         ),
+-    .GBA_BusReadData    (               ),
+-    .GBA_Bus_written    ( 1'b0          ),
++    .GBA_BusReadData    ( dbg_data      ),
++    .GBA_Bus_written    ( dbg_written   ),
+     .pixel_out_x        (               ),
+     .pixel_out_y        (               ),
+     .pixel_out_addr     ( pixel_addr    ),
+-- 
+2.43.0
+

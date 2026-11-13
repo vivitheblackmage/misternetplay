@@ -1,0 +1,38 @@
+From 903bf6ed146db39b84250faf3a1528cc04ec481a Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 10 Nov 2026 22:17:56 +0100
+Subject: [PATCH 33/42] netplay: the wireless adapter polls its mailbox every
+ 100 us only while the game talks to it (50% CPU otherwise)
+---
+ support/netplay/netplay.cpp | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 1e290b4..20cbaf7 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -934,6 +934,7 @@ static void *gba_wireless_thread(void *)
+ 	bool linked = false;
+ 	const char *told = nullptr;
+ 	uint64_t next_frame_us = now_ms() * 1000;
++	uint64_t last_busy = 0;
+ 
+ 	while (!quit)
+ 	{
+@@ -1049,9 +1050,10 @@ static void *gba_wireless_thread(void *)
+ 		}
+ 		if (now_us >= next_frame_us) next_frame_us = now_us;   // after a stall: no burst
+ 
+-		// the game waits for every answer: poll often (one command per poll)
+-		mbx.poll((uint32_t)now, rfu);
+-		usleep(100);
++		// the game waits for every answer: poll often while it talks to the
++		// adapter (commands come in bursts), else once a millisecond (CPU)
++		if (mbx.poll((uint32_t)now, rfu)) last_busy = now;
++		usleep(now - last_busy < 50 ? 100 : 1000);
+ 	}
+ 
+ 	delete link;
+-- 
+2.43.0
+

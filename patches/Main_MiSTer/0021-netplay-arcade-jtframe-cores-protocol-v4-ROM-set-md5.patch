@@ -1,8 +1,8 @@
-From 7363fef6f44aaa05c1d1f8ec75e9189ce2c54376 Mon Sep 17 00:00:00 2001
+From 647693275055426c8cafbbdeeba6aabfc9462613 Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sun, 8 Nov 2026 13:21:42 +0100
-Subject: [PATCH] netplay: arcade (jtframe cores), protocol v4: ROM set md5
- from the MRA, the host's DIP switches, OSD starts the session
+Subject: [PATCH 21/42] netplay: arcade (jtframe cores), protocol v4: ROM set
+ md5 from the MRA, the host's DIP switches, OSD starts the session
 ---
  support/arcade/mra_loader.cpp         |   6 +
  support/netplay/netplay.cpp           | 171 ++++++++++++++++++++++++--

@@ -252,7 +252,7 @@ func writePage(w http.ResponseWriter, l *library, catalog string, r *relay) {
 	var arcRooms []roomInfo
 	for _, ri := range rooms {
 		c := strings.ToUpper(ri.core)
-		if c != "NES" && c != "SNES" && c != "GB2P" {
+		if c != "NES" && c != "SNES" && c != "GB2P" && c != "GBA" {
 			c = "ARC" // arcade: any other core (JTBUBL, ...), SPEC 12.5
 			arcRooms = append(arcRooms, ri)
 		}

@@ -1,7 +1,7 @@
-From c7f1142adbebbeadfdd8914fdbd5dfa1ab180a6a Mon Sep 17 00:00:00 2001
+From a533659f9bbde6c305fac41edb53d26e5d8ee822 Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sat, 31 Oct 2026 21:54:06 +0100
-Subject: [PATCH] netplay: one recording file per game
+Subject: [PATCH 07/42] netplay: one recording file per game
 
 Without file= in netplay.ini, record and replay use
 netplay/<ROM file name>.npr, so recording another game (or the core's

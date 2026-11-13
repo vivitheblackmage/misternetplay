@@ -1,0 +1,153 @@
+From a25fd006a7f775700934303a29452f537924e0fb Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Wed, 11 Nov 2026 20:52:51 +0100
+Subject: [PATCH 37/42] netplay: wireless host reports a missed client only
+ after 250 ms and only the clients that did not ack (Pokemon communication
+ error)
+---
+ support/netplay/rfu.cpp           | 38 ++++++++++++++++++++++++-------
+ support/netplay/rfu.h             |  2 +-
+ support/netplay/test/test_rfu.cpp | 24 ++++++++++++++++---
+ 3 files changed, 52 insertions(+), 12 deletions(-)
+
+diff --git a/support/netplay/rfu.cpp b/support/netplay/rfu.cpp
+index c7ba45b..60bcaa9 100644
+--- a/support/netplay/rfu.cpp
++++ b/support/netplay/rfu.cpp
+@@ -56,6 +56,10 @@ enum : uint32_t {
+ 
+ const unsigned BCST_ANNOUNCE_FRAMES = 30;     // broadcast twice per second
+ const unsigned CLIENT_TIMEOUT_FRAMES = 240;   // host drops a silent client after 4 s
++// A host's Wait reports clients that did not ack its data no sooner than this:
++// the real adapter's retransmissions take ~3 ms each, a round trip over the
++// internet tens of ms. Reporting early makes Pokemon drop the link.
++const uint32_t RTX_MIN_MS = 250;
+ 
+ uint32_t be32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
+ uint32_t le32(const uint8_t *p) { return p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24; }
+@@ -284,10 +288,13 @@ int Rfu::command(uint8_t cmd, const uint32_t *data, int len, uint32_t *out)
+ 	case CMD_RTX_WAIT:
+ 		if (state_ == HOST)
+ 		{
+-			if (tx_.blen <= 90)
+-				for (int i = 0; i < 4; i++)
+-					if (host_.clients[i].devid)
++			for (int i = 0; i < 4; i++)
++				if (host_.clients[i].devid)
++				{
++					host_.clients[i].unacked = tx_.blen <= 90;
++					if (tx_.blen <= 90)
+ 						send_data(host_.clients[i].peer, NET_HOST_SEND, tx_.blen, tx_.buf, tx_.blen);
++				}
+ 		}
+ 		else if (state_ == CLIENT)
+ 		{
+@@ -364,7 +371,14 @@ int Rfu::wait_poll(uint32_t now_ms, uint32_t *out)
+ 	// timeouts as gpSP: Setup's timeout in frames (0: none), and for a host
+ 	// the retransmissions in adapter "frames" of 1/6 of a GBA frame
+ 	bool timed_out = timeout_frames_ && waited >= (uint32_t)timeout_frames_ * 1000 / 60;
+-	bool rtx_out = waited >= (uint32_t)rtx_max_ * 1000 / 360;
++	// for a host: which clients have the last data (acked), which not yet.
++	// rtx_max 0 means retransmit forever: never report a miss.
++	uint32_t got = 0, missing = 0;
++	if (state_ == HOST)
++		for (int i = 0; i < 4; i++)
++			if (host_.clients[i].devid) (host_.clients[i].unacked ? missing : got) |= 1u << i;
++	uint32_t rtx_ms = (uint32_t)rtx_max_ * 1000 / 360;
++	bool rtx_out = rtx_max_ && waited >= (rtx_ms > RTX_MIN_MS ? rtx_ms : RTX_MIN_MS);
+ 	int n = 0;
+ 	if (state_ == IDLE)
+ 	{
+@@ -372,10 +386,13 @@ int Rfu::wait_poll(uint32_t now_ms, uint32_t *out)
+ 		out[n++] = 0xF;
+ 	}
+ 	else if (data_avail()) out[n++] = 0x99660000 | EVT_DATA;
+-	else if (state_ == HOST && rtx_out)
++	else if (state_ == HOST && got && !missing) out[n++] = 0x99660000 | EVT_DATA;   // every client has it
++	else if (state_ == HOST && missing && rtx_out)
+ 	{
+-		out[n++] = 0x99660000 | 1 << 8 | EVT_DATA;   // clients that did not receive
+-		out[n++] = 0x00000F0F;
++		// bits 0-3: clients that received; bits 8-11 (inactive) stay clear:
++		// a silent client is dropped after 4 s (frame())
++		out[n++] = 0x99660000 | 1 << 8 | EVT_DATA;
++		out[n++] = got;
+ 	}
+ 	else if (timed_out) out[n++] = 0x99660000 | EVT_TIMEOUT;
+ 	else return 0;
+@@ -488,6 +505,7 @@ void Rfu::receive(int peer, const uint8_t *buf, size_t len)
+ 			Client &c = host_.clients[clid];
+ 			if (c.devid != devid || c.peer != peer || blen > 16 || blen > plen) return;
+ 			c.ttl = 0;
++			c.unacked = false;
+ 			for (int i = 0; i < 4; i++)
+ 				if (!c.pkts[i].len)
+ 				{
+@@ -502,7 +520,11 @@ void Rfu::receive(int peer, const uint8_t *buf, size_t len)
+ 		if (state_ != HOST) return;
+ 		{
+ 			uint32_t clid = (h >> 16) & 3;
+-			if (host_.clients[clid].devid == (uint16_t)h && host_.clients[clid].peer == peer) host_.clients[clid].ttl = 0;
++			if (host_.clients[clid].devid == (uint16_t)h && host_.clients[clid].peer == peer)
++			{
++				host_.clients[clid].ttl = 0;
++				host_.clients[clid].unacked = false;
++			}
+ 		}
+ 		break;
+ 	}
+diff --git a/support/netplay/rfu.h b/support/netplay/rfu.h
+index 191ab27..092d84d 100644
+--- a/support/netplay/rfu.h
++++ b/support/netplay/rfu.h
+@@ -60,7 +60,7 @@ private:
+ 	struct { uint32_t buf[23]; uint8_t blen; } tx_ {};
+ 
+ 	struct Pkt { uint32_t len; uint8_t data[16]; };
+-	struct Client { int peer; uint16_t devid, ttl; Pkt pkts[4]; };
++	struct Client { int peer; uint16_t devid, ttl; bool unacked; Pkt pkts[4]; };   // unacked: the last host data
+ 	struct { uint16_t devid; uint8_t tx_ttl; uint32_t bdata[6]; Client clients[4]; } host_ {};
+ 
+ 	struct HPkt { uint16_t len; uint8_t data[128]; };
+diff --git a/support/netplay/test/test_rfu.cpp b/support/netplay/test/test_rfu.cpp
+index b3db18c..fe1b660 100644
+--- a/support/netplay/test/test_rfu.cpp
++++ b/support/netplay/test/test_rfu.cpp
+@@ -94,13 +94,31 @@ int main()
+ 	n = B.wait_poll(5600, out);
+ 	CHECK(n == 2 && out[0] == 0x99660027, "timeout event %x", out[0]);
+ 
+-	// --- host waits after SendDataWait with no answer: missed clients ---
++	// --- host waits after SendDataWait: the client acked, so "sent" at once ---
++	cmd(A, 0x17, {0x003C0420});   // Pokemon's Setup: 4 transmissions, 32 frames
+ 	cmd(A, 0x25, {1, 1});
+ 	A.begin_wait(9000);
+-	n = A.wait_poll(9100, out);
+-	CHECK(n == 3 && out[0] == 0x99660128 && out[1] == 0x0F0F, "host rtx event %x %x", out[0], out[1]);
++	n = A.wait_poll(9001, out);
++	CHECK(n == 2 && out[0] == 0x99660028, "host: every client acked (%d %x)", n, out[0]);
+ 	cmd(B, 0x26);   // the client takes the host's packet
+ 
++	// --- the ack is late (internet): no miss before 250 ms, never "inactive" ---
++	A.command(0x25, std::vector<uint32_t>{1, 2}.data(), 2, out);   // not delivered yet
++	A.begin_wait(10000);
++	CHECK(A.wait_poll(10020, out) == 0, "no miss after 20 ms (the adapter's own rtx time)");
++	CHECK(A.wait_poll(10200, out) == 0, "no miss after 200 ms");
++	n = A.wait_poll(10260, out);
++	CHECK(n == 3 && out[0] == 0x99660128 && out[1] == 0, "host miss event %x %x (no client got it, none inactive)", out[0], out[1]);
++	deliver();
++	cmd(B, 0x26);
++	A.command(0x25, std::vector<uint32_t>{1, 3}.data(), 2, out);
++	A.begin_wait(11000);
++	CHECK(A.wait_poll(11030, out) == 0, "waiting for the ack");
++	deliver();   // the ack arrives 30 ms later
++	n = A.wait_poll(11031, out);
++	CHECK(n == 2 && out[0] == 0x99660028, "late ack: sent (%d %x)", n, out[0]);
++	cmd(B, 0x26);
++
+ 	// --- disconnect: the host drops client 0, the waiting client hears it ---
+ 	CHECK(cmd(A, 0x30, {1}) == 0, "DisconnectClient");
+ 	CHECK(B.state() == Rfu::IDLE, "client idle after the host dropped it");
+-- 
+2.43.0
+

@@ -28,11 +28,12 @@ cp "$rel/SOURCE.txt" "$b/"
 [ -f "$rel/RELEASE_NOTES.md" ] && cp "$rel/RELEASE_NOTES.md" "$b/"
 
 cat > "$b/README.txt" <<EOF
-NES, SNES, GAME BOY 2P AND ARCADE NETPLAY $ver - EVERYTHING IN ONE
+NES, SNES, GAME BOY 2P, GBA WIRELESS AND ARCADE NETPLAY $ver - EVERYTHING IN ONE
 
-Two MiSTers play NES, SNES, Game Boy link-cable games or Bubble Bobble (arcade)
-together over the network. SOURCE.txt says where the code comes from
-(MiSTer-devel's NES and SNES cores, the Game Boy 2P core by pomstazlesa,
+Two MiSTers play NES, SNES, Game Boy link-cable games, GBA games with the
+Wireless Adapter (Apotris, Pokemon FireRed/LeafGreen ...) or Bubble Bobble
+(arcade) together over the network. SOURCE.txt says where the code comes from
+(MiSTer-devel's NES, SNES and GBA cores, the Game Boy 2P core by pomstazlesa,
 Jotego's jtcores and Main_MiSTer, plus our patches). RELEASE_NOTES.md says what
 is new.
 
@@ -43,7 +44,7 @@ is new.
 
 2a. WITHOUT A SERVER (one player forwards a port in the router)
    Host: forward UDP 7845 in the router. OSD in NES_netplay, SNES_netplay,
-   GAMEBOY2P_netplay or Bubble Bobble [netplay]:
+   GAMEBOY2P_netplay, GBA_netplay or Bubble Bobble [netplay]:
    Netplay -> Host.
    Join: put the host's address in /media/fat/netplay.ini, peer=..., and
    Netplay -> Join. Load the same game (NetPong is included).
@@ -61,10 +62,15 @@ is new.
      name=<your name>
    One player: Netplay -> Host and load a game. The other: the file browser,
    folder _Netplay/Rooms, open the room and pick the game in it. Arcade: the
-   game's OSD, "Join room".
+   game's OSD, "Join room". GBA: Netplay -> Join and load any GBA game.
    More in Server/README.md.
 
-Switching between the netplay cores (NES, SNES, Game Boy 2P): reboot from the MiSTer's menu
+GBA WIRELESS ADAPTER: in GBA_netplay's OSD, Hardware -> Link Port: Wireless
+Adapter, then Netplay -> Host on one MiSTer and Join on the other, and load
+the game. In the game's own wireless menu one hosts and the other joins, as on
+real GBAs. More in "SD card/README-netplay.txt".
+
+Switching between the netplay cores (NES, SNES, Game Boy 2P, GBA): reboot from the MiSTer's menu
 first (or pick the other core after a reboot). Jumping straight from one core
 to the other can leave netplay without the ROM reload at the start.
 

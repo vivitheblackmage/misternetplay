@@ -18,7 +18,12 @@ func addr(port int) *net.UDPAddr { return &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1
 // reg sends a REG and returns the server's reply (without "NPS1 ").
 func reg(t *testing.T, r *relay, from *net.UDPAddr, room, role, md5 string) string {
 	t.Helper()
-	pkt := ctrlPrefix + strings.Join([]string{"REG", testKey, room, role, "p", "10.0.0.1:7845", "JTBUBL", md5, "Game"}, "\t")
+	return regCore(t, r, from, room, role, md5, "JTBUBL")
+}
+
+func regCore(t *testing.T, r *relay, from *net.UDPAddr, room, role, md5, core string) string {
+	t.Helper()
+	pkt := ctrlPrefix + strings.Join([]string{"REG", testKey, room, role, "p", "10.0.0.1:7845", core, md5, "Game"}, "\t")
 	out := r.control(pkt, from, time.Now())
 	if len(out) == 0 {
 		return ""
@@ -61,5 +66,25 @@ func TestJoinWithoutRoom(t *testing.T) {
 	reg(t, r, addr(3), "bbbbbbbb", "host", md5B)
 	if got := reg(t, r, addr(2), "*", "join", md5A); got != "ERR no room with this game" {
 		t.Fatalf("join, no room: %q", got)
+	}
+}
+
+func TestGBAAnyGame(t *testing.T) {
+	// GBA (wireless adapter): another game joins, by room and without one
+	r := newRelay(testKey, nil)
+	regCore(t, r, addr(1), "aaaaaaaa", "host", md5A, "GBA")
+	if got := regCore(t, r, addr(2), "aaaaaaaa", "join", md5B, "GBA"); got != "OK\tjoin\tpaired\taaaaaaaa" {
+		t.Fatalf("GBA join with another game: %q", got)
+	}
+	r = newRelay(testKey, nil)
+	regCore(t, r, addr(1), "aaaaaaaa", "host", md5A, "GBA")
+	if got := regCore(t, r, addr(2), "*", "join", md5B, "GBA"); got != "OK\tjoin\tpaired\taaaaaaaa" {
+		t.Fatalf("GBA join without a room, another game: %q", got)
+	}
+	// other cores still need the same game
+	r = newRelay(testKey, nil)
+	regCore(t, r, addr(1), "aaaaaaaa", "host", md5A, "NES")
+	if got := regCore(t, r, addr(2), "aaaaaaaa", "join", md5B, "NES"); got != "ERR not the room's game" {
+		t.Fatalf("NES join with another game: %q", got)
 	}
 }

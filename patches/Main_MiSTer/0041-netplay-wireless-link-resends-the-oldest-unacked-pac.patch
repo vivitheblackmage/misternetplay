@@ -1,0 +1,103 @@
+From 02d7c00d6a5053bcfd256eba7b257ea7429fe81e Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Thu, 12 Nov 2026 22:37:46 +0100
+Subject: [PATCH 41/42] netplay: wireless link resends the oldest unacked
+ packet after 1.5 round trips (a lost packet stalled the game's data 100 ms;
+ homebrew gives up after 10 frames)
+---
+ support/netplay/rfu_link.cpp           | 15 +++++++++++-
+ support/netplay/test/test_rfu_link.cpp | 32 ++++++++++++++++++++++++++
+ 2 files changed, 46 insertions(+), 1 deletion(-)
+
+diff --git a/support/netplay/rfu_link.cpp b/support/netplay/rfu_link.cpp
+index 1f0bd73..010dada 100644
+--- a/support/netplay/rfu_link.cpp
++++ b/support/netplay/rfu_link.cpp
+@@ -8,6 +8,11 @@ namespace {
+ const uint8_t MAGIC[4] = { 'N', 'P', 'W', '1' };
+ const uint64_t RESEND_MS = 100, HELLO_MS = 500, KEEPALIVE_MS = 1000;
+ const uint64_t STALL_MS = 3000;                 // the oldest packet unacked this long: resend slowly
++// The oldest unacked packet is resent after about one and a half round trips:
++// the other side keeps what came after it, so that one resend fills the gap.
++// Waiting 100 ms stalls the game's data long enough for homebrew to give up
++// (gba-link-connection: 10 frames). The rest are resent after RESEND_MS.
++const uint64_t FRONT_MIN_MS = 30;
+ const size_t MAX_OUT = 1024;                   // unacked packets kept (more: the link is dead anyway)
+ 
+ int16_t diff(uint16_t a, uint16_t b) { return (int16_t)(uint16_t)(a - b); }
+@@ -167,8 +172,16 @@ void RfuLink::tick(uint64_t now_ms, const Deliver &deliver)
+ 	// once a second, not every 100 ms
+ 	bool stalled = !out_.empty() && out_.front().first && now_ms - out_.front().first >= STALL_MS;
+ 	uint64_t resend = lost(now_ms) || stalled ? 1000 : RESEND_MS;
++	uint64_t front = resend;
++	if (resend == RESEND_MS && rtt_)
++	{
++		uint64_t r = rtt_ms();
++		front = r + r / 2 + 10;
++		if (front < FRONT_MIN_MS) front = FRONT_MIN_MS;
++		if (front > RESEND_MS) front = RESEND_MS;
++	}
+ 	for (Out &o : out_)
+-		if (!o.sent || now_ms - o.sent >= resend)
++		if (!o.sent || now_ms - o.sent >= (&o == &out_.front() ? front : resend))
+ 		{
+ 			if (o.sent) { resent_++; o.resent = true; }
+ 			if (!o.first) o.first = now_ms;
+diff --git a/support/netplay/test/test_rfu_link.cpp b/support/netplay/test/test_rfu_link.cpp
+index 915bb3d..65de6dd 100644
+--- a/support/netplay/test/test_rfu_link.cpp
++++ b/support/netplay/test/test_rfu_link.cpp
+@@ -30,11 +30,13 @@ struct Net
+ 	std::vector<Pkt> q[2];            // to end 0, to end 1
+ 	uint64_t now = 0;
+ 	int loss = 20, dup = 10, maxdelay = 80;
++	int drop[2] = { 0, 0 };           // drop the next n packets sent by end 0 / 1
+ 	Net() { e[0].net = e[1].net = this; e[0].me = 0; e[1].me = 1; }
+ };
+ void End::send(const uint8_t *b, size_t n)
+ {
+ 	int to = 1 - me;
++	if (net->drop[me] > 0) { net->drop[me]--; return; }
+ 	if ((int)(rnd() % 100) < net->loss) return;
+ 	int copies = (int)(rnd() % 100) < net->dup ? 2 : 1;
+ 	for (int i = 0; i < copies; i++)
+@@ -146,6 +148,36 @@ int main()
+ 		CHECK(h.unacked() == 0 && j2.unacked() == 0, "everything acked after the restart (%zu, %zu)", h.unacked(), j2.unacked());
+ 	}
+ 
++	// one lost packet in a steady stream (a game sending every 2 ms, 5 ms each
++	// way): the gap is filled after about one and a half round trips, not 100 ms
++	{
++		Net n6;
++		n6.loss = 0; n6.dup = 0; n6.maxdelay = 1;
++		RfuLink a(&n6.e[0], true, 0x7777), b(&n6.e[1], false, 0x8888);
++		uint64_t last = 0, gap = 0;
++		uint32_t got = 0;
++		auto none = [](const uint8_t *, size_t) {};
++		auto onb = [&](const uint8_t *, size_t) { if (last && n6.now - last > gap) gap = n6.now - last; last = n6.now; got++; };
++		for (int i = 0; i < 200; i++) { n6.now++; a.tick(n6.now, none); b.tick(n6.now, onb); }
++		uint8_t p[8] = {0};
++		for (int i = 0; i < 2000; i++)
++		{
++			n6.now++;
++			if (i % 2 == 0)
++			{
++				if (i == 1000) n6.drop[0] = 1;   // this one is lost
++				a.send(p, sizeof(p));
++			}
++			a.tick(n6.now, none);
++			b.tick(n6.now, onb);
++		}
++		uint64_t worst = gap;
++		for (int i = 0; i < 200; i++) { n6.now++; a.tick(n6.now, none); b.tick(n6.now, onb); }
++		gap = worst;
++		CHECK(got == 1000, "every packet delivered (%u)", got);
++		CHECK(gap <= 50, "a lost packet stalls delivery %u ms (round trip %u ms)", (unsigned)gap, a.rtt_ms());
++	}
++
+ 	// a peer that answers but never acks (a broken link): resends slow down
+ 	{
+ 		Net n5;
+-- 
+2.43.0
+

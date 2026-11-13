@@ -1,8 +1,8 @@
-From 504e3e318bd29098a42aae66923a38d427903b63 Mon Sep 17 00:00:00 2001
+From a8e42b3275177652b2ca0ac163a95354481ecac4 Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sat, 7 Nov 2026 18:43:02 +0100
-Subject: [PATCH] Makefile: header dependencies name the objects in the build
- folder, so a changed header rebuilds them
+Subject: [PATCH 19/42] Makefile: header dependencies name the objects in the
+ build folder, so a changed header rebuilds them
 ---
  Makefile | 4 ++--
  1 file changed, 2 insertions(+), 2 deletions(-)

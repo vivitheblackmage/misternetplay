@@ -1,0 +1,132 @@
+From b7b8155fe4701fb63380bdb19af865600dd8bc89 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Thu, 12 Nov 2026 19:56:52 +0100
+Subject: [PATCH 40/42] netplay: wireless adapter answer latency in netplay.log
+ (worst case per command, histogram every 10 s)
+---
+ support/netplay/netplay.cpp     | 53 +++++++++++++++++++++++++++++++++
+ support/netplay/rfu_mailbox.cpp |  1 +
+ support/netplay/rfu_mailbox.h   |  2 ++
+ 3 files changed, 56 insertions(+)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 0bb2a0d..231620e 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -695,6 +695,13 @@ static uint64_t now_ms()
+ 	return (uint64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+ }
+ 
++static uint64_t mono_us()
++{
++	timespec ts;
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (uint64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
++}
++
+ // A line for netplay.log only (any thread; the main thread writes the file)
+ static void log_line(const char *m)
+ {
+@@ -946,6 +953,28 @@ static void rfu_trace_open()
+ 	rfu_trace_f = fopen("/tmp/rfu_trace.txt", "w");
+ }
+ 
++// How long the GBA may have waited for an answer: a command can arrive just
++// after the previous look at the mailbox, so the time from that look to the
++// answer written is the worst case. Homebrew (gba-link-connection) gives up
++// after 15 scanlines (~1.1 ms); a real adapter answers in ~40 us.
++struct RfuLatency
++{
++	static const int NB = 8;
++	uint32_t n = 0, over = 0, max_us = 0, max_cmd = 0, proc_max_us = 0;
++	uint32_t bucket[NB] = {};
++	void add(uint32_t us, uint32_t proc_us, uint8_t cmd)
++	{
++		static const uint32_t lim[NB - 1] = { 100, 200, 500, 1000, 1500, 3000, 10000 };
++		int b = 0;
++		while (b < NB - 1 && us >= lim[b]) b++;
++		bucket[b]++;
++		n++;
++		if (us > 1100) over++;
++		if (us > max_us) { max_us = us; max_cmd = cmd; }
++		if (proc_us > proc_max_us) proc_max_us = proc_us;
++	}
++};
++
+ static void rfu_trace(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+ static void rfu_trace(const char *fmt, ...)
+ {
+@@ -1013,6 +1042,8 @@ static void *gba_wireless_thread(void *)
+ 	bool lost_told = false;
+ 	uint32_t restarts = 0;
+ 	Rfu::State traced_state = Rfu::IDLE;
++	RfuLatency lat;
++	uint64_t last_look_us = 0, last_lat_log = 0;
+ 
+ 	while (!quit)
+ 	{
+@@ -1149,7 +1180,29 @@ static void *gba_wireless_thread(void *)
+ 
+ 		// the game waits for every answer: poll often while it talks to the
+ 		// adapter (commands come in bursts), else once a millisecond (CPU)
++		uint32_t cmds_before = mbx.commands();
++		uint64_t t0 = mono_us();
+ 		if (mbx.poll((uint32_t)now, rfu)) last_busy = now;
++		uint64_t t1 = mono_us();
++		if (mbx.commands() != cmds_before && last_look_us)
++		{
++			uint32_t us = (uint32_t)(t1 - last_look_us);
++			lat.add(us, (uint32_t)(t1 - t0), mbx.last_cmd());
++			if (us > 1100) rfu_trace("slow %02x %u us", mbx.last_cmd(), us);
++		}
++		last_look_us = t0;
++		if (lat.n && now - last_lat_log >= 10000)
++		{
++			last_lat_log = now;
++			char text[200];
++			snprintf(text, sizeof(text),
++			         "wireless latency: %u cmds, max %u us (cmd %02x), over 1.1 ms %u, work max %u us, "
++			         "<0.1 %u <0.2 %u <0.5 %u <1 %u <1.5 %u <3 %u <10 %u more %u",
++			         lat.n, lat.max_us, lat.max_cmd, lat.over, lat.proc_max_us, lat.bucket[0], lat.bucket[1],
++			         lat.bucket[2], lat.bucket[3], lat.bucket[4], lat.bucket[5], lat.bucket[6], lat.bucket[7]);
++			log_line(text);
++			lat = RfuLatency();
++		}
+ 		if (rfu.state() != traced_state)
+ 		{
+ 			static const char *names[] = { "idle", "host", "connecting", "client" };
+diff --git a/support/netplay/rfu_mailbox.cpp b/support/netplay/rfu_mailbox.cpp
+index 80ded63..c8c0271 100644
+--- a/support/netplay/rfu_mailbox.cpp
++++ b/support/netplay/rfu_mailbox.cpp
+@@ -57,6 +57,7 @@ bool RfuMailbox::poll(uint32_t now_ms, Rfu &rfu)
+ 			for (int i = 0; i < len; i++) in[i] = (uint32_t)rd(OFF_CDATA + 8 * i);
+ 			int n = rfu.command(cmd, in, len, out);
+ 			commands_++;
++			last_cmd_ = cmd;
+ 			if (trace) trace('C', cmd, in, len, out, n);
+ 			uint32_t hdr;
+ 			if (n < 0)
+diff --git a/support/netplay/rfu_mailbox.h b/support/netplay/rfu_mailbox.h
+index 5d15813..918cf21 100644
+--- a/support/netplay/rfu_mailbox.h
++++ b/support/netplay/rfu_mailbox.h
+@@ -22,6 +22,7 @@ public:
+ 	bool poll(uint32_t now_ms, Rfu &rfu);
+ 
+ 	uint32_t commands() const { return commands_; }  // observation (tests)
++	uint8_t last_cmd() const { return last_cmd_; }   // the command served last
+ 
+ 	// optional: every command ('C', its words, the answer; n < 0 an error) and
+ 	// every event ('E', no command words) for a trace file
+@@ -32,6 +33,7 @@ private:
+ 	uint16_t last_seq_ = 0, eseq_ = 0, resets_ = 0;
+ 	bool synced_ = false, waiting_ = false;
+ 	uint32_t commands_ = 0;
++	uint8_t last_cmd_ = 0;
+ 
+ 	uint64_t rd(uint32_t off) const { return mb_[off / 8]; }
+ 	void wr(uint32_t off, uint64_t v) { mb_[off / 8] = v; }
+-- 
+2.43.0
+

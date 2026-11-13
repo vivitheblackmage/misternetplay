@@ -6,6 +6,7 @@
 #   core  NES_MiSTer/output_files/NES.rbf  -> /media/fat/_Console/NES_netplay.rbf
 #         SNES_MiSTer/output_files/SNES.rbf -> /media/fat/_Console/SNES_netplay.rbf
 #         Gameboy2P_MiSTer/output_files/Gameboy.rbf -> /media/fat/_Console/GAMEBOY2P_netplay.rbf
+#         GBA_MiSTer/output_files/GBA.rbf -> /media/fat/_Console/GBA_netplay.rbf (wireless adapter, SPEC.md 13)
 #         (each when built)
 #   main  Main_MiSTer/bin/MiSTer           -> /media/fat/MiSTer_online, plus
 #         Scripts/netplay_on.sh and netplay_off.sh to switch (your MiSTer is kept)
@@ -39,7 +40,7 @@ ssh_opts=(-o StrictHostKeyChecking=accept-new)
 if [[ "$what" == core || "$what" == all ]]; then
 	n=0
 	for c in NES:NES_MiSTer/output_files/NES.rbf SNES:SNES_MiSTer/output_files/SNES.rbf \
-	         GAMEBOY2P:Gameboy2P_MiSTer/output_files/Gameboy.rbf; do
+	         GAMEBOY2P:Gameboy2P_MiSTer/output_files/Gameboy.rbf GBA:GBA_MiSTer/output_files/GBA.rbf; do
 		rbf="$root/${c#*:}"
 		[ -f "$rbf" ] || continue
 		scp "${ssh_opts[@]}" "$rbf" "root@$host:/media/fat/_Console/${c%%:*}_netplay.rbf"

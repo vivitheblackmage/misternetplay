@@ -1,0 +1,705 @@
+From 5189a6328e373df6f7c460252b4223950ac1404a Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Mon, 9 Nov 2026 22:43:34 +0100
+Subject: [PATCH 01/12] npsim: determinism test bench (GHDL -> Verilator), one
+ gba_top with random memory latency
+---
+ npsim/.gitignore                    |   2 +
+ npsim/Makefile                      |  29 ++++
+ npsim/SyncRamDualByteEnable_sim.vhd |  65 +++++++++
+ npsim/gba_sim.cpp                   | 127 ++++++++++++++++++
+ npsim/ghdl_fixes.txt                |  13 ++
+ npsim/ghdl_prep.py                  |  79 +++++++++++
+ npsim/merge_vlog.py                 |  46 +++++++
+ npsim/sim_top.sv                    | 196 ++++++++++++++++++++++++++++
+ npsim/synth.sh                      |  13 ++
+ npsim/vhdl_files.txt                |  44 +++++++
+ 10 files changed, 614 insertions(+)
+ create mode 100644 npsim/.gitignore
+ create mode 100644 npsim/Makefile
+ create mode 100644 npsim/SyncRamDualByteEnable_sim.vhd
+ create mode 100644 npsim/gba_sim.cpp
+ create mode 100644 npsim/ghdl_fixes.txt
+ create mode 100644 npsim/ghdl_prep.py
+ create mode 100644 npsim/merge_vlog.py
+ create mode 100644 npsim/sim_top.sv
+ create mode 100755 npsim/synth.sh
+ create mode 100644 npsim/vhdl_files.txt
+
+diff --git a/npsim/.gitignore b/npsim/.gitignore
+new file mode 100644
+index 0000000..722a501
+--- /dev/null
++++ b/npsim/.gitignore
+@@ -0,0 +1,2 @@
++build/
++obj/
+diff --git a/npsim/Makefile b/npsim/Makefile
+new file mode 100644
+index 0000000..184370a
+--- /dev/null
++++ b/npsim/Makefile
+@@ -0,0 +1,29 @@
++# Determinism test of the GBA core (research/gba2p-plan.md, phase 0). Simulation only.
++#
++#   make -C npsim                 GHDL (Docker) -> Verilog -> Verilator: obj/gba_sim
++#   obj/gba_sim game.gba --frames 120 --seed 1 --lat 20
++#
++# GHDL runs in the Docker image hdlc/ghdl:yosys; Verilator runs locally.
++BUILD  := build
++VFLAGS := -O3 --x-assign 0 --x-initial 0 -Wno-fatal -Wno-WIDTH -Wno-PINMISSING -Wno-UNOPTFLAT \
++          -Wno-CASEINCOMPLETE -Wno-UNUSED -Wno-LATCH -Wno-UNSIGNED -Wno-MULTIDRIVEN -Wno-IMPLICIT \
++          -Wno-SELRANGE -Wno-COMBDLY +1364-2005ext+v +1800-2017ext+sv --top-module sim_top
++VHDL_SRC := $(shell sed 's|^[a-z]*:||; s|^|../|' vhdl_files.txt)
++
++all: obj/gba_sim
++
++$(BUILD)/analyzed: vhdl_files.txt ghdl_fixes.txt ghdl_prep.py $(VHDL_SRC)
++	rm -rf $(BUILD)/vhdl $(BUILD)/ghdl
++	cd .. && python3 -I npsim/ghdl_prep.py npsim/vhdl_files.txt npsim/$(BUILD)/vhdl npsim/$(BUILD)/ghdl
++	touch $@
++
++$(BUILD)/vlog/gba_top.v: $(BUILD)/analyzed synth.sh
++	./synth.sh
++
++obj/gba_sim: $(BUILD)/vlog/gba_top.v sim_top.sv gba_sim.cpp
++	verilator --cc --exe --build -j 0 $(VFLAGS) -Mdir obj -o gba_sim sim_top.sv $(BUILD)/vlog/gba_top.v gba_sim.cpp
++
++clean:
++	rm -rf $(BUILD) obj
++
++.PHONY: all clean
+diff --git a/npsim/SyncRamDualByteEnable_sim.vhd b/npsim/SyncRamDualByteEnable_sim.vhd
+new file mode 100644
+index 0000000..f4c42ac
+--- /dev/null
++++ b/npsim/SyncRamDualByteEnable_sim.vhd
+@@ -0,0 +1,65 @@
++-- Simulation model of rtl/SyncRamDualByteEnable.vhd (npsim only, GHDL has no
++-- altera_mf). Same ports and generics. Behaves like the altsyncram the core
++-- uses (is_cyclone5 = '1'): BIDIR_DUAL_PORT with
++-- read_during_write_mode_port_a/b = NEW_DATA_NO_NBE_READ, i.e. a port that
++-- writes reads back the word as written (bytes without byte enable keep their
++-- old value here).
++library ieee;
++use ieee.std_logic_1164.all;
++use IEEE.numeric_std.all;
++
++entity SyncRamDualByteEnable is
++   generic
++   (
++      is_simu     : std_logic;
++      is_cyclone5 : std_logic := '0';
++      BYTE_WIDTH  : natural := 8;
++      ADDR_WIDTH  : natural := 6;
++      BYTES       : natural := 4
++   );
++   port
++   (
++      clk        : in std_logic;
++      addr_a     : in natural range 0 to 2**ADDR_WIDTH - 1;
++      datain_a0  : in std_logic_vector((BYTE_WIDTH-1) downto 0);
++      datain_a1  : in std_logic_vector((BYTE_WIDTH-1) downto 0);
++      datain_a2  : in std_logic_vector((BYTE_WIDTH-1) downto 0);
++      datain_a3  : in std_logic_vector((BYTE_WIDTH-1) downto 0);
++      dataout_a  : out std_logic_vector((BYTES*BYTE_WIDTH-1) downto 0);
++      we_a       : in std_logic := '1';
++      be_a       : in  std_logic_vector (BYTES - 1 downto 0);
++      addr_b     : in natural range 0 to 2**ADDR_WIDTH - 1;
++      datain_b0  : in std_logic_vector((BYTE_WIDTH-1) downto 0);
++      datain_b1  : in std_logic_vector((BYTE_WIDTH-1) downto 0);
++      datain_b2  : in std_logic_vector((BYTE_WIDTH-1) downto 0);
++      datain_b3  : in std_logic_vector((BYTE_WIDTH-1) downto 0);
++      dataout_b  : out std_logic_vector((BYTES*BYTE_WIDTH-1) downto 0);
++      we_b       : in std_logic := '1';
++      be_b       : in  std_logic_vector (BYTES - 1 downto 0)
++   );
++end;
++
++architecture rtl of SyncRamDualByteEnable is
++   type ram_t is array (0 to 2 ** ADDR_WIDTH - 1) of std_logic_vector(BYTES*BYTE_WIDTH-1 downto 0);
++   signal ram : ram_t := (others => (others => '0'));
++begin
++   process(clk)
++      variable wa, wb : std_logic_vector(BYTES*BYTE_WIDTH-1 downto 0);
++      variable da, db : std_logic_vector(BYTES*BYTE_WIDTH-1 downto 0);
++   begin
++      if rising_edge(clk) then
++         da := datain_a3 & datain_a2 & datain_a1 & datain_a0;
++         db := datain_b3 & datain_b2 & datain_b1 & datain_b0;
++         wa := ram(addr_a);
++         wb := ram(addr_b);
++         for i in 0 to BYTES - 1 loop
++            if we_a = '1' and be_a(i) = '1' then wa(BYTE_WIDTH*(i+1)-1 downto BYTE_WIDTH*i) := da(BYTE_WIDTH*(i+1)-1 downto BYTE_WIDTH*i); end if;
++            if we_b = '1' and be_b(i) = '1' then wb(BYTE_WIDTH*(i+1)-1 downto BYTE_WIDTH*i) := db(BYTE_WIDTH*(i+1)-1 downto BYTE_WIDTH*i); end if;
++         end loop;
++         if we_a = '1' then ram(addr_a) <= wa; end if;
++         if we_b = '1' then ram(addr_b) <= wb; end if;
++         dataout_a <= wa;
++         dataout_b <= wb;
++      end if;
++   end process;
++end rtl;
+diff --git a/npsim/gba_sim.cpp b/npsim/gba_sim.cpp
+new file mode 100644
+index 0000000..9efdc39
+--- /dev/null
++++ b/npsim/gba_sim.cpp
+@@ -0,0 +1,127 @@
++// Determinism test of the GBA core (research/gba2p-plan.md, phase 0).
++// Simulation only.
++//
++//   obj/gba_sim game.gba [--frames N] [--seed S] [--lat MAX] [--keyseed K]
++//
++// Runs the core from power-on and prints one line per emulated frame:
++//   frame <n> crc <crc32 of the 240x160 picture> pc <cpu pc>
++// --seed and --lat set the memory latency (0..MAX clocks per request, random).
++// --keyseed sets the scripted key presses (the same for two runs that are
++// compared). Two runs with different --seed must print the same lines if the
++// core is deterministic in emulated time.
++#include "Vsim_top.h"
++#include "verilated.h"
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++static std::vector<uint32_t> mem(1u << 24);    // 64 MB flat memory, DWORD addressed
++static uint64_t lat_state[2];
++static int lat_max = 0;
++
++static uint64_t xs(uint64_t &s) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; return s; }
++
++extern "C" int mem_read(int addr) { return (int)mem[(uint32_t)addr & (mem.size() - 1)]; }
++extern "C" void mem_write(int addr, int data) { mem[(uint32_t)addr & (mem.size() - 1)] = (uint32_t)data; }
++extern "C" int lat_rand(int port) { return lat_max ? (int)(xs(lat_state[port & 1]) % (uint64_t)(lat_max + 1)) : 0; }
++
++static uint32_t crc_table[256];
++static void crc_init()
++{
++	for (uint32_t i = 0; i < 256; i++)
++	{
++		uint32_t c = i;
++		for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1;
++		crc_table[i] = c;
++	}
++}
++
++int main(int argc, char **argv)
++{
++	const char *rom = nullptr;
++	int frames = 60;
++	uint64_t seed = 1, keyseed = 7;
++	for (int i = 1; i < argc; i++)
++	{
++		if (!strcmp(argv[i], "--frames") && i + 1 < argc) frames = atoi(argv[++i]);
++		else if (!strcmp(argv[i], "--seed") && i + 1 < argc) seed = strtoull(argv[++i], nullptr, 0);
++		else if (!strcmp(argv[i], "--lat") && i + 1 < argc) lat_max = atoi(argv[++i]);
++		else if (!strcmp(argv[i], "--keyseed") && i + 1 < argc) keyseed = strtoull(argv[++i], nullptr, 0);
++		else if (argv[i][0] != '-') rom = argv[i];
++		else { fprintf(stderr, "unknown option %s\n", argv[i]); return 2; }
++	}
++	if (!rom) { fprintf(stderr, "usage: %s game.gba [--frames N] [--seed S] [--lat MAX] [--keyseed K]\n", argv[0]); return 2; }
++	lat_state[0] = seed * 0x9E3779B97F4A7C15ull + 1;
++	lat_state[1] = seed * 0xC2B2AE3D27D4EB4Full + 3;
++
++	FILE *f = fopen(rom, "rb");
++	if (!f) { perror(rom); return 1; }
++	std::vector<uint8_t> data;
++	uint8_t buf[65536];
++	size_t n;
++	while ((n = fread(buf, 1, sizeof(buf), f)) > 0) data.insert(data.end(), buf, buf + n);
++	fclose(f);
++	if (data.empty() || data.size() > 32u << 20) { fprintf(stderr, "bad ROM size %zu\n", data.size()); return 1; }
++	// the game ROM at Softmap_GBA_Gamerom_ADDR (DWORDs), as in GBA.sv
++	const uint32_t rom_base = 65536 + 131072;
++	for (size_t i = 0; i < data.size(); i += 4)
++	{
++		uint32_t w = 0;
++		for (int b = 0; b < 4 && i + b < data.size(); b++) w |= (uint32_t)data[i + b] << (8 * b);
++		mem[rom_base + i / 4] = w;
++	}
++	bool flash1m = std::string(data.begin(), data.end()).find("FLASH1M_V") != std::string::npos;
++	crc_init();
++
++	Verilated::commandArgs(argc, argv);
++	Vsim_top *top = new Vsim_top;
++	top->clk = 0;
++	top->gba_on = 0;
++	top->max_pak_addr = (uint32_t)((data.size() - 1) >> 2);
++	top->flash_1m = flash1m;
++	top->keys = 0;
++
++	uint64_t ks = keyseed * 0x2545F4914F6CDD1Dull + 5;
++	uint32_t crc = 0xFFFFFFFFu;
++	int frame = 0;
++	uint64_t cycles = 0;
++	auto t0 = std::chrono::steady_clock::now();
++	while (frame < frames && !Verilated::gotFinish())
++	{
++		if (cycles == 100) top->gba_on = 1;
++		top->clk = 1;
++		top->eval();
++		if (top->pixel_we)
++		{
++			uint32_t p = top->pixel_data;
++			for (int b = 0; b < 3; b++) crc = crc_table[(crc ^ (p >> (8 * b))) & 0xFF] ^ (crc >> 8);
++			if (top->pixel_addr == 38399)
++			{
++				printf("frame %d crc %08x pc %08x\n", frame, ~crc, top->cpu_pc);
++				fflush(stdout);
++				crc = 0xFFFFFFFFu;
++				frame++;
++				// scripted keys, one change per frame from keyseed (same for runs compared)
++				uint64_t r = xs(ks);
++				if ((r & 7) == 0)
++				{
++					uint32_t k = (uint32_t)((r >> 8) & 0x3FF);
++					if ((k & 0x0C0) == 0x0C0) k &= ~0x080u;   // not Up and Down together
++					if ((k & 0x030) == 0x030) k &= ~0x020u;   // nor Left and Right
++					top->keys = k;
++				}
++			}
++		}
++		top->clk = 0;
++		top->eval();
++		cycles++;
++	}
++	double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++	fprintf(stderr, "%d frames, %llu clocks, %.1f s, %.0f clocks/s\n", frame, (unsigned long long)cycles, s, cycles / s);
++	delete top;
++	return 0;
++}
+diff --git a/npsim/ghdl_fixes.txt b/npsim/ghdl_fixes.txt
+new file mode 100644
+index 0000000..5fe594a
+--- /dev/null
++++ b/npsim/ghdl_fixes.txt
+@@ -0,0 +1,13 @@
++# Literal replacements applied to the simulation copy before GHDL (file|old|new).
++# Quartus accepts these, GHDL does not. The core's own files are never changed.
++# "default" is a reserved word in VHDL-2008 (record field of regmap_type)
++rtl/proc_bus_gba.vhd|      default     : integer;|      defaultv    : integer;
++rtl/proc_bus_gba.vhd|Reg.default,|Reg.defaultv,|all
++# integer range of the actual must match the port (both are 8 bits in hardware)
++rtl/gba_gpu_drawer.vhd|   signal linecounter_mosaic_bg  : integer range 0 to 239;|   signal linecounter_mosaic_bg  : integer range 0 to 159;
++rtl/gba_gpu_drawer.vhd|   signal linecounter_mosaic_obj : integer range 0 to 239;|   signal linecounter_mosaic_obj : integer range 0 to 159;
++# palette addresses: declared 0 to 128 but come from 7 address bits (the RAM port is 0 to 127)
++rtl/gba_memorymux.vhd|integer range 0 to 128;|integer range 0 to 127;|all
++rtl/gba_top.vhd|integer range 0 to 128;|integer range 0 to 127;|all
++rtl/gba_gpu.vhd|integer range 0 to 128;|integer range 0 to 127;|all
++rtl/gba_gpu_drawer.vhd|integer range 0 to 128;|integer range 0 to 127;|all
+diff --git a/npsim/ghdl_prep.py b/npsim/ghdl_prep.py
+new file mode 100644
+index 0000000..4866114
+--- /dev/null
++++ b/npsim/ghdl_prep.py
+@@ -0,0 +1,79 @@
++#!/usr/bin/env python3
++"""Copies the core's VHDL into a build folder for GHDL (simulation only) and
++works around constructs Quartus accepts but GHDL rejects:
++- literal replacements listed in ghdl_fixes.txt (a 4th field "all": every
++  occurrence, else exactly one),
++- a `case` without `when others` gets `when others => null;`.
++Then analyses every file in order, in one GHDL run (in Docker); on a missing
++choice it fixes that file and starts again.
++A line "lib:path" analyses that file into library lib (default work).
++usage: ghdl_prep.py <filelist> <outdir> <workdir>   (run from the core's root)"""
++import os, re, shutil, subprocess, sys
++
++flist, out, work = sys.argv[1:4]
++root = os.getcwd()
++uid = f"{os.getuid()}:{os.getgid()}"
++entries = [l.strip() for l in open(flist) if l.strip() and not l.startswith("#")]
++libs = {}
++for e in entries:
++    lib, _, f = e.rpartition(":")
++    libs[f] = lib or "work"
++files = [e.rpartition(":")[2] for e in entries]
++fixes = {}
++for l in open(os.path.join(os.path.dirname(flist), "ghdl_fixes.txt")):
++    if l.strip() and not l.startswith("#"):
++        parts = l.rstrip("\n").split("|")
++        f, old, new = parts[:3]
++        fixes.setdefault(f, []).append((old, new, len(parts) > 3 and parts[3] == "all"))
++
++for f in files:
++    dst = os.path.join(out, f)
++    os.makedirs(os.path.dirname(dst), exist_ok=True)
++    shutil.copy(f, dst)
++    if f in fixes:
++        t = open(dst).read()
++        for old, new, every in fixes[f]:
++            if (t.count(old) < 1) if every else (t.count(old) != 1):
++                sys.exit(f"fix not found {'at all' if every else 'exactly once'} in {f}: {old}")
++            t = t.replace(old, new)
++        open(dst, "w").write(t)
++
++def analyse_all():
++    os.makedirs(work, exist_ok=True)
++    for x in os.listdir(work):
++        os.remove(os.path.join(work, x))
++    script = "set -e\n" + "".join(
++        f"ghdl -a --std=08 -frelaxed -fsynopsys --workdir=/work -P/work --work={libs[f]} {f} || {{ echo FAILED {f}; exit 1; }}\n" for f in files)
++    cmd = ["docker", "run", "--rm", "-i", "-u", uid, "-v", f"{os.path.abspath(out)}:/out",
++           "-v", f"{os.path.abspath(work)}:/work", "-w", "/out", "hdlc/ghdl:yosys", "sh"]
++    return subprocess.run(cmd, input=script, capture_output=True, text=True)
++
++for _ in range(100):
++    r = analyse_all()
++    if r.returncode == 0:
++        print("ANALYZED", len(files))
++        sys.exit(0)
++    failed = re.search(r"FAILED (\S+)", r.stdout)
++    m = re.search(r"^(\S+?):(\d+):\d+:error: missing choice", r.stderr, re.M)
++    if not failed or not m:
++        sys.exit(f"GHDL error:\n{r.stdout[-1000:]}\n{r.stderr[:3000]}")
++    f, line = m.group(1), int(m.group(2)) - 1
++    dst = os.path.join(out, f)
++    src = open(dst).read().split("\n")
++    depth, i = 0, line + 1
++    while i < len(src):
++        code = src[i].split("--")[0].lower()
++        if re.search(r"\bend\s+case\b", code):
++            if depth == 0:
++                indent = re.match(r"\s*", src[i]).group(0)
++                src.insert(i, indent + "\twhen others => null; -- sim: GHDL needs others")
++                break
++            depth -= 1
++        elif re.search(r"\bcase\b", code):
++            depth += 1
++        i += 1
++    else:
++        sys.exit(f"no end case after {f}:{line + 1}")
++    open(dst, "w").write("\n".join(src))
++    print(f"fixed: {f}:{line + 1}")
++sys.exit("too many fixes")
+diff --git a/npsim/merge_vlog.py b/npsim/merge_vlog.py
+new file mode 100644
+index 0000000..f104efb
+--- /dev/null
++++ b/npsim/merge_vlog.py
+@@ -0,0 +1,46 @@
++#!/usr/bin/env python3
++"""Merges the Verilog that `ghdl synth` wrote for each top entity into one
++file: submodules shared by several tops appear once (they must be identical).
++Tops that the Verilog instantiates with parameters get dummy parameters (GHDL
++fixes generics at the values given on its command line, which are the values
++the Verilog uses). VHDL is case-insensitive and Quartus matches the Verilog's
++pin names that way; Verilator does not, so the ports of each top get the
++Verilog's spelling.
++usage: merge_vlog.py out.v verilog1 [verilog2 ...] -- in1.v in2.v ..."""
++import re, sys
++
++out = sys.argv[1]
++sep = sys.argv.index("--")
++vlogs, ins = sys.argv[2:sep], sys.argv[sep + 1:]
++src = re.sub(r"//.*", "", "\n".join(open(f).read() for f in vlogs))
++pins = {}   # module -> {lower name: spelling in the Verilog}
++for m in re.finditer(r"^[ \t]*(?!(?:generate|if|else|module|begin|end)\b)(\w+)\s*(?:#\s*\((?:[^()]|\([^()]*\))*\)\s*)?\w+\s*\((.*?)\);", src, re.S | re.M):
++    for pin in re.findall(r"\.(\w+)\s*\(", m.group(2)):
++        pins.setdefault(m.group(1), {})[pin.lower()] = pin
++params = {"gb_statemanager": "parameter Softmap_SaveState_ADDR = 0;\n  parameter Softmap_Rewind_ADDR = 0;"}
++seen, order = {}, []
++for f in ins:
++    text = open(f).read()
++    for m in re.finditer(r"^module (\w+)\b.*?^endmodule\s*$", text, re.S | re.M):
++        name, body = m.group(1), m.group(0)
++        if name in seen:
++            norm = lambda t: re.sub(r"n\d+", "n", t)
++            if norm(seen[name]) != norm(body):
++                sys.exit(f"module {name} differs between inputs")
++            continue
++        if name in pins:
++            header = re.match(r"module \w+\s*\((.*?)\);", body, re.S).group(1)
++            for port in re.findall(r"(\w+)\s*(?:,|$)", header.replace("\n", " ")):
++                want = pins[name].get(port.lower())
++                if want and want != port:
++                    body = re.sub(r"\b%s\b" % re.escape(port), want, body)
++        if name in params:
++            body = re.sub(r"\);", ");\n  " + params[name], body, count=1)
++        seen[name] = body
++        order.append(name)
++with open(out, "w") as o:
++    o.write("// Generated by npsim/merge_vlog.py from ghdl synth output. Do not edit.\n")
++    o.write("/* verilator lint_off WIDTH */\n/* verilator lint_off UNOPTFLAT */\n")
++    for n in order:
++        o.write(seen[n] + "\n\n")
++print(f"{out}: {len(order)} modules")
+diff --git a/npsim/sim_top.sv b/npsim/sim_top.sv
+new file mode 100644
+index 0000000..6aabcf7
+--- /dev/null
++++ b/npsim/sim_top.sv
+@@ -0,0 +1,196 @@
++// Determinism test bench of the GBA core (research/gba2p-plan.md, phase 0).
++// Simulation only. One gba_top (ghdl synth output) with its two memory ports
++// on one flat memory in C++ (DPI): the ROM port (sdram_read_*) and the bus
++// port (WRAM large, SRAM/Flash/EEPROM). Every request is answered after a
++// random number of clocks (lat_rand(), seeded in C++), so two runs with
++// different seeds see different memory latency, as two MiSTers do.
++
++module sim_top(
++    input             clk,
++    input             gba_on,
++    input      [24:0] max_pak_addr,
++    input             flash_1m,
++    input       [9:0] keys,        // {L, R, Down, Up, Left, Right, Start, Select, B, A}
++    output     [15:0] pixel_addr,
++    output     [17:0] pixel_data,
++    output            pixel_we,
++    output     [31:0] cpu_pc
++);
++
++import "DPI-C" function int  mem_read (input int addr);
++import "DPI-C" function void mem_write(input int addr, input int data);
++import "DPI-C" function int  lat_rand (input int port);
++
++// ROM port
++wire        rom_req;
++wire [24:0] rom_addr;
++reg         rom_done = 0;
++reg  [31:0] rom_d1 = 0, rom_d2 = 0;
++reg  [24:0] rom_a;
++reg  [15:0] rom_wait = 0;
++reg         rom_busy = 0;
++
++always @(posedge clk) begin
++    rom_done <= 0;
++    if (rom_req) begin
++        rom_a    <= rom_addr;
++        rom_wait <= 16'(lat_rand(0));
++        rom_busy <= 1;
++    end else if (rom_busy) begin
++        if (rom_wait != 0) rom_wait <= rom_wait - 1'd1;
++        else begin
++            rom_d1   <= mem_read({7'd0, rom_a});
++            rom_d2   <= mem_read({7'd0, rom_a + 25'd1});
++            rom_done <= 1;
++            rom_busy <= 0;
++        end
++    end
++end
++
++// bus port
++wire [31:0] bus_din;      // data from the core (written)
++reg  [31:0] bus_dout = 0; // data to the core (read)
++wire [25:0] bus_adr;
++wire        bus_rnw, bus_ena;
++reg         bus_done = 0;
++reg  [25:0] bus_a;
++reg  [31:0] bus_w;
++reg         bus_r;
++reg  [15:0] bus_wait = 0;
++reg         bus_busy = 0;
++
++always @(posedge clk) begin
++    bus_done <= 0;
++    if (bus_ena) begin
++        bus_a    <= bus_adr;
++        bus_w    <= bus_din;
++        bus_r    <= bus_rnw;
++        bus_wait <= 16'(lat_rand(1));
++        bus_busy <= 1;
++    end else if (bus_busy) begin
++        if (bus_wait != 0) bus_wait <= bus_wait - 1'd1;
++        else begin
++            if (bus_r) bus_dout <= mem_read({6'd0, bus_a});
++            else       mem_write({6'd0, bus_a}, bus_w);
++            bus_done <= 1;
++            bus_busy <= 0;
++        end
++    end
++end
++
++// savestate port and the large image (HD modes): unused, answered at once
++wire save_ena, fb_req;
++reg  save_done = 0, fb_done = 0;
++always @(posedge clk) begin
++    save_done <= save_ena;
++    fb_done   <= fb_req;
++end
++
++gba_top u_gba(
++    .clk100             ( clk           ),
++    .GBA_on             ( gba_on        ),
++    .GBA_lockspeed      ( 1'b1          ),
++    .GBA_cputurbo       ( 1'b0          ),
++    .GBA_flash_1m       ( flash_1m      ),
++    .CyclePrecalc       ( 16'd100       ),
++    .Underclock         ( 2'd0          ),
++    .MaxPakAddr         ( max_pak_addr  ),
++    .CyclesMissing      (               ),
++    .CyclesVsyncSpeed   (               ),
++    .SramFlashEnable    ( 1'b1          ),
++    .memory_remap       ( 1'b0          ),
++    .matrix_mapper      ( 1'b0          ),
++    .increaseSSHeaderCount( 1'b0        ),
++    .save_state         ( 1'b0          ),
++    .load_state         ( 1'b0          ),
++    .interframe_blend   ( 2'd0          ),
++    .maxpixels          ( 1'b0          ),
++    .shade_mode         ( 3'd0          ),
++    .hdmode2x_bg        ( 1'b0          ),
++    .hdmode2x_obj       ( 1'b0          ),
++    .specialmodule      ( 1'b0          ),
++    .solar_in           ( 3'd0          ),
++    .tilt               ( 1'b0          ),
++    .rewind_on          ( 1'b0          ),
++    .rewind_active      ( 1'b0          ),
++    .savestate_number   ( 32'd0         ),
++    .RTC_timestampNew   ( 1'b0          ),
++    .RTC_timestampIn    ( 32'd0         ),
++    .RTC_timestampSaved ( 32'd0         ),
++    .RTC_savedtimeIn    ( 42'd0         ),
++    .RTC_saveLoaded     ( 1'b0          ),
++    .RTC_timestampOut   (               ),
++    .RTC_savedtimeOut   (               ),
++    .RTC_inuse          (               ),
++    .cheat_clear        ( 1'b0          ),
++    .cheats_enabled     ( 1'b0          ),
++    .cheat_on           ( 1'b0          ),
++    .cheat_in           ( 128'd0        ),
++    .cheats_active      (               ),
++    .sdram_read_ena     ( rom_req       ),
++    .sdram_read_done    ( rom_done      ),
++    .sdram_read_addr    ( rom_addr      ),
++    .sdram_read_data    ( rom_d1        ),
++    .sdram_second_dword ( rom_d2        ),
++    .bus_out_Din        ( bus_din       ),
++    .bus_out_Dout       ( bus_dout      ),
++    .bus_out_Adr        ( bus_adr       ),
++    .bus_out_rnw        ( bus_rnw       ),
++    .bus_out_ena        ( bus_ena       ),
++    .bus_out_done       ( bus_done      ),
++    .SAVE_out_Din       (               ),
++    .SAVE_out_Dout      ( 64'd0         ),
++    .SAVE_out_Adr       (               ),
++    .SAVE_out_rnw       (               ),
++    .SAVE_out_ena       ( save_ena      ),
++    .SAVE_out_active    (               ),
++    .SAVE_out_be        (               ),
++    .SAVE_out_done      ( save_done     ),
++    .bios_wraddr        ( 12'd0         ),
++    .bios_wrdata        ( 32'd0         ),
++    .bios_wr            ( 1'b0          ),
++    .save_eeprom        (               ),
++    .save_sram          (               ),
++    .save_flash         (               ),
++    .load_done          (               ),
++    .KeyA               ( keys[0]       ),
++    .KeyB               ( keys[1]       ),
++    .KeySelect          ( keys[2]       ),
++    .KeyStart           ( keys[3]       ),
++    .KeyRight           ( keys[4]       ),
++    .KeyLeft            ( keys[5]       ),
++    .KeyUp              ( keys[6]       ),
++    .KeyDown            ( keys[7]       ),
++    .KeyR               ( keys[8]       ),
++    .KeyL               ( keys[9]       ),
++    .AnalogTiltX        ( 8'd0          ),
++    .AnalogTiltY        ( 8'd0          ),
++    .Rumble             (               ),
++    .GBA_BusAddr        ( 28'd0         ),
++    .GBA_BusRnW         ( 1'b1          ),
++    .GBA_BusACC         ( 2'd0          ),
++    .GBA_BusWriteData   ( 32'd0         ),
++    .GBA_BusReadData    (               ),
++    .GBA_Bus_written    ( 1'b0          ),
++    .pixel_out_x        (               ),
++    .pixel_out_y        (               ),
++    .pixel_out_addr     ( pixel_addr    ),
++    .pixel_out_data     ( pixel_data    ),
++    .pixel_out_we       ( pixel_we      ),
++    .largeimg_out_base  (               ),
++    .largeimg_out_addr  (               ),
++    .largeimg_out_data  (               ),
++    .largeimg_out_req   ( fb_req        ),
++    .largeimg_out_done  ( fb_done       ),
++    .largeimg_newframe  ( 1'b0          ),
++    .largeimg_singlebuf ( 1'b0          ),
++    .sound_out_left     (               ),
++    .sound_out_right    (               ),
++    .debug_cpu_pc       ( cpu_pc        ),
++    .debug_cpu_mixed    (               ),
++    .debug_irq          (               ),
++    .debug_dma          (               ),
++    .debug_mem          (               )
++);
++
++endmodule
+diff --git a/npsim/synth.sh b/npsim/synth.sh
+new file mode 100755
+index 0000000..faf12e3
+--- /dev/null
++++ b/npsim/synth.sh
+@@ -0,0 +1,13 @@
++#!/usr/bin/env bash
++# ghdl synth of gba_top (generics as in GBA.sv) -> build/vlog/gba_top.v
++set -u
++cd "$(dirname "$0")"
++mkdir -p build/vlog
++docker run --rm -u $(id -u):$(id -g) -v $PWD/build/vhdl:/out -v $PWD/build/ghdl:/work -w /out hdlc/ghdl:yosys \
++  ghdl synth --std=08 -frelaxed -fsynopsys --latches --workdir=/work -P/work \
++  -gSoftmap_GBA_FLASH_ADDR=0 -gSoftmap_GBA_EEPROM_ADDR=0 -gSoftmap_GBA_WRam_ADDR=131072 \
++  -gSoftmap_GBA_Gamerom_ADDR=196608 -gSoftmap_SaveState_ADDR=58720256 -gSoftmap_Rewind_ADDR=33554432 \
++  "-gturbosound='1'" --out=verilog gba_top > build/vlog/gba_top.v 2> build/vlog/gba_top.log
++rc=$?
++grep error build/vlog/gba_top.log | sort -u | head -20
++exit $rc
+diff --git a/npsim/vhdl_files.txt b/npsim/vhdl_files.txt
+new file mode 100644
+index 0000000..468bd62
+--- /dev/null
++++ b/npsim/vhdl_files.txt
+@@ -0,0 +1,44 @@
++mem:rtl/SyncFifo.vhd
++mem:rtl/SyncRam.vhd
++mem:rtl/SyncRamDual.vhd
++mem:rtl/SyncRamDualNotPow2.vhd
++mem:npsim/SyncRamDualByteEnable_sim.vhd
++rtl/proc_bus_gba.vhd
++rtl/reggba_display.vhd
++rtl/reggba_dma.vhd
++rtl/reggba_keypad.vhd
++rtl/reggba_serial.vhd
++rtl/reggba_sound.vhd
++rtl/reggba_system.vhd
++rtl/reggba_timer.vhd
++rtl/reg_savestates.vhd
++rtl/gba_bios.vhd
++rtl/gba_cpu.vhd
++rtl/gba_dma_module.vhd
++rtl/gba_dma.vhd
++rtl/gba_drawer_merge.vhd
++rtl/gba_drawer_mode0.vhd
++rtl/gba_drawer_mode2.vhd
++rtl/gba_drawer_mode345.vhd
++rtl/gba_drawer_obj.vhd
++rtl/gba_gpu_timing.vhd
++rtl/gba_gpu_drawer.vhd
++rtl/gba_gpu_colorshade.vhd
++rtl/gba_gpu.vhd
++rtl/gba_joypad.vhd
++rtl/gba_reservedregs.vhd
++rtl/gba_serial.vhd
++rtl/gba_sound_ch1.vhd
++rtl/gba_sound_ch3.vhd
++rtl/gba_sound_ch4.vhd
++rtl/gba_sound_dma.vhd
++rtl/gba_sound.vhd
++rtl/gba_timer_module.vhd
++rtl/gba_timer.vhd
++rtl/gba_savestates.vhd
++rtl/gba_statemanager.vhd
++rtl/gba_cheats.vhd
++rtl/gba_gpioRTCSolarGyro.vhd
++rtl/cache.vhd
++rtl/gba_memorymux.vhd
++rtl/gba_top.vhd
+-- 
+2.43.0
+

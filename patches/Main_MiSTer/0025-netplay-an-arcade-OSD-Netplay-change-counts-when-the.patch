@@ -1,8 +1,8 @@
-From 2197af2d15ed26f33cb0274604456a988396ed87 Mon Sep 17 00:00:00 2001
+From 7ff76514809743419af13f9c3a3ef7d78a89183c Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sun, 8 Nov 2026 19:37:36 +0100
-Subject: [PATCH 25/25] netplay: an arcade OSD Netplay change counts when the OSD
- closes or after 1.5 s, not on every step through the choices
+Subject: [PATCH 25/42] netplay: an arcade OSD Netplay change counts when the
+ OSD closes or after 1.5 s, not on every step through the choices
 ---
  support/netplay/netplay.cpp          | 18 +++++++++++++++---
  support/netplay/test/Makefile        |  1 +

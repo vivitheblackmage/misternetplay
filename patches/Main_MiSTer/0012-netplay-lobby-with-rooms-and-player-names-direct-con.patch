@@ -1,8 +1,8 @@
-From d7384ee2b84cd40ce7b52451631e4e810f2ba9f5 Mon Sep 17 00:00:00 2001
+From af422eeb91c06347647887d0435c43dafea5a55c Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sun, 1 Nov 2026 12:29:38 +0100
-Subject: [PATCH] netplay: lobby with rooms and player names, direct connection
- with relay fallback
+Subject: [PATCH 12/42] netplay: lobby with rooms and player names, direct
+ connection with relay fallback
 
 With server= in netplay.ini, Host opens a room on the netplay-server and the
 others see it as a folder in the OSD file browser, _Netplay/Rooms/<name> -

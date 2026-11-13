@@ -1,0 +1,285 @@
+From c209b76a87b9a95fcceaeca2368e649a010183f9 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 10 Nov 2026 21:08:56 +0100
+Subject: [PATCH 32/42] netplay: T3w over real UDP: two MiSTers' GBA adapters
+ pair (direct, server, relay only), find each other's room, connect and
+ exchange data; no catalog check for GBA
+---
+ support/netplay/netplay.cpp          |   2 +-
+ support/netplay/test/Makefile        |   5 +-
+ support/netplay/test/run_udp_test.sh |  13 ++-
+ support/netplay/test/udp_harness.cpp | 136 ++++++++++++++++++++++++++-
+ 4 files changed, 149 insertions(+), 7 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index ff063c3..1e290b4 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -2227,7 +2227,7 @@ static void begin_session(const char *name_in, unsigned char index, char opensav
+ 	}
+ 	else if (!md5_file(name, li.rom_md5, hdr, sizeof(hdr))) return;
+ 	if (core_sys != SYS_GB2P) memcpy(li.rom2_md5, li.rom_md5, 16);
+-	if (cfg.server[0] && core_sys != SYS_ARCADE)    // arcade games never come from the server
++	if (cfg.server[0] && core_sys != SYS_ARCADE && core_sys != SYS_GBA)    // arcade games never come from the server; GBA: each its own game
+ 	{
+ 		std::lock_guard<std::mutex> g(cat_mtx);
+ 		if (!catalog.empty() && (!catalog.count(md5_hex(li.rom_md5)) || !catalog.count(md5_hex(li.rom2_md5))))
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index c0dc4c2..99a52d1 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -22,6 +22,7 @@ test: test_netplay test_rfu test_rfu_link udp_harness
+ 	NP_SYSTEM=arcade ./run_udp_test.sh
+ 	NP_SYSTEM=arcade NP_OSD=1 ./run_udp_test.sh
+ 	NP_SYSTEM=arcade NP_OSD=1 NP_OSD_STEPS=1 ./run_udp_test.sh
++	NP_SYSTEM=gba ./run_udp_test.sh
+ 	@srv=../../../../server/build/netplay-server-linux-amd64; \
+ 	if [ -x $$srv ]; then srv=$$(cd $$(dirname $$srv) && pwd)/$$(basename $$srv); \
+ 	  NP_SERVER_BIN=$$srv ./run_udp_test.sh && \
+@@ -40,7 +41,9 @@ test: test_netplay test_rfu test_rfu_link udp_harness
+ 	  NP_SYSTEM=arcade NP_SERVER_BIN=$$srv NP_INCORE=1 NP_DECOY=1 ./run_udp_test.sh && \
+ 	  NP_SYSTEM=arcade NP_SERVER_BIN=$$srv NP_DECOY=1 ./run_udp_test.sh && \
+ 	  NP_SYSTEM=arcade NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
+-	  NP_SYSTEM=arcade NP_SERVER_BIN=$$srv NP_DIRECT=no NP_AUTOJOIN=1 ./run_udp_test.sh; \
++	  NP_SYSTEM=arcade NP_SERVER_BIN=$$srv NP_DIRECT=no NP_AUTOJOIN=1 ./run_udp_test.sh && \
++	  NP_SYSTEM=gba NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
++	  NP_SYSTEM=gba NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_DIRECT=no ./run_udp_test.sh; \
+ 	else echo "SKIP udp (server): build it with server/build.sh"; fi
+ 
+ test_netplay: $(ENGINE) test_netplay.cpp $(HDRS)
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+index e75b2a6..f0305b8 100755
+--- a/support/netplay/test/run_udp_test.sh
++++ b/support/netplay/test/run_udp_test.sh
+@@ -12,6 +12,7 @@ case "${NP_SYSTEM:-}" in
+ 	snes) sysdir=SNES; ext=sfc ;;
+ 	gb2p) sysdir=GB; ext=gb ;;
+ 	arcade) sysdir=; ext=nes ;;   # nothing from the server: the games are MRA files
++	gba) sysdir=GBA; ext=gba ;;   # wireless adapter (SPEC.md 13): each side its own game
+ 	*)    sysdir=; ext=nes ;;
+ esac
+ 
+@@ -51,8 +52,18 @@ hd=${h##*digest=}; jd=${j##*digest=}
+ label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_TWO:+ (two games)}${NP_OSD:+ (OSD mode${NP_OSD_STEPS:+, stepping})}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_INCORE:+, Join room in the core}${NP_DECOY:+, two rooms}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}"
+ ok=0
+ [ $hr -eq 0 ] && [ $jr -eq 0 ] && [ -n "$hd" ] && [ "$hd" = "$jd" ] && ok=1
++# GBA wireless adapter: both linked (and through the server: with the other's name)
++if [ $ok -eq 1 ] && [ "${NP_SYSTEM:-}" = gba ]; then
++	for side in host join; do
++		grep -q "wireless adapter linked" "$tmp/$side.log" || { echo "$side: not linked"; ok=0; }
++	done
++	if [ -n "${NP_SERVER_BIN:-}" ]; then
++		grep -q "linked with Joinor" "$tmp/host.log" || { echo "host: name of join missing"; ok=0; }
++		grep -q "linked with Par..Host" "$tmp/join.log" || { echo "join: name of host missing"; ok=0; }
++	fi
++fi
+ # through a server: the path the session took, and the names
+-if [ $ok -eq 1 ] && [ -n "${NP_SERVER_BIN:-}" ]; then
++if [ $ok -eq 1 ] && [ -n "${NP_SERVER_BIN:-}" ] && [ "${NP_SYSTEM:-}" != gba ]; then
+ 	for side in host join; do
+ 		if [ "${NP_DIRECT:-yes}" = no ]; then
+ 			grep -q "playing with .*through the server" "$tmp/$side.log" || { echo "$side: not through the server"; ok=0; }
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index 6a28e4a..32b7790 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -18,6 +18,7 @@
+ #include <vector>
+ 
+ #include "../netplay.h"
++#include "../rfu.h"
+ #include "../../../file_io.h"
+ #include "../../../spi.h"
+ #include "../../../user_io.h"
+@@ -31,7 +32,8 @@ static std::string workdir;
+ static int         reloads = 0;
+ // NP_SYSTEM=snes: the SNES core (SPEC.md 10); NP_SYSTEM=gb2p: Game Boy 2P (SPEC.md 11);
+ // NP_SYSTEM=arcade: a jtframe arcade core loaded from an MRA (SPEC.md 12); else NES
+-static bool        snes = false, gb2p = false, arcade = false;
++static bool        snes = false, gb2p = false, arcade = false, gba = false;
++static uint64_t    gba_mb[0x1000 / 8];      // GBA: the wireless adapter's mailbox (gba_rfu.sv's side is faked below)
+ static sw_struct   sw;                      // arcade: the DIP switches as mra_loader keeps them
+ static std::string dip_sends;               // arcade: what went to the core, in order
+ // NP_TWO=1 (gb2p): two games, game.gb into both Game Boys, then game2.gb into gb2
+@@ -44,8 +46,8 @@ static int         spi_cmd = -1, spi_words = 0;
+ // --- stubs for the MiSTer functions netplay.cpp uses ------------------------
+ 
+ // arcade: the MRA's set name, and with orig the core's own name (as Main has them)
+-char *user_io_get_core_name(int orig) { static char n[] = "NES", sn[] = "SNES", g[] = "GAMEBOY2P", a[] = "bublboblr", ao[] = "JTBUBL"; return arcade ? (orig ? ao : a) : gb2p ? g : snes ? sn : n; }
+-char *user_io_get_core_path(const char *, int) { static char p[] = "games/NES", sp[] = "games/SNES", g[] = "games/GAMEBOY2P"; return gb2p ? g : snes ? sp : p; }
++char *user_io_get_core_name(int orig) { static char n[] = "NES", sn[] = "SNES", g[] = "GAMEBOY2P", a[] = "bublboblr", ao[] = "JTBUBL", ga[] = "GBA"; return gba ? ga : arcade ? (orig ? ao : a) : gb2p ? g : snes ? sn : n; }
++char *user_io_get_core_path(const char *, int) { static char p[] = "games/NES", sp[] = "games/SNES", g[] = "games/GAMEBOY2P", ga[] = "games/GBA"; return gba ? ga : gb2p ? g : snes ? sp : p; }
+ char is_arcade() { return arcade; }
+ static bool menu_mode = false;              // NP_MENU: the join starts in the main menu
+ char is_menu() { return menu_mode; }
+@@ -71,6 +73,9 @@ char *user_io_get_confstr(int index)
+ 	// (an empty item after the name, which user_io_get_confstr() returns as NULL)
+ 	static char ad[] = "DIP", ar[] = "R0,Reset";
+ 	if (arcade) return index == 0 ? aa : index == 1 ? nullptr : index == 2 ? ad : index == 3 ? an : index == 4 ? ar : index == 5 ? b : nullptr;
++	// GBA as GBA.sv's CONF_STR: the Link Port and Netplay options (SPEC.md 13)
++	static char gn[] = "GBA", gl[] = "P2O[44],Link Port,Off,Wireless Adapter", gnp[] = "P2O[46:45],Netplay,netplay.ini,Off,Host,Join";
++	if (gba) return index == 0 ? gn : index == 1 ? gl : index == 2 ? gnp : index == 3 ? b : nullptr;
+ 	return index == 0 ? (gb2p ? ga : snes ? sa : a) : index == 1 ? b : nullptr;
+ }
+ 
+@@ -80,7 +85,7 @@ static bool osd_visible = false;            // NP_OSD_STEPS: the OSD is open whi
+ char user_io_osd_is_visible() { return osd_visible; }
+ uint32_t user_io_status_get(const char *opt, int)
+ {
+-	if (!strcmp(opt, arcade ? "[127:126]" : gb2p ? "[47:46]" : snes ? "[59:58]" : "[89:88]")) return osd_netplay;
++	if (!strcmp(opt, gba ? "[46:45]" : arcade ? "[127:126]" : gb2p ? "[47:46]" : snes ? "[59:58]" : "[89:88]")) return osd_netplay;
+ 	if (arcade) return 0;
+ 	if (gb2p) return !strcmp(opt, "[6]") ? status6 : 0;
+ 	if (snes && (!strcmp(opt, "[22:21]") || !strcmp(opt, "[45:44]"))) return 1;   // WRAM/ARAM 00FF
+@@ -131,6 +136,7 @@ void Info(const char *message, int, int, int, int) { printf("[osd] %s\n", messag
+ 
+ void *shmem_map(uint32_t phys, uint32_t)
+ {
++	if (gba) return phys == 0x3C000000 ? (void *)gba_mb : nullptr;
+ 	if (phys != mailbox_phys(arcade ? SYS_ARCADE : gb2p ? SYS_GB2P : snes ? SYS_SNES : SYS_NES)) { printf("[harness] wrong mailbox address %08x\n", phys); return nullptr; }
+ 	return fpga->own;
+ }
+@@ -302,11 +308,132 @@ static int run_arcade(bool host, bool osd, uint32_t want)
+ 	return ok ? 0 : 1;
+ }
+ 
++// GBA with the wireless adapter (SPEC.md 13.6, T3w): the core's side of the
++// mailbox as gba_rfu.sv does it, one command at a time; the scripts are what a
++// game sends (LinkRawWireless): the host opens a room and waits for a client
++// and its data; the join searches, connects, sends and waits for the host's.
++static uint16_t gba_seq = 0, gba_eseq = 0;
++static void gba_sleep(int ms)   // the main thread keeps running netplay_poll() (it shows the messages)
++{
++	for (uint64_t t = now_ms(); now_ms() - t < (uint64_t)ms; usleep(1000)) netplay_poll();
++}
++static int gba_cmd(uint8_t cmd, const std::vector<uint32_t> &d, uint32_t *out, uint32_t *err)
++{
++	volatile uint64_t *mb = gba_mb;
++	for (size_t i = 0; i < d.size(); i++) mb[(0x018 >> 3) + i] = d[i];
++	gba_seq++;
++	uint32_t h = (uint32_t)gba_seq << 16 | (uint32_t)cmd << 8 | (uint32_t)d.size();
++	mb[0x010 >> 3] = (uint64_t)h << 32 | h;
++	for (uint64_t t = now_ms(); now_ms() - t < 3000; usleep(100))
++	{
++		netplay_poll();
++		uint64_t a = mb[0x200 >> 3];
++		uint32_t lo = (uint32_t)a;
++		if (lo != (uint32_t)(a >> 32) || (lo >> 16) != gba_seq) continue;
++		int n = lo & 0xff;
++		if (lo & 0x100) { *err = (uint32_t)mb[0x208 >> 3]; return -1; }
++		for (int i = 0; i < n; i++) out[i] = (uint32_t)mb[(0x208 >> 3) + i];
++		return n;
++	}
++	printf("[harness] no answer to command %02x\n", cmd);
++	return -2;
++}
++static int gba_event(uint32_t *out, int ms)   // after Wait: the words the adapter pushes
++{
++	volatile uint64_t *mb = gba_mb;
++	for (uint64_t t = now_ms(); now_ms() - t < (uint64_t)ms; usleep(200))
++	{
++		netplay_poll();
++		uint64_t e = mb[0x500 >> 3];
++		uint32_t lo = (uint32_t)e;
++		if (lo != (uint32_t)(e >> 32) || (lo >> 16) == gba_eseq || !(lo & 7)) continue;
++		gba_eseq = lo >> 16;
++		int n = lo & 7;
++		for (int i = 0; i < n; i++) out[i] = (uint32_t)mb[(0x508 >> 3) + i];
++		return n;
++	}
++	return 0;
++}
++
++static int run_gba(bool host)
++{
++	// the core is up: magic and status (as gba_rfu.sv writes them)
++	gba_mb[0] = 0x4742415246553031ull;   // "GBARFU01"
++	gba_mb[1] = 0;
++	netplay_start();
++	gba_sleep(200);
++	// each side its own game (FireRed and LeafGreen talk): different md5s
++	make_rom(getFullPath("game.gba"), host ? 0 : 7);
++	netplay_note_file("game.gba", 1, 0);
++	uint32_t out[Rfu::MAX_WORDS], err = 0;
++	bool ok = true;
++	auto expect = [&](bool c, const char *what) { if (!c) { printf("[harness] FAIL %s\n", what); ok = false; } };
++
++	expect(gba_cmd(0x10, {}, out, &err) == 0, "Hello");
++	if (host)
++	{
++		expect(gba_cmd(0x17, {0x003C0420}, out, &err) == 0, "Setup");
++		expect(gba_cmd(0x16, {0x11, 0x22, 0x33, 0x44, 0x55, 0x66}, out, &err) == 0, "Broadcast");
++		expect(gba_cmd(0x19, {}, out, &err) == 0, "StartHost");
++		int n = 0;
++		for (uint64_t t = now_ms(); n < 1 && now_ms() - t < 20000; gba_sleep(20)) n = gba_cmd(0x1a, {}, out, &err);
++		expect(n == 1, "a client in PollConnections");
++		// wait for the client's data (it may already be there)
++		int got = 0;
++		for (uint64_t t = now_ms(); !got && now_ms() - t < 20000; )
++		{
++			expect(gba_cmd(0x27, {}, out, &err) == 0, "Wait");
++			uint32_t ev[8];
++			int k = gba_event(ev, 3000);
++			if (k >= 1 && ev[0] == 0x99660028)
++			{
++				int m = gba_cmd(0x26, {}, out, &err);
++				if (m >= 2 && out[0] == 0x400 && out[1] == 0xc0ffee11) got = 1;
++			}
++		}
++		expect(got, "the client's data c0ffee11");
++		expect(gba_cmd(0x24, {4, 0x12345678}, out, &err) == 0, "SendData to the client");
++		gba_sleep(7000);   // let it go out, and the messages show, before leaving
++	}
++	else
++	{
++		uint32_t id = 0;
++		for (uint64_t t = now_ms(); !id && now_ms() - t < 20000; )
++		{
++			gba_cmd(0x1c, {}, out, &err);
++			gba_sleep(300);
++			int n = gba_cmd(0x1d, {}, out, &err);
++			if (n >= 7 && out[1] == 0x11 && out[6] == 0x66) id = out[0];
++			gba_cmd(0x1e, {}, out, &err);
++		}
++		expect(id != 0, "the host's broadcast");
++		expect(gba_cmd(0x1f, {id}, out, &err) == 0, "Connect");
++		uint32_t st = 0x01000000;
++		for (uint64_t t = now_ms(); st == 0x01000000 && now_ms() - t < 10000; gba_sleep(20))
++			if (gba_cmd(0x20, {}, out, &err) == 1) st = out[0];
++		expect(st != 0x01000000 && (st >> 16) == 0, "connected as client 0");
++		expect(gba_cmd(0x21, {}, out, &err) == 1, "FinishConnection");
++		expect(gba_cmd(0x24, {4u << 8, 0xc0ffee11}, out, &err) == 0, "SendData to the host");
++		int got = 0;
++		for (uint64_t t = now_ms(); !got && now_ms() - t < 20000; gba_sleep(20))
++		{
++			int m = gba_cmd(0x26, {}, out, &err);
++			if (m >= 2 && out[0] == 4 && out[1] == 0x12345678) got = 1;
++		}
++		expect(got, "the host's data 12345678");
++		gba_sleep(7000);   // the messages are shown one after the other, 1.5 s each
++	}
++	netplay_stop();
++	printf("RESULT frames=0 stalls=0 reloads=%d dip=0 digest=%s\n", reloads, ok ? "gba-ok" : "gba-fail");
++	return ok ? 0 : 1;
++}
++
+ int main(int argc, char **argv)
+ {
+ 	snes = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "snes");
+ 	gb2p = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "gb2p");
+ 	arcade = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "arcade");
++	gba = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "gba");
+ 	two = gb2p && getenv("NP_TWO") != nullptr;
+ 	const char *sysdir = gb2p ? "GAMEBOY2P" : snes ? "SNES" : "NES", *ext = gb2p ? ".gb" : snes ? ".sfc" : ".nes";
+ 	if (argc == 4 && !strcmp(argv[1], "makerom")) { make_rom(argv[2], atoi(argv[3])); return 0; }
+@@ -338,6 +465,7 @@ int main(int argc, char **argv)
+ 	fclose(f);
+ 
+ 	if (arcade) return run_arcade(host, osd, want);
++	if (gba) return run_gba(host);
+ 
+ 	std::string game = std::string("game") + ext;
+ 	if (server)
+-- 
+2.43.0
+

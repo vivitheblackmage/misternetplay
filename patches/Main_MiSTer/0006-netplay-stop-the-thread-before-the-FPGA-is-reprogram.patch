@@ -1,7 +1,8 @@
-From 3bb6cab46b3a2c79b1ffa2365d5f6e2179840426 Mon Sep 17 00:00:00 2001
+From 16447fe3a8bb0412c84124a4d6caf6c63d7eef05 Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sat, 31 Oct 2026 21:42:32 +0100
-Subject: [PATCH] netplay: stop the thread before the FPGA is reprogrammed
+Subject: [PATCH 06/42] netplay: stop the thread before the FPGA is
+ reprogrammed
 
 fpga_load_rbf() reprograms the FPGA before app_restart() runs, so the netplay
 thread kept writing the DDR3 mailbox while the next core was already loaded

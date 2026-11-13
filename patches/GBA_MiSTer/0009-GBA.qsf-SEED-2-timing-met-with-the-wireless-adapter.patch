@@ -1,0 +1,24 @@
+From 259dacdd89479aaea346f5e7cc599bac6cb1aa7b Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 10 Nov 2026 22:37:13 +0100
+Subject: [PATCH 09/12] GBA.qsf: SEED 2 (timing met with the wireless adapter)
+---
+ GBA.qsf | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/GBA.qsf b/GBA.qsf
+index 5b1b4b9..ba0a2b6 100644
+--- a/GBA.qsf
++++ b/GBA.qsf
+@@ -49,7 +49,7 @@ set_global_assignment -name PERIPHERY_TO_CORE_PLACEMENT_AND_ROUTING_OPTIMIZATION
+ set_global_assignment -name PHYSICAL_SYNTHESIS_ASYNCHRONOUS_SIGNAL_PIPELINING ON
+ set_global_assignment -name ALM_REGISTER_PACKING_EFFORT LOW
+ set_global_assignment -name PLACEMENT_EFFORT_MULTIPLIER 1.0
+-set_global_assignment -name SEED 1
++set_global_assignment -name SEED 2
+ set_global_assignment -name VERILOG_MACRO "MISTER_FB=1"
+ 
+ source sys/sys.tcl
+-- 
+2.43.0
+

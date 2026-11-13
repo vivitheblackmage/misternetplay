@@ -1,7 +1,7 @@
-From c9d491354c9c9eedaf0f675e167467aff5cc55f8 Mon Sep 17 00:00:00 2001
+From 1d8ab718b2cc9f96a606fcc74e88eefab168375e Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sun, 8 Nov 2026 18:24:18 +0100
-Subject: [PATCH 23/23] netplay: arcade rooms in _Arcade/_Netplay: one MRA per
+Subject: [PATCH 23/42] netplay: arcade rooms in _Arcade/_Netplay: one MRA per
  waiting room, a copy of the player's own with the room id; loading it joins
  that room
 ---

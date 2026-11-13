@@ -1,0 +1,95 @@
+From 3d56104e3b566532dc7aeed30ba0e0df35543ffc Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 10 Nov 2026 21:22:11 +0100
+Subject: [PATCH 08/12] gba_rfu: no command buffer, each data word goes to the
+ mailbox as it arrives (the core did not route)
+---
+ rtl/gba_rfu.sv | 36 +++++++++++++++++++-----------------
+ 1 file changed, 19 insertions(+), 17 deletions(-)
+
+diff --git a/rtl/gba_rfu.sv b/rtl/gba_rfu.sv
+index 3b5a3b9..3eb0bc2 100644
+--- a/rtl/gba_rfu.sv
++++ b/rtl/gba_rfu.sv
+@@ -52,7 +52,11 @@ reg  [7:0] cmd, plen, cnt;
+ reg [15:0] seq, eseq, resets;
+ reg  [7:0] alen, aflags;
+ reg [31:0] aerr;
+-reg [31:0] cbuf[0:31];          // command data
++// command data: each word goes to the mailbox as it arrives (a GBA transfer
++// takes ~16 us, a DDR3 write far less), so no buffer is needed
++reg        wq_pend;
++reg  [4:0] wq_idx;
++reg [31:0] wq_word;
+ reg  [2:0] en_sync;
+ 
+ // pending GBA transfer waiting for the HPS (or for a mailbox read)
+@@ -60,7 +64,7 @@ reg        pend;
+ reg [31:0] pend_word;
+ 
+ // memory sequencer
+-localparam M_IDLE = 0, M_MAGIC = 1, M_STATUS = 2, M_CDATA = 3, M_CHDR = 4,
++localparam M_IDLE = 0, M_MAGIC = 1, M_STATUS = 2, M_CHDR = 4,
+            M_AHDR = 5, M_ADATA = 6, M_EHDR = 7, M_EDATA = 8, M_WAIT = 9;
+ reg  [3:0] ms, mret;
+ reg  [7:0] mi;                  // word index
+@@ -148,7 +152,9 @@ always @(posedge clk) begin
+ 				xfer_answer   <= 32'h80000000;
+ 				xfer_done     <= 1;
+ 				pend          <= 0;
+-				cbuf[cnt[4:0]] <= pend_word;
++				wq_pend       <= 1;
++				wq_idx        <= cnt[4:0];
++				wq_word       <= pend_word;
+ 				cnt           <= cnt + 1'd1;
+ 				if (cnt + 1'd1 >= plen) begin
+ 					st       <= S_ASK;
+@@ -223,9 +229,16 @@ always @(posedge clk) begin
+ 				mem_addr <= (MB_BASE + 28'h008) >> 3; mem_din <= {resets, 16'h0, resets, 16'h0}; mem_we <= 1; mem_req <= 1;
+ 				need_status <= 0; ms <= M_WAIT; mret <= M_IDLE;
+ 			end
++			else if (wq_pend) begin
++				mem_addr <= (MB_BASE + 28'h018 + {wq_idx, 3'b000}) >> 3; mem_din <= {32'h0, wq_word}; mem_we <= 1; mem_req <= 1;
++				wq_pend <= 0;
++				ms <= M_WAIT; mret <= M_IDLE;
++			end
+ 			else if (on && st == S_ASK && !cmd_sent) begin
+-				mi <= 0;
+-				ms <= M_CDATA;
++				// the data is in the mailbox already: the header last
++				mem_addr <= (MB_BASE + 28'h010) >> 3; mem_din <= {seq, cmd, plen, seq, cmd, plen}; mem_we <= 1; mem_req <= 1;
++				cmd_sent <= 1;
++				ms <= M_WAIT; mret <= M_IDLE;
+ 			end
+ 			else if (on && st == S_ASK && cmd_sent && !ans_ok && poll == 0) begin
+ 				mem_addr <= (MB_BASE + 28'h200) >> 3; mem_we <= 0; mem_req <= 1;
+@@ -240,18 +253,6 @@ always @(posedge clk) begin
+ 				ms <= M_WAIT; mret <= M_EHDR;
+ 			end
+ 		end
+-		M_CDATA: begin
+-			if (mi < plen) begin
+-				mem_addr <= (MB_BASE + 28'h018 + {mi, 3'b000}) >> 3; mem_din <= {32'h0, cbuf[mi[4:0]]}; mem_we <= 1; mem_req <= 1;
+-				mi <= mi + 1'd1;
+-				ms <= M_WAIT; mret <= M_CDATA;
+-			end
+-			else begin
+-				mem_addr <= (MB_BASE + 28'h010) >> 3; mem_din <= {seq, cmd, plen, seq, cmd, plen}; mem_we <= 1; mem_req <= 1;
+-				cmd_sent <= 1;
+-				ms <= M_WAIT; mret <= M_IDLE;
+-			end
+-		end
+ 		M_AHDR: begin
+ 			// answer for this command: both halves alike, the right sequence number
+ 			if (mem_dout[63:32] == mem_dout[31:0] && mem_dout[31:16] == seq && st == S_ASK) begin
+@@ -321,6 +322,7 @@ always @(posedge clk) begin
+ 		poll     <= 0;
+ 		have_word <= 0;
+ 		resets   <= 0;
++		wq_pend  <= 0;
+ 	end
+ end
+ 
+-- 
+2.43.0
+

@@ -1,8 +1,8 @@
-From 6e0acb3b9976c2cde6c81e8edeb94b0e05c2f46c Mon Sep 17 00:00:00 2001
+From 060443a1de3ef69e880cd069d2faab5c06af6fcf Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Wed, 4 Nov 2026 16:25:09 +0100
-Subject: [PATCH] netplay: SNES allows every Initial WRAM/ARAM pattern (each is
- fixed)
+Subject: [PATCH 16/42] netplay: SNES allows every Initial WRAM/ARAM pattern
+ (each is fixed)
 ---
  support/netplay/netplay_proto.cpp     | 7 +++----
  support/netplay/netplay_proto.h       | 4 ++--

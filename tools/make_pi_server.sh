@@ -3,6 +3,7 @@
 # machine with systemd), to send over with FileBridge or copy on a USB stick:
 #
 #   tools/make_pi_server.sh <from-folder> <to-folder>
+#   NO_ROMS=1 tools/make_pi_server.sh ...   only the server (an update: the Pi keeps its games)
 #
 #   from-folder  the server's folder so far (e.g. on Windows), whose
 #                netplay-server.ini (the key), catalog.txt and roms/ go along
@@ -29,7 +30,8 @@ mkdir -p "$to"
 cp "$b/netplay-server-linux-arm64" "$b/netplay-server-linux-armv7" "$b/install-linux.sh" "$to/"
 chmod +x "$to"/netplay-server-linux-*
 for f in netplay-server.ini catalog.txt; do [ -f "$from/$f" ] && cp "$from/$f" "$to/"; done
-[ -d "$from/roms" ] && { mkdir -p "$to/roms"; cp -r "$from/roms/." "$to/roms/"; }
+rm -rf "$to/roms"
+if [ -z "${NO_ROMS:-}" ] && [ -d "$from/roms" ]; then mkdir -p "$to/roms"; cp -r "$from/roms/." "$to/roms/"; fi
 cp "$root/server/README.md" "$to/"
 
 cat > "$to/README-pi.txt" <<'EOF'
@@ -61,4 +63,4 @@ Settings and games on the Pi: /opt/netplay-server
 Status page: http://<the Pi's address>:7845/
 EOF
 echo "$to: $(ls "$to" | tr '\n' ' ')"
-echo "roms: $(find "$to/roms" -type f 2>/dev/null | wc -l) files"
+echo "roms: $(find "$to/roms" -type f 2>/dev/null | wc -l) files${NO_ROMS:+ (NO_ROMS: an update, the Pi keeps its games)}"

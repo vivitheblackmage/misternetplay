@@ -1,0 +1,202 @@
+From 1696775e8f51bf0e80eeb8684afe509b6ccfa2f7 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Wed, 11 Nov 2026 23:09:44 +0100
+Subject: [PATCH 10/12] npsim T2w (work in progress): Wait the way Pokemon's
+ librfu does it (data frames later, SO toggled per pushed word); pool padding
+ (the bench reads some ROM literals 8 bytes off)
+---
+ npsim/Makefile    |   2 +-
+ npsim/gba_sim.cpp |  23 ++++++++++-
+ npsim/rfutest.s   | 103 ++++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 125 insertions(+), 3 deletions(-)
+
+diff --git a/npsim/Makefile b/npsim/Makefile
+index 24a5595..23bda86 100644
+--- a/npsim/Makefile
++++ b/npsim/Makefile
+@@ -40,7 +40,7 @@ $(BUILD)/rfutest.gba: rfutest.s
+ 	python3 -I -c 'import sys; h=open(sys.argv[1],"rb").read()[:0xc0]; c=open(sys.argv[2],"rb").read(); r=h+c; r+=bytes(-len(r)%4); r+=bytes(65536-len(r)); open(sys.argv[3],"wb").write(r)' ../sim/tests/armwrestler.gba $(BUILD)/asm/t.bin $@
+ 
+ t2w: obj/gba_sim $(BUILD)/rfutest.gba
+-	obj/gba_sim $(BUILD)/rfutest.gba --rfu --nokeys --frames 30 --lat 8 2>&1 | tee $(BUILD)/t2w.log | grep -E "T2w|peer|rfutest:"
++	obj/gba_sim $(BUILD)/rfutest.gba --rfu --nokeys --frames 60 --lat 8 2>&1 | tee $(BUILD)/t2w.log | grep -E "T2w|peer|rfutest:"
+ 	grep -q "^PASS T2w" $(BUILD)/t2w.log
+ 
+ clean:
+diff --git a/npsim/gba_sim.cpp b/npsim/gba_sim.cpp
+index f276b85..afe97b1 100644
+--- a/npsim/gba_sim.cpp
++++ b/npsim/gba_sim.cpp
+@@ -118,6 +118,25 @@ static void peer_frame()
+ 			peer_step = 3;
+ 		}
+ 		break;
++	case 3:
++	case 4:
++	case 5:
++	case 6:
++	case 7:
++	case 8:
++	case 9:
++	case 10:
++	case 11:
++	case 12:
++		peer_step++;   // the GBA sits in Wait meanwhile (Pokemon's client case)
++		break;
++	case 13:
++		d[0] = 4u << 8;
++		d[1] = 0xbeef0001;
++		rfu_peer.command(0x24, d, 2, out);
++		fprintf(stderr, "peer: sent beef0001 (10 frames later)\n");
++		peer_step = 14;
++		break;
+ 	}
+ 	rfu_deliver();
+ }
+@@ -254,7 +273,7 @@ int main(int argc, char **argv)
+ 			if (top->pixel_addr == 38399)
+ 			{
+ 				printf("frame %d crc %08x pc %08x\n", frame, ~crc, top->cpu_pc);
+-				if (rfu_on && mem[131072 + 0x40] == 1 && peer_step == 3) break;   // T2w finished (EWRAM 0x02000100)
++				if (rfu_on && mem[131072 + 0x40] == 1 && peer_step == 14) break;   // T2w finished (EWRAM 0x02000100)
+ 				if (rfu_on)
+ 				{
+ 					rfu_gba.frame();
+@@ -348,7 +367,7 @@ int main(int argc, char **argv)
+ 	{
+ 		const uint32_t ew = 131072;   // EWRAM in the flat memory (Softmap_GBA_WRam_ADDR)
+ 		fprintf(stderr, "rfutest: done=%u failed=%u commands=%u peer_got=%08x\n", mem[ew + 0x40], mem[ew + 18], rfu_mb.commands(), peer_got);
+-		for (int i = 0; i < 19; i++) fprintf(stderr, "  r[%d] = %08x\n", i, mem[ew + i]);
++		for (int i = 0; i < 25; i++) fprintf(stderr, "  r[%d] = %08x\n", i, mem[ew + i]);
+ 		bool pass = mem[ew + 0x40] == 1 && mem[ew + 18] == 0 && peer_got == 0x12345678;
+ 		fprintf(stderr, "%s T2w\n", pass ? "PASS" : "FAIL");
+ 	}
+diff --git a/npsim/rfutest.s b/npsim/rfutest.s
+index 5c0152e..fc2d0f9 100644
+--- a/npsim/rfutest.s
++++ b/npsim/rfutest.s
+@@ -206,6 +206,49 @@ start:
+     cmp   r0, r1
+     addne r10, r10, #1
+ 
++    @ Wait as Pokemon's librfu does it (pret/pokefirered librfu_intr.c): the
++    @ peer's data comes frames later; each pushed word: SO high, read, SO low
++    @ results: [19] Wait ack [20] pushed 0 [21] pushed 1 [22] ReceiveData ack
++    @          [23] its data word [24] where it got stuck (0 = nowhere)
++    mov   r0, #0
++    str   r0, [r11, #96]
++    mov   r0, #0x27
++    mov   r1, #0
++    bl    command
++    str   r0, [r11, #76]
++    ldr   r1, =0x996600a7
++    cmp   r0, r1
++    addne r10, r10, #1
++    ldr   r0, =0x80000000           @ preloaded while armed
++    mov   r1, #0                    @ not the last word
++    bl    lr_slave
++    str   r0, [r11, #80]
++    ldr   r1, =0x99660028
++    cmp   r0, r1
++    addne r10, r10, #1
++    ldr   r0, =0x996600a8           @ the ack, sent while the adapter pushes word 1
++    mov   r1, #1                    @ last word: back to clock master
++    bl    lr_slave
++    str   r0, [r11, #84]
++    cmp   r0, #0x80000000
++    addne r10, r10, #1
++    mov   r0, #0x26
++    mov   r1, #0
++    bl    command
++    str   r0, [r11, #88]
++    ldr   r1, =0x996602a6
++    cmp   r0, r1
++    addne r10, r10, #1
++    bl    readword                  @ header
++    bl    readword
++    str   r0, [r11, #92]
++    ldr   r1, =0xbeef0001
++    cmp   r0, r1
++    addne r10, r10, #1
++    ldr   r0, [r11, #96]
++    cmp   r0, #0
++    addne r10, r10, #1
++
+     str   r10, [r11, #72]
+     mov   r0, #1
+     str   r0, [r11, #0x100]
+@@ -270,6 +313,65 @@ xfer:
+     ldr   r0, [r1]
+     bx    lr
+ 
++@ lr_slave: one word pushed by the adapter, librfu's way (sio32intr_clock_slave);
++@ r0 = what the GBA sends meanwhile, r1 = 1 for the last word. Returns the
++@ pushed word. A stuck step goes to [24] (1 arm, 2 SI low, 3 SI high).
++lr_slave:
++    stmfd sp!, {r4-r6, lr}
++    mov   r6, r1
++    ldr   r1, =SIODATA32
++    str   r0, [r1]
++    ldr   r1, =SIOCNT
++    ldr   r2, =0x5002               @ external clock, 2 MHz bit, SO low, IRQ bit
++    strh  r2, [r1]
++    ldr   r2, =0x5082               @ start: armed
++    strh  r2, [r1]
++    ldr   r5, =8000000
++1:  ldrh  r3, [r1]
++    tst   r3, #0x80
++    beq   2f
++    subs  r5, r5, #1
++    bne   1b
++    mov   r0, #1
++    b     9f
++2:  ldr   r5, =100000               @ handshake_wait(0): SI low
++3:  ldrh  r3, [r1]
++    tst   r3, #0x04
++    beq   4f
++    subs  r5, r5, #1
++    bne   3b
++    mov   r0, #2
++    b     9f
++4:  ldr   r2, =0x500a               @ SO high
++    strh  r2, [r1]
++    ldr   r4, =SIODATA32
++    ldr   r4, [r4]
++    ldr   r5, =100000               @ handshake_wait(1): SI high
++5:  ldrh  r3, [r1]
++    tst   r3, #0x04
++    bne   6f
++    subs  r5, r5, #1
++    bne   5b
++    mov   r0, #3
++    b     9f
++6:  ldr   r2, =0x5002               @ SO low
++    strh  r2, [r1]
++    cmp   r6, #0
++    beq   8f
++    ldr   r2, =SIODATA32            @ the last word: master again
++    mov   r3, #0
++    str   r3, [r2]
++    strh  r3, [r1]
++    ldr   r2, =0x5003
++    strh  r2, [r1]
++8:  mov   r0, r4
++    ldmfd sp!, {r4-r6, pc}
++9:  ldr   r2, [r11, #96]
++    cmp   r2, #0
++    streq r0, [r11, #96]
++    mov   r0, #0
++    ldmfd sp!, {r4-r6, pc}
++
+ @ xfer_ext: the adapter is clock master; r0 = the GBA's word, returns the pushed one
+ xfer_ext:
+     ldr   r1, =SIODATA32
+@@ -291,4 +393,5 @@ hs:
+     .word 0xABB14E45, 0xB1BA4E45, 0xB1BA4F44, 0xB0BB4F44, 0xB0BB8001
+ bcst:
+     .word 0x11, 0x22, 0x33, 0x44, 0x55, 0x66
++    .word 0                         @ pool alignment (the bench reads some ROM literals 8 bytes off)
+     .pool
+-- 
+2.43.0
+

@@ -1,0 +1,130 @@
+From ce67ad2d2088d7530d9052f4dd010f90b14dfe4b Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 10 Nov 2026 23:28:42 +0100
+Subject: [PATCH 35/42] netplay: rfu_link measures the round trip
+ (netplay.log), resends once a second after the link is lost
+---
+ support/netplay/netplay.cpp            |  4 ++--
+ support/netplay/rfu_link.cpp           | 23 ++++++++++++++++++-----
+ support/netplay/rfu_link.h             |  4 +++-
+ support/netplay/test/test_rfu_link.cpp |  8 ++++++++
+ 4 files changed, 31 insertions(+), 8 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 3799731..0ba6b22 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -1055,8 +1055,8 @@ static void *gba_wireless_thread(void *)
+ 			{
+ 				last_stats = now;
+ 				char text[160];
+-				snprintf(text, sizeof(text), "wireless: sent %u received %u resent %u unacked %u foreign %u %s%s",
+-				         link->sent(), link->received(), link->resent(), (unsigned)link->unacked(), link->foreign(),
++				snprintf(text, sizeof(text), "wireless: rtt %u ms, sent %u received %u resent %u unacked %u foreign %u %s%s",
++				         link->rtt_ms(), link->sent(), link->received(), link->resent(), (unsigned)link->unacked(), link->foreign(),
+ 				         udp->via_server() ? (udp->direct() ? "direct" : "via server") : "peer=",
+ 				         link->connected() ? "" : " (not linked)");
+ 				log_line(text);
+diff --git a/support/netplay/rfu_link.cpp b/support/netplay/rfu_link.cpp
+index f446195..4be692d 100644
+--- a/support/netplay/rfu_link.cpp
++++ b/support/netplay/rfu_link.cpp
+@@ -35,15 +35,25 @@ void RfuLink::send(const uint8_t *buf, size_t len)
+ {
+ 	if (len > MAX_PAYLOAD) return;
+ 	if (out_.size() >= MAX_OUT) out_.pop_front();   // 1024 unacked: the peer is gone
+-	Out o { next_seq_++, now_, std::vector<uint8_t>(buf, buf + len) };
++	Out o { next_seq_++, now_, now_, false, std::vector<uint8_t>(buf, buf + len) };
+ 	if (connected_) put(T_DATA, o.seq, o.data.data(), o.data.size());
+-	else o.sent = 0;                                  // sent once the peer answers
++	else o.sent = o.first = 0;                        // sent once the peer answers
+ 	out_.push_back(o);
+ }
+ 
+ void RfuLink::on_ack(uint16_t ack)
+ {
+-	while (!out_.empty() && diff(out_.front().seq, ack) <= 0) out_.pop_front();
++	while (!out_.empty() && diff(out_.front().seq, ack) <= 0)
++	{
++		// round trip from packets acked on their first sending only
++		const Out &o = out_.front();
++		if (!o.resent && o.first)
++		{
++			uint32_t r = (uint32_t)(now_ - o.first);
++			rtt_ = rtt_ ? rtt_ - (rtt_ + 4) / 8 + r : r * 8;
++		}
++		out_.pop_front();
++	}
+ }
+ 
+ void RfuLink::tick(uint64_t now_ms, const Deliver &deliver)
+@@ -116,10 +126,13 @@ void RfuLink::tick(uint64_t now_ms, const Deliver &deliver)
+ 		return;
+ 	}
+ 
++	// the other side silent for 10 s: resend once a second, not every 100 ms
++	uint64_t resend = lost(now_ms) ? 1000 : RESEND_MS;
+ 	for (Out &o : out_)
+-		if (!o.sent || now_ms - o.sent >= RESEND_MS)
++		if (!o.sent || now_ms - o.sent >= resend)
+ 		{
+-			if (o.sent) resent_++;
++			if (o.sent) { resent_++; o.resent = true; }
++			if (!o.first) o.first = now_ms;
+ 			o.sent = now_ms;
+ 			put(T_DATA, o.seq, o.data.data(), o.data.size());
+ 		}
+diff --git a/support/netplay/rfu_link.h b/support/netplay/rfu_link.h
+index 022712e..fcdd475 100644
+--- a/support/netplay/rfu_link.h
++++ b/support/netplay/rfu_link.h
+@@ -35,6 +35,7 @@ public:
+ 	uint32_t sent() const { return sent_; }
+ 	uint32_t received() const { return received_; }
+ 	uint32_t foreign() const { return foreign_; }
++	uint32_t rtt_ms() const { return rtt_ ? (rtt_ + 4) / 8 : 0; }   // round trip, smoothed (0: none yet)
+ 
+ private:
+ 	enum : uint8_t { T_HELLO = 0, T_DATA = 1, T_ACK = 2 };
+@@ -42,7 +43,7 @@ private:
+ 	static const size_t HDR = 11;              // "NPW1" type seq16 ack16 len16
+ 	static const uint16_t WINDOW = 256;        // out-of-order packets kept
+ 
+-	struct Out { uint16_t seq; uint64_t sent; std::vector<uint8_t> data; };
++	struct Out { uint16_t seq; uint64_t sent, first; bool resent; std::vector<uint8_t> data; };
+ 
+ 	netplay::Transport *t_;
+ 	bool host_, connected_ = false, locked_ = false;
+@@ -54,6 +55,7 @@ private:
+ 	uint64_t last_hello_ = 0, last_ack_ = 0, last_rx_ = 0, now_ = 0;
+ 	bool ack_due_ = false;
+ 	uint32_t resent_ = 0, sent_ = 0, received_ = 0, foreign_ = 0;
++	uint32_t rtt_ = 0;                         // 8 x smoothed round trip in ms
+ 
+ 	void put(uint8_t type, uint16_t seq, const uint8_t *data, size_t len);
+ 	void on_ack(uint16_t ack);
+diff --git a/support/netplay/test/test_rfu_link.cpp b/support/netplay/test/test_rfu_link.cpp
+index c849627..c2a9ca7 100644
+--- a/support/netplay/test/test_rfu_link.cpp
++++ b/support/netplay/test/test_rfu_link.cpp
+@@ -89,9 +89,17 @@ int main()
+ 	for (int i = 0; i < 3000; i++) { net.now++; host.tick(net.now, deliver0); join.tick(net.now, deliver1); }
+ 	CHECK(host.unacked() == 0 && join.unacked() == 0, "everything acked (%zu, %zu)", host.unacked(), join.unacked());
+ 	CHECK(!host.lost(net.now) && !join.lost(net.now), "keepalive holds the link");
++	CHECK(host.rtt_ms() >= 10 && host.rtt_ms() <= 200, "round trip measured (%u ms; the net delays 5..85 each way)", host.rtt_ms());
+ 	net.loss = 100;
+ 	for (int i = 0; i < 11000; i++) { net.now++; host.tick(net.now, deliver0); }
+ 	CHECK(host.lost(net.now), "silence for 10 s: lost");
++	{
++		uint8_t b[4] = {1, 2, 3, 4};
++		for (int i = 0; i < 50; i++) host.send(b, 4);
++		uint32_t before = host.sent();
++		for (int i = 0; i < 3000; i++) { net.now++; host.tick(net.now, deliver0); }
++		CHECK(host.sent() - before < 50 * 4 + 10, "lost: resends once a second, not every 100 ms (%u)", host.sent() - before);
++	}
+ 
+ 	// a lockstep peer (netplay HELLO) and a different version are named
+ 	{
+-- 
+2.43.0
+

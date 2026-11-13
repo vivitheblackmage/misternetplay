@@ -1,8 +1,8 @@
-From 318a6af0a8503cf540ef7886f4c0efe926aae29f Mon Sep 17 00:00:00 2001
+From 88cf8ea2cfa48043984748f8be24710cdafce9bd Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sun, 1 Nov 2026 03:09:01 +0100
-Subject: [PATCH] netplay: netplay-server support (rooms + relay, games in a
- RAM folder, catalog)
+Subject: [PATCH 11/42] netplay: netplay-server support (rooms + relay, games
+ in a RAM folder, catalog)
 
 With server=, room= and key= in netplay.ini, host and join send only to a
 netplay-server, which pairs them by room and relays the session packets; only

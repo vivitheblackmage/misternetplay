@@ -1,0 +1,386 @@
+From 68bbdaed654b5738f1087dd86657ffb7b5ba3943 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 10 Nov 2026 20:47:53 +0100
+Subject: [PATCH 30/42] netplay: rfu_link, a reliable ordered channel for the
+ wireless adapter's packets (T3w part 2)
+---
+ support/netplay/rfu_link.cpp           | 124 +++++++++++++++++++++++
+ support/netplay/rfu_link.h             |  59 +++++++++++
+ support/netplay/test/Makefile          |   8 +-
+ support/netplay/test/test_rfu_link.cpp | 135 +++++++++++++++++++++++++
+ 4 files changed, 324 insertions(+), 2 deletions(-)
+ create mode 100644 support/netplay/rfu_link.cpp
+ create mode 100644 support/netplay/rfu_link.h
+ create mode 100644 support/netplay/test/test_rfu_link.cpp
+
+diff --git a/support/netplay/rfu_link.cpp b/support/netplay/rfu_link.cpp
+new file mode 100644
+index 0000000..a52d452
+--- /dev/null
++++ b/support/netplay/rfu_link.cpp
+@@ -0,0 +1,124 @@
++// rfu_link.cpp — reliable, ordered packets for the wireless adapter (SPEC.md 13.5).
++
++#include "rfu_link.h"
++#include <string.h>
++
++const uint8_t RfuLink::VERSION;   // its address is sent (C++14 needs the definition)
++
++namespace {
++const uint8_t MAGIC[4] = { 'N', 'P', 'W', '1' };
++const uint64_t RESEND_MS = 100, HELLO_MS = 500, KEEPALIVE_MS = 1000;
++const size_t MAX_OUT = 1024;                   // unacked packets kept (more: the link is dead anyway)
++
++int16_t diff(uint16_t a, uint16_t b) { return (int16_t)(uint16_t)(a - b); }
++void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
++uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] << 8 | p[1]); }
++}
++
++void RfuLink::put(uint8_t type, uint16_t seq, const uint8_t *data, size_t len)
++{
++	uint8_t pkt[HDR + MAX_PAYLOAD];
++	if (len > MAX_PAYLOAD) len = MAX_PAYLOAD;
++	memcpy(pkt, MAGIC, 4);
++	pkt[4] = type;
++	put16(pkt + 5, seq);
++	put16(pkt + 7, (uint16_t)(expect_ - 1));   // everything before expect_ has arrived
++	put16(pkt + 9, (uint16_t)len);
++	if (len) memcpy(pkt + HDR, data, len);
++	t_->send(pkt, HDR + len);
++	last_ack_ = now_;
++	ack_due_ = false;
++}
++
++void RfuLink::send(const uint8_t *buf, size_t len)
++{
++	if (len > MAX_PAYLOAD) return;
++	if (out_.size() >= MAX_OUT) out_.pop_front();   // 1024 unacked: the peer is gone
++	Out o { next_seq_++, now_, std::vector<uint8_t>(buf, buf + len) };
++	if (connected_) put(T_DATA, o.seq, o.data.data(), o.data.size());
++	else o.sent = 0;                                  // sent once the peer answers
++	out_.push_back(o);
++}
++
++void RfuLink::on_ack(uint16_t ack)
++{
++	while (!out_.empty() && diff(out_.front().seq, ack) <= 0) out_.pop_front();
++}
++
++void RfuLink::tick(uint64_t now_ms, const Deliver &deliver)
++{
++	now_ = now_ms;
++	uint8_t buf[1500];
++	int n;
++	while ((n = t_->recv(buf, sizeof(buf))) >= 0)
++	{
++		if ((size_t)n < HDR || memcmp(buf, MAGIC, 4))
++		{
++			// something else talks to us: a lockstep core, or junk
++			if (n >= 4 && !connected_) refusal_ = "Netplay: the other player is not using the wireless adapter";
++			continue;
++		}
++		uint8_t type = buf[4];
++		uint16_t seq = get16(buf + 5), ack = get16(buf + 7), len = get16(buf + 9);
++		if (len > MAX_PAYLOAD || HDR + len > (size_t)n || type > T_ACK) continue;
++		if (type == T_HELLO && (len < 1 || buf[HDR] != VERSION))
++		{
++			refusal_ = "Netplay: different netplay version";
++			continue;
++		}
++		if (host_ && !locked_)
++		{
++			t_->lock_peer();   // from now on only this player
++			locked_ = true;
++		}
++		last_rx_ = now_ms;
++		if (!connected_)
++		{
++			connected_ = true;
++			refusal_ = nullptr;
++			put(T_HELLO, 0, &VERSION, 1);   // so the other side connects too
++			for (Out &o : out_) o.sent = 0;
++		}
++		else if (type == T_HELLO) put(T_HELLO, 0, &VERSION, 1);   // it has not heard us yet
++		on_ack(ack);
++		if (type != T_DATA) continue;
++
++		int16_t d = diff(seq, expect_);
++		if (d < 0) { ack_due_ = true; continue; }    // a resend we already have
++		if (d >= (int16_t)WINDOW) continue;            // far ahead: dropped, it is resent
++		if (d > 0)
++		{
++			early_[seq] = std::vector<uint8_t>(buf + HDR, buf + HDR + len);
++			ack_due_ = true;
++			continue;
++		}
++		deliver(buf + HDR, len);
++		expect_++;
++		for (auto it = early_.find(expect_); it != early_.end(); it = early_.find(expect_))
++		{
++			deliver(it->second.data(), it->second.size());
++			early_.erase(it);
++			expect_++;
++		}
++		ack_due_ = true;
++	}
++
++	if (!connected_)
++	{
++		if (!last_hello_ || now_ms - last_hello_ >= HELLO_MS)
++		{
++			last_hello_ = now_ms;
++			put(T_HELLO, 0, &VERSION, 1);
++		}
++		return;
++	}
++
++	for (Out &o : out_)
++		if (!o.sent || now_ms - o.sent >= RESEND_MS)
++		{
++			if (o.sent) resent_++;
++			o.sent = now_ms;
++			put(T_DATA, o.seq, o.data.data(), o.data.size());
++		}
++	if (ack_due_ || now_ms - last_ack_ >= KEEPALIVE_MS) put(T_ACK, 0, nullptr, 0);
++}
+diff --git a/support/netplay/rfu_link.h b/support/netplay/rfu_link.h
+new file mode 100644
+index 0000000..030f80a
+--- /dev/null
++++ b/support/netplay/rfu_link.h
+@@ -0,0 +1,59 @@
++// rfu_link.h — the wireless adapter's packets between two MiSTers (SPEC.md 13.5):
++// a small reliable, ordered channel over the netplay Transport (UDP, direct or
++// through the server). No lockstep: the adapter's protocol tolerates the delay.
++// No OS calls (time comes in as an argument), so it builds in the x86 tests.
++
++#ifndef RFU_LINK_H
++#define RFU_LINK_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include <deque>
++#include <map>
++#include <vector>
++#include <functional>
++#include "netplay_session.h"   // Transport
++
++class RfuLink
++{
++public:
++	static const size_t MAX_PAYLOAD = 128;     // gpSP's largest RFU1 packet is 104 bytes
++	using Deliver = std::function<void(const uint8_t *buf, size_t len)>;
++
++	RfuLink(netplay::Transport *t, bool host) : t_(t), host_(host) {}
++
++	void send(const uint8_t *buf, size_t len);         // reliable, in order
++	void tick(uint64_t now_ms, const Deliver &deliver);  // receive, resend, keep alive
++
++	bool connected() const { return connected_; }
++	bool lost(uint64_t now_ms) const { return connected_ && now_ms - last_rx_ > 10000; }
++	const char *refusal() const { return refusal_; }  // the other side is not a wireless adapter
++
++	// observation (tests)
++	size_t unacked() const { return out_.size(); }
++	uint32_t resent() const { return resent_; }
++
++private:
++	enum : uint8_t { T_HELLO = 0, T_DATA = 1, T_ACK = 2 };
++	static const uint8_t VERSION = 1;
++	static const size_t HDR = 11;              // "NPW1" type seq16 ack16 len16
++	static const uint16_t WINDOW = 256;        // out-of-order packets kept
++
++	struct Out { uint16_t seq; uint64_t sent; std::vector<uint8_t> data; };
++
++	netplay::Transport *t_;
++	bool host_, connected_ = false, locked_ = false;
++	const char *refusal_ = nullptr;
++	uint16_t next_seq_ = 1;                    // ours
++	uint16_t expect_ = 1;                      // theirs, next in order
++	std::deque<Out> out_;
++	std::map<uint16_t, std::vector<uint8_t>> early_;   // theirs, ahead of expect_
++	uint64_t last_hello_ = 0, last_ack_ = 0, last_rx_ = 0, now_ = 0;
++	bool ack_due_ = false;
++	uint32_t resent_ = 0;
++
++	void put(uint8_t type, uint16_t seq, const uint8_t *data, size_t len);
++	void on_ack(uint16_t ack);
++};
++
++#endif
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index 3cced00..d0bc290 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -8,9 +8,10 @@ ENGINE   := ../netplay_proto.cpp ../netplay_session.cpp
+ HDRS     := ../netplay_proto.h ../netplay_session.h fake_fpga.h
+ 
+ .PHONY: test clean
+-test: test_netplay test_rfu udp_harness
++test: test_netplay test_rfu test_rfu_link udp_harness
+ 	./test_netplay
+ 	./test_rfu
++	./test_rfu_link
+ 	./run_udp_test.sh
+ 	NP_OSD=1 ./run_udp_test.sh
+ 	NP_SYSTEM=snes ./run_udp_test.sh
+@@ -49,6 +50,9 @@ test_netplay: $(ENGINE) test_netplay.cpp $(HDRS)
+ test_rfu: test_rfu.cpp ../rfu.cpp ../rfu.h
+ 	$(CXX) $(CXXFLAGS) -o $@ test_rfu.cpp ../rfu.cpp
+ 
++test_rfu_link: test_rfu_link.cpp ../rfu_link.cpp ../rfu_link.h ../netplay_session.h
++	$(CXX) $(CXXFLAGS) -o $@ test_rfu_link.cpp ../rfu_link.cpp
++
+ # The real netplay.cpp, with MiSTer functions stubbed in udp_harness.cpp.
+ md5.o: $(ROOT)/lib/md5/md5.c
+ 	$(CC) -O1 -g -fsanitize=address,undefined -c -o $@ $<
+@@ -58,4 +62,4 @@ udp_harness: $(ENGINE) ../netplay.cpp ../netplay.h udp_harness.cpp $(HDRS) md5.o
+ 	  -o $@ $(ENGINE) ../netplay.cpp udp_harness.cpp md5.o -lpthread
+ 
+ clean:
+-	rm -f test_netplay test_rfu udp_harness md5.o
++	rm -f test_netplay test_rfu test_rfu_link udp_harness md5.o
+diff --git a/support/netplay/test/test_rfu_link.cpp b/support/netplay/test/test_rfu_link.cpp
+new file mode 100644
+index 0000000..c849627
+--- /dev/null
++++ b/support/netplay/test/test_rfu_link.cpp
+@@ -0,0 +1,135 @@
++// T3w, second part: rfu_link.cpp over a bad network (loss, duplicates,
++// reordering, delay): every packet arrives once and in order on both sides.
++// Then a lockstep peer, another version, and junk.
++
++#include "../rfu_link.h"
++#include <stdio.h>
++#include <string.h>
++#include <vector>
++#include <deque>
++
++static int fails = 0, checks = 0;
++#define CHECK(c, ...) do { checks++; if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
++
++static uint32_t rng = 1;
++static uint32_t rnd() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
++
++struct Net;
++struct End : netplay::Transport
++{
++	Net *net; int me;
++	void send(const uint8_t *b, size_t n) override;
++	int recv(uint8_t *b, size_t cap) override;
++	void lock_peer() override { locked = true; }
++	bool locked = false;
++};
++struct Pkt { uint64_t at; std::vector<uint8_t> d; };
++struct Net
++{
++	End e[2];
++	std::vector<Pkt> q[2];            // to end 0, to end 1
++	uint64_t now = 0;
++	int loss = 20, dup = 10, maxdelay = 80;
++	Net() { e[0].net = e[1].net = this; e[0].me = 0; e[1].me = 1; }
++};
++void End::send(const uint8_t *b, size_t n)
++{
++	int to = 1 - me;
++	if ((int)(rnd() % 100) < net->loss) return;
++	int copies = (int)(rnd() % 100) < net->dup ? 2 : 1;
++	for (int i = 0; i < copies; i++)
++		net->q[to].push_back({ net->now + 5 + rnd() % net->maxdelay, std::vector<uint8_t>(b, b + n) });
++}
++int End::recv(uint8_t *b, size_t cap)
++{
++	auto &q = net->q[me];
++	for (size_t i = 0; i < q.size(); i++)   // any due packet: order is not kept
++		if (q[i].at <= net->now)
++		{
++			size_t n = q[i].d.size() < cap ? q[i].d.size() : cap;
++			if (n) memcpy(b, q[i].d.data(), n);
++			q.erase(q.begin() + i);
++			return (int)n;
++		}
++	return -1;
++}
++
++int main()
++{
++	Net net;
++	RfuLink host(&net.e[0], true), join(&net.e[1], false);
++	std::vector<uint32_t> got[2];
++	auto deliver0 = [&](const uint8_t *b, size_t n) { uint32_t v; if (n >= 4) { memcpy(&v, b, 4); got[0].push_back(v); } };
++	auto deliver1 = [&](const uint8_t *b, size_t n) { uint32_t v; if (n >= 4) { memcpy(&v, b, 4); got[1].push_back(v); } };
++
++	// packets sent before the link is up are kept and go out once it is
++	uint32_t early = 0xEA41;
++	join.send((const uint8_t *)&early, 4);
++
++	const uint32_t N = 2000;
++	uint32_t sent0 = 0, sent1 = 0;
++	for (int step = 0; step < 200000 && (got[0].size() < N + 1 || got[1].size() < N); step++)
++	{
++		net.now++;
++		if (host.connected() && sent0 < N && rnd() % 3 == 0) { uint32_t v = 1000000 + sent0++; uint8_t b[100] = {}; memcpy(b, &v, 4); host.send(b, 4 + rnd() % 96); }
++		if (join.connected() && sent1 < N && rnd() % 3 == 0) { uint32_t v = 2000000 + sent1++; uint8_t b[100] = {}; memcpy(b, &v, 4); join.send(b, 4 + rnd() % 96); }
++		host.tick(net.now, deliver0);
++		join.tick(net.now, deliver1);
++	}
++	CHECK(host.connected() && join.connected(), "both connected");
++	CHECK(net.e[0].locked && !net.e[1].locked, "the host locked its peer");
++	CHECK(got[1].size() == N, "join got %zu of %u", got[1].size(), N);
++	CHECK(got[0].size() == N + 1, "host got %zu of %u", got[0].size(), N + 1);
++	bool order1 = true, order0 = got[0].size() && got[0][0] == early;
++	for (size_t i = 0; i < got[1].size(); i++) if (got[1][i] != 1000000 + i) order1 = false;
++	for (size_t i = 1; i < got[0].size(); i++) if (got[0][i] != 2000000 + i - 1) order0 = false;
++	CHECK(order1, "join: in order, once each");
++	CHECK(order0, "host: the early packet first, then in order, once each");
++	CHECK(host.resent() > 0 && join.resent() > 0, "losses were resent (%u, %u)", host.resent(), join.resent());
++	for (int i = 0; i < 3000; i++) { net.now++; host.tick(net.now, deliver0); join.tick(net.now, deliver1); }
++	CHECK(host.unacked() == 0 && join.unacked() == 0, "everything acked (%zu, %zu)", host.unacked(), join.unacked());
++	CHECK(!host.lost(net.now) && !join.lost(net.now), "keepalive holds the link");
++	net.loss = 100;
++	for (int i = 0; i < 11000; i++) { net.now++; host.tick(net.now, deliver0); }
++	CHECK(host.lost(net.now), "silence for 10 s: lost");
++
++	// a lockstep peer (netplay HELLO) and a different version are named
++	{
++		Net n2;
++		n2.loss = 0; n2.dup = 0;
++		RfuLink a(&n2.e[0], true);
++		const uint8_t lockstep[] = { 'N', 'P', 'L', 'Y', 1, 2, 3, 4, 5, 6, 7, 8 };
++		n2.e[1].send(lockstep, sizeof(lockstep));
++		for (int i = 0; i < 200; i++) { n2.now++; a.tick(n2.now, deliver0); }
++		CHECK(a.refusal() && strstr(a.refusal(), "not using the wireless adapter"), "lockstep peer named");
++		CHECK(!a.connected(), "not connected to it");
++		const uint8_t v9[] = { 'N', 'P', 'W', '1', 0, 0, 0, 0, 0, 0, 1, 9 };
++		n2.e[1].send(v9, sizeof(v9));
++		for (int i = 0; i < 200; i++) { n2.now++; a.tick(n2.now, deliver0); }
++		CHECK(a.refusal() && strstr(a.refusal(), "version"), "other version named");
++	}
++
++	// junk must not crash or deliver (ASan)
++	{
++		Net n3;
++		n3.loss = 0; n3.dup = 0;
++		RfuLink a(&n3.e[0], false);
++		size_t delivered = 0;
++		auto count = [&](const uint8_t *, size_t n) { delivered++; if (n > RfuLink::MAX_PAYLOAD) delivered += 1000000; };
++		for (int i = 0; i < 20000; i++)
++		{
++			uint8_t pkt[300];
++			for (auto &c : pkt) c = (uint8_t)rnd();
++			memcpy(pkt, "NPW1", 4);
++			pkt[4] = i % 4;
++			size_t len = rnd() % sizeof(pkt);
++			n3.e[1].send(pkt, len);
++			n3.now++;
++			a.tick(n3.now, count);
++		}
++		CHECK(delivered < 1000000, "never a payload over the limit");
++	}
++
++	printf("%s: %d checks, %d failed\n", fails ? "FAIL" : "PASS", checks, fails);
++	return fails ? 1 : 0;
++}
+-- 
+2.43.0
+

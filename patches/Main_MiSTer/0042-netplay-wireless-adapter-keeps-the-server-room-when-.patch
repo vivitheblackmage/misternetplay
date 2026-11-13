@@ -1,0 +1,206 @@
+From 3cb4bd0176c671771e3ed22f2c970890e7d769cb Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 14 Nov 2026 00:27:24 +0100
+Subject: [PATCH 42/42] netplay: wireless adapter keeps the server room when
+ the game is loaded again (a host's new room stranded the join); T3w: second
+ round after the host or the join loads its game again
+---
+ support/netplay/netplay.cpp          | 30 +++++++++---
+ support/netplay/test/Makefile        |  4 +-
+ support/netplay/test/run_udp_test.sh |  2 +-
+ support/netplay/test/udp_harness.cpp | 71 +++++++++++++++++++++-------
+ 4 files changed, 80 insertions(+), 27 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 231620e..c412ff3 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -1035,6 +1035,8 @@ static void *gba_wireless_thread(void *)
+ 	Rfu rfu([&link](int, const uint8_t *b, size_t n) { rfu_trace_pkt(link ? "tx" : "tx-nolink", b, n); if (link) link->send(b, n); },
+ 	        (uint32_t)(now_ms() ^ ((uint64_t)getpid() << 16)));
+ 	uint32_t seen_rom = 0;
++	Mode pair_mode = M_OFF;      // what udp was opened for
++	std::string pair_room;
+ 	bool linked = false;
+ 	const char *told = nullptr;
+ 	uint64_t next_frame_us = now_ms() * 1000;
+@@ -1058,13 +1060,6 @@ static void *gba_wireless_thread(void *)
+ 		if (seq != seen_rom)
+ 		{
+ 			seen_rom = seq;
+-			delete link; link = nullptr;
+-			if (udp) udp->leave();
+-			delete udp; udp = nullptr;
+-			lobby_host("");
+-			linked = false;
+-			told = nullptr;
+-
+ 			LocalInfo li;
+ 			Mode mode;
+ 			std::string room, path;
+@@ -1075,6 +1070,27 @@ static void *gba_wireless_thread(void *)
+ 				room = rom_room;
+ 				path = rom_path;
+ 			}
++			linked = false;
++			lost_told = false;
++			told = nullptr;
++			// The same mode and room as before (the game loaded again): keep the
++			// place on the server and the way to the other player; only the link
++			// starts over, with a new session id, which the other side follows.
++			// A new room here would leave a join that already got this one
++			// asking for a room that is gone.
++			if (udp && link && mode == pair_mode && room == pair_room)
++			{
++				delete link;
++				link = new RfuLink(udp, mode == M_HOST, random32());
++				restarts = 0;
++				continue;   // the next round of the loop serves the mailbox
++			}
++			delete link; link = nullptr;
++			if (udp) udp->leave();
++			delete udp; udp = nullptr;
++			lobby_host("");
++			pair_mode = mode;
++			pair_room = room;
+ 			bool ok = mode == M_HOST || mode == M_JOIN;
+ 			if (mode == M_JOIN && !cfg.peer[0] && !cfg.server[0])
+ 			{
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index 99a52d1..c57b3b4 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -43,7 +43,9 @@ test: test_netplay test_rfu test_rfu_link udp_harness
+ 	  NP_SYSTEM=arcade NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
+ 	  NP_SYSTEM=arcade NP_SERVER_BIN=$$srv NP_DIRECT=no NP_AUTOJOIN=1 ./run_udp_test.sh && \
+ 	  NP_SYSTEM=gba NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
+-	  NP_SYSTEM=gba NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_DIRECT=no ./run_udp_test.sh; \
++	  NP_SYSTEM=gba NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_DIRECT=no ./run_udp_test.sh && \
++	  NP_SYSTEM=gba NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_GBA_RELOAD=host ./run_udp_test.sh && \
++	  NP_SYSTEM=gba NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_GBA_RELOAD=join ./run_udp_test.sh; \
+ 	else echo "SKIP udp (server): build it with server/build.sh"; fi
+ 
+ test_netplay: $(ENGINE) test_netplay.cpp $(HDRS)
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+index f0305b8..b9ddbfc 100755
+--- a/support/netplay/test/run_udp_test.sh
++++ b/support/netplay/test/run_udp_test.sh
+@@ -49,7 +49,7 @@ h=$(grep RESULT "$tmp/host.log"); j=$(grep RESULT "$tmp/join.log")
+ echo "host: $h"
+ echo "join: $j"
+ hd=${h##*digest=}; jd=${j##*digest=}
+-label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_TWO:+ (two games)}${NP_OSD:+ (OSD mode${NP_OSD_STEPS:+, stepping})}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_INCORE:+, Join room in the core}${NP_DECOY:+, two rooms}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}"
++label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_TWO:+ (two games)}${NP_OSD:+ (OSD mode${NP_OSD_STEPS:+, stepping})}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_INCORE:+, Join room in the core}${NP_DECOY:+, two rooms}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}${NP_GBA_RELOAD:+ ($NP_GBA_RELOAD loads the game again)}"
+ ok=0
+ [ $hr -eq 0 ] && [ $jr -eq 0 ] && [ -n "$hd" ] && [ "$hd" = "$jd" ] && ok=1
+ # GBA wireless adapter: both linked (and through the server: with the other's name)
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index 32b7790..2673969 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -355,19 +355,15 @@ static int gba_event(uint32_t *out, int ms)   // after Wait: the words the adapt
+ 	return 0;
+ }
+ 
+-static int run_gba(bool host)
++// One round of a game's wireless session: the host opens a room and waits for
++// a client and its data; the join searches, connects, sends and waits for the
++// host's. Each round has its own data.
++static bool gba_round(bool host, int round)
+ {
+-	// the core is up: magic and status (as gba_rfu.sv writes them)
+-	gba_mb[0] = 0x4742415246553031ull;   // "GBARFU01"
+-	gba_mb[1] = 0;
+-	netplay_start();
+-	gba_sleep(200);
+-	// each side its own game (FireRed and LeafGreen talk): different md5s
+-	make_rom(getFullPath("game.gba"), host ? 0 : 7);
+-	netplay_note_file("game.gba", 1, 0);
+ 	uint32_t out[Rfu::MAX_WORDS], err = 0;
+ 	bool ok = true;
+-	auto expect = [&](bool c, const char *what) { if (!c) { printf("[harness] FAIL %s\n", what); ok = false; } };
++	auto expect = [&](bool c, const char *what) { if (!c) { printf("[harness] FAIL round %d: %s\n", round, what); ok = false; } };
++	const uint32_t from_join = 0xc0ffee10 + round, from_host = 0x12345670 + round;
+ 
+ 	expect(gba_cmd(0x10, {}, out, &err) == 0, "Hello");
+ 	if (host)
+@@ -388,12 +384,11 @@ static int run_gba(bool host)
+ 			if (k >= 1 && ev[0] == 0x99660028)
+ 			{
+ 				int m = gba_cmd(0x26, {}, out, &err);
+-				if (m >= 2 && out[0] == 0x400 && out[1] == 0xc0ffee11) got = 1;
++				if (m >= 2 && out[0] == 0x400 && out[1] == from_join) got = 1;
+ 			}
+ 		}
+-		expect(got, "the client's data c0ffee11");
+-		expect(gba_cmd(0x24, {4, 0x12345678}, out, &err) == 0, "SendData to the client");
+-		gba_sleep(7000);   // let it go out, and the messages show, before leaving
++		expect(got, "the client's data");
++		expect(gba_cmd(0x24, {4, from_host}, out, &err) == 0, "SendData to the client");
+ 	}
+ 	else
+ 	{
+@@ -413,16 +408,56 @@ static int run_gba(bool host)
+ 			if (gba_cmd(0x20, {}, out, &err) == 1) st = out[0];
+ 		expect(st != 0x01000000 && (st >> 16) == 0, "connected as client 0");
+ 		expect(gba_cmd(0x21, {}, out, &err) == 1, "FinishConnection");
+-		expect(gba_cmd(0x24, {4u << 8, 0xc0ffee11}, out, &err) == 0, "SendData to the host");
++		expect(gba_cmd(0x24, {4u << 8, from_join}, out, &err) == 0, "SendData to the host");
+ 		int got = 0;
+ 		for (uint64_t t = now_ms(); !got && now_ms() - t < 20000; gba_sleep(20))
+ 		{
+ 			int m = gba_cmd(0x26, {}, out, &err);
+-			if (m >= 2 && out[0] == 4 && out[1] == 0x12345678) got = 1;
++			if (m >= 2 && out[0] == 4 && out[1] == from_host) got = 1;
++		}
++		expect(got, "the host's data");
++	}
++	return ok;
++}
++
++static void gba_adapter_reset()   // an SD pulse: the game resets its adapter (gba_rfu counts it in the status word)
++{
++	static uint16_t resets = 0;
++	resets++;
++	uint32_t st = (uint32_t)resets << 16;
++	gba_mb[1] = (uint64_t)st << 32 | st;
++	gba_sleep(50);
++}
++
++static int run_gba(bool host)
++{
++	// the core is up: magic and status (as gba_rfu.sv writes them)
++	gba_mb[0] = 0x4742415246553031ull;   // "GBARFU01"
++	gba_mb[1] = 0;
++	netplay_start();
++	gba_sleep(200);
++	// each side its own game (FireRed and LeafGreen talk): different md5s
++	make_rom(getFullPath("game.gba"), host ? 0 : 7);
++	netplay_note_file("game.gba", 1, 0);
++	bool ok = gba_round(host, 1);
++
++	// NP_GBA_RELOAD=host|join: that side loads its game again after the first
++	// round, the other side's game goes back to its menu (resets its adapter),
++	// and both play a second round over the same server room
++	const char *rl = getenv("NP_GBA_RELOAD");
++	if (ok && rl)
++	{
++		bool me = !strcmp(rl, host ? "host" : "join");
++		gba_sleep(me ? 1000 : 1500);
++		if (me)
++		{
++			printf("[harness] loading the game again\n");
++			netplay_note_file("game.gba", 1, 0);
+ 		}
+-		expect(got, "the host's data 12345678");
+-		gba_sleep(7000);   // the messages are shown one after the other, 1.5 s each
++		gba_adapter_reset();
++		ok = gba_round(host, 2);
+ 	}
++	gba_sleep(7000);   // let it go out, and the messages show, before leaving
+ 	netplay_stop();
+ 	printf("RESULT frames=0 stalls=0 reloads=%d dip=0 digest=%s\n", reloads, ok ? "gba-ok" : "gba-fail");
+ 	return ok ? 0 : 1;
+-- 
+2.43.0
+

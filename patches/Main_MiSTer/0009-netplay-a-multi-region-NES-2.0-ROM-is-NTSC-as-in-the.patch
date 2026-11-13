@@ -1,7 +1,8 @@
-From 5f3cd707633bba466085ec22ab15645f0e7e3cc1 Mon Sep 17 00:00:00 2001
+From 060cc00d243ac92d659ff370b3c1389b6f6ef5fc Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sat, 31 Oct 2026 22:22:55 +0100
-Subject: [PATCH] netplay: a multi-region NES 2.0 ROM is NTSC, as in the core
+Subject: [PATCH 09/42] netplay: a multi-region NES 2.0 ROM is NTSC, as in the
+ core
 
 rom_region_from_header() put multi-region (timing 2) together with Dendy and
 refused it, e.g. Super Mario Bros. (World). The core's Auto system type runs

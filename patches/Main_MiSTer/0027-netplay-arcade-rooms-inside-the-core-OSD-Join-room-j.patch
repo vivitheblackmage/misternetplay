@@ -1,8 +1,8 @@
-From 3d531f45d6d70738e7b9206be36298a19bed2c8f Mon Sep 17 00:00:00 2001
+From 3f44a320a27840a3f3000be3993fa5e55cac56d0 Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Mon, 9 Nov 2026 21:08:17 +0100
-Subject: [PATCH] netplay: arcade rooms inside the core, OSD Join room (jtframe
- F9) browses _Arcade/_Netplay and joins without a reload
+Subject: [PATCH 27/42] netplay: arcade rooms inside the core, OSD Join room
+ (jtframe F9) browses _Arcade/_Netplay and joins without a reload
 ---
  menu.cpp                             | 16 +++++++++++++++-
  support/netplay/netplay.cpp          | 28 ++++++++++++++++++++++++++++

@@ -1,0 +1,24 @@
+From 564c1503655ba2d8a5d01ba20d670d9ba8e94082 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 10 Nov 2026 20:45:15 +0100
+Subject: [PATCH 07/12] OSD Netplay (O[46:45]) for the wireless adapter's
+ pairing (netplay SPEC 13.5)
+---
+ GBA.sv | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/GBA.sv b/GBA.sv
+index d490989..7139875 100644
+--- a/GBA.sv
++++ b/GBA.sv
+@@ -116,6 +116,7 @@ parameter CONF_STR = {
+ 	"H2P2O[16],Turbo,Off,On;",
+ 	"P2O[28],Homebrew BIOS(Reset!),Off,On;",
+ 	"P2O[44],Link Port,Off,Wireless Adapter;",
++	"P2O[46:45],Netplay,netplay.ini,Off,Host,Join;",
+ 
+ 	"P3,Miscellaneous;",
+ 	"P3-;",
+-- 
+2.43.0
+

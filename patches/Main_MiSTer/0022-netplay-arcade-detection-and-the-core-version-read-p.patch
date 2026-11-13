@@ -1,8 +1,8 @@
-From e618141082be81e58e723b9ec366205304e45d8b Mon Sep 17 00:00:00 2001
+From 11a4ab43557e001ddf9a9bc02afec71e71c216d4 Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sun, 8 Nov 2026 17:51:58 +0100
-Subject: [PATCH 22/22] netplay: arcade detection and the core version read past the
- empty item jtframe strings have after the core name
+Subject: [PATCH 22/42] netplay: arcade detection and the core version read
+ past the empty item jtframe strings have after the core name
 ---
  support/netplay/netplay.cpp          | 32 ++++++++++++++++++----------
  support/netplay/test/udp_harness.cpp |  5 ++++-

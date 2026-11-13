@@ -1,7 +1,7 @@
-From 33f9a3d0a9c8679fd713e57e60fb0375197ba0b8 Mon Sep 17 00:00:00 2001
+From 338ecbf74eaba23eeb9ee7ce5143bd885af5fb84 Mon Sep 17 00:00:00 2001
 From: netplay <netplay@localhost>
 Date: Sun, 8 Nov 2026 18:42:15 +0100
-Subject: [PATCH 24/24] netplay: the main menu keeps the arcade rooms in
+Subject: [PATCH 24/42] netplay: the main menu keeps the arcade rooms in
  _Arcade/_Netplay up to date, before any MRA is loaded
 ---
  support/netplay/netplay.cpp          | 22 +++++++++++++++++++++-
