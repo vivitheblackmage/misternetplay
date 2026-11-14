@@ -95,9 +95,6 @@ them; it holds our changes as patches on top of exact upstream commits:
 The NES and SNES cores are the work of the MiSTer-devel contributors and of the
 authors credited in their own READMEs; Main_MiSTer likewise. The Game Boy 2P
 core is pomstazlesa's two-player fork of the MiSTer-devel Game Boy core. The
-wireless adapter in the Main binary is ported from gpSP's adapter emulation by
-David Guillen Fandos (GPL-2.0-or-later), with the protocol as documented by
-afska and davidgfnet (gba-link-connection). The
 arcade core and jtframe are Jotego's (jtcores). All are licensed GPL-3.0, and
 so are our patches.
 
@@ -108,6 +105,33 @@ Everything else here is our own: the lobby server (`server/`), the tools
 (`tools/`) and the NetPong test game (`netpong/`). The Quartus Docker setup in
 `tools/quartus-docker/` is based on
 [ebraminio/mister-docker-build](https://github.com/ebraminio/mister-docker-build) (MIT).
+
+### Where the GBA Wireless Adapter comes from
+
+The adapter is not our invention; it stands on the work of others:
+
+- **gpSP** by David Guillen Fandos (davidgfnet),
+  [github.com/libretro/gpsp](https://github.com/libretro/gpsp), GPL-2.0-or-later.
+  Its adapter emulation (`rfu.c`) is the base of the Main binary's adapter
+  (`support/netplay/rfu.cpp`, ported with its copyright notice: the command
+  handling, the packets between adapters and the timeouts), and its link port
+  (`serial.c`) is the model for the core's serial port in Normal mode and the
+  SI/SO handshake.
+- **gba-link-connection** by afska,
+  [github.com/afska/gba-link-connection](https://github.com/afska/gba-link-connection):
+  the adapter's protocol as documented by afska and davidgfnet
+  ([`docs/wireless_adapter.md`](https://github.com/afska/gba-link-connection/blob/master/docs/wireless_adapter.md)),
+  and its `LinkUniversal_stress` test ROM, which we test against.
+- **pret/pokefirered** ([github.com/pret/pokefirered](https://github.com/pret/pokefirered)):
+  the decompiled librfu showed how Pokémon drives the adapter (its timers and
+  handshakes). The core's serial test bench imitates that behaviour; no code
+  is copied from it.
+
+What is ours: the core's side (`gba_rfu.sv`: the handshake, the command words
+and a mailbox to the ARM), the link between two MiSTers (`rfu_link.cpp`:
+reliable, ordered packets over UDP, directly or through the server), the
+pairing through the lobby, and the fixes Pokémon needed over the internet
+(SPEC.md section 13).
 
 ## What you need
 

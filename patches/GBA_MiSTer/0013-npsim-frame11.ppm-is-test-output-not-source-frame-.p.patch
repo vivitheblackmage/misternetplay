@@ -1,0 +1,33 @@
+From 7a5302799d0c40b1ae620ef0b060068eb7014d96 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 14 Nov 2026 01:08:18 +0100
+Subject: [PATCH] npsim: frame11.ppm is test output, not source (frame*.ppm is
+ ignored)
+---
+ npsim/frame11.ppm | Bin 115215 -> 0 bytes
+ 1 file changed, 0 insertions(+), 0 deletions(-)
+ delete mode 100644 npsim/frame11.ppm
+
+diff --git a/npsim/frame11.ppm b/npsim/frame11.ppm
+deleted file mode 100644
+index 7af287bfab1c83d063d4ff0ef90d8530299ea01a..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 115215
+zcmeIuF%1A93;-~0R7?U8HXZoa!hsB)CRNZ=vG#~rBUWZ_w_(750RsjM7%*VKfB^#r
+z3>YwAz<>b*1`HT5V8DO@0|pEjFkrxd0RsjM7%*VKfB^#r3>YwAz<>b*1`HT5V8DO@
+z0|pEjFkrxd0RsjM7%*VKfB^#r3>YwAz<>b*1`HT5V8DO@0|pEjFkrxd0RsjM7%*VK
+zfB^#r3>YwAz<>b*1`HT5V8DO@0|pEjFkrxd0RsjM7%*VKfB^#r3>YwAz<>b*1`HT5
+zV8DO@0|pEjFkrxd0RsjM7%*VKfB^#r3>YwAz<>b*1`HT5V8DO@0|pEjFkrxd0RsjM
+z7%*VKfB^#r3>YwAz<>b*1`HT5V8DO@0|pEjFkrxd0RsjM7%*VKfB^#r3>YwAz<>b*
+z1`HT5V8DO@0|pEjFkrxd0RsjM7%*VKfB^#r3>YwAz<>b*1`HT5V8DO@0|pEjFkrxd
+z0RsjM7%*VKfB^#r3>YwAz<>b*1`HT5V8DO@0|pEjFkrxd0RsjM7%*VKfB^#r3>YwA
+zz<>b*1`HT5V8DO@0|pEjFkrxd0RsjM7%*VKfB^#r3>YwAz<>b*1`HT5V8DO@0|pEj
+zFkrxd0RsjM7%*VKfB^#r3>YwAz<>b*1`HT5V8DO@0|pEjFkrxd0RsjM7%*VKfB^#r
+Y3>YwAz<>b*1`HT5V8DO@0|veiJVC6pR{#J2
+
+-- 
+2.43.0
+

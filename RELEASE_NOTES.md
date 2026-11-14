@@ -28,6 +28,13 @@
   the adapter, from https://akouzoukos.com/apotris/downloads (put
   `Apotris.gba` in `games/GBA`).
 
+Built on the work of others: the adapter emulation is ported from **gpSP** by
+David Guillen Fandos (github.com/libretro/gpsp), the protocol is as documented
+by afska and davidgfnet in **gba-link-connection**
+(github.com/afska/gba-link-connection), and Pokémon's link handling was read in
+**pret/pokefirered**. Details in the README, "Where the GBA Wireless Adapter
+comes from".
+
 Tested on hardware: two MiSTers over the internet through the lobby server on a
 Raspberry Pi: Pokémon FireRed/LeafGreen battles and a trade in the Union Room, and
 gba-link-connection's `LinkUniversal_stress` ROM (packet loss and packet sync,
