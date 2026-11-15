@@ -1,0 +1,1176 @@
+From 6034decb5cc92e71f621f0cb78245d671ff60bd0 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 14 Nov 2026 16:28:18 +0100
+Subject: [PATCH 43/46] netplay: Neo Geo (SYS_NEOGEO, SPEC 14.4): armed before
+ the ROM set loads with a CTRL heartbeat, the core loaded again (path kept in
+ DDR3) when the machine has run, ROM set and BIOS md5 in HELLO, Join takes the
+ oldest room with the ROM set; T3n: fake core with the module's rules,
+ direct/server/core reload, refused ROM set and BIOS
+---
+ support/neogeo/neogeo_loader.cpp      |   5 +
+ support/netplay/netplay.cpp           | 250 +++++++++++++++++++++++++-
+ support/netplay/netplay.h             |   6 +-
+ support/netplay/netplay_proto.cpp     |  21 +++
+ support/netplay/netplay_proto.h       |  42 +++--
+ support/netplay/netplay_session.cpp   |  43 ++++-
+ support/netplay/netplay_session.h     |  11 +-
+ support/netplay/test/Makefile         |   8 +-
+ support/netplay/test/fake_fpga.h      |  25 ++-
+ support/netplay/test/run_udp_test.sh  |   9 +-
+ support/netplay/test/test_netplay.cpp |  69 ++++++-
+ support/netplay/test/udp_harness.cpp  | 125 ++++++++++++-
+ 12 files changed, 578 insertions(+), 36 deletions(-)
+
+diff --git a/support/neogeo/neogeo_loader.cpp b/support/neogeo/neogeo_loader.cpp
+index cc586eb..139b581 100644
+--- a/support/neogeo/neogeo_loader.cpp
++++ b/support/neogeo/neogeo_loader.cpp
+@@ -13,6 +13,7 @@
+ #include "../../osd.h"
+ #include "../../menu.h"
+ #include "../../shmem.h"
++#include "../netplay/netplay.h"
+ 
+ struct NeoFile
+ {
+@@ -1147,6 +1148,9 @@ int neogeo_romset_tx(char* name, int cd_en)
+ 	int system_mvs, system_cdz;
+ 	static char full_path[1024];
+ 
++	// netplay: armed before the load, or the core loaded again first (SPEC.md 14.2)
++	if (netplay_neogeo_before(name, cd_en)) return 1;
++
+ 	system_mvs = user_io_status_get("[1]") & 1;
+ 	system_cdz = user_io_status_get("[2]") & 1;
+ 	printf("System MVS: %u, CDZ: %u, CD: %u\n", system_mvs, system_cdz, cd_en);
+@@ -1274,5 +1278,6 @@ int neogeo_romset_tx(char* name, int cd_en)
+ 
+ 	user_io_status_set("[0]", 0); // Release reset
+ 
++	netplay_neogeo_loaded(name, cd_en);
+ 	return 1;
+ }
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index c412ff3..df94f2c 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -23,6 +23,7 @@
+ #include <deque>
+ #include <set>
+ #include <vector>
++#include <algorithm>
+ #include <pthread.h>
+ #include "rfu.h"
+ #include "rfu_mailbox.h"
+@@ -44,6 +45,8 @@
+ #include "md5.h"
+ #include "../snes/snes.h"
+ #include "../arcade/mra_loader.h"
++#include "../neogeo/neogeo_loader.h"
++#include "../../fpga_io.h"
+ 
+ #include "netplay.h"
+ #include "netplay_proto.h"
+@@ -684,6 +687,13 @@ static std::atomic<uint64_t> reload_dip { 0 };  // arcade: the session's DIP swi
+ static std::atomic<uint32_t> dip_live { 0 };
+ static bool              own_reload = false; // main thread only
+ 
++// Neo Geo (SPEC.md 14.2): a session starts on a machine that has not run since
++// the FPGA was loaded, armed before the ROM set loads.
++static std::atomic<bool> neo_prearm { false };   // main -> thread: keep CTRL enabled (session 0) with a heartbeat
++static std::atomic<bool> neo_armed { false };    // thread -> main: the core holds the machine (ARMED)
++static bool              neo_ran = false;        // main thread: a ROM set was loaded since this core was (the machine has run)
++static std::string       neo_pending;            // main thread: a ROM set to load once the core is up again
++
+ static std::mutex        msg_mtx;
+ static std::deque<std::string> msg_queue;    // shown one after the other, each for a while
+ static std::deque<std::string> log_queue;    // only for netplay.log (diagnostics), same mutex
+@@ -870,6 +880,31 @@ static void *netplay_thread(void *)
+ 				s = new Session(mode, cfg.delay, mb, udp, &rec, seed);
+ 				s->set_local(li);
+ 			}
++			neo_prearm = false;              // the session's CTRL from now on (none: the machine goes)
++		}
++
++		// Neo Geo: armed before the ROM set loads; the session takes over CTRL
++		// once it exists (SPEC.md 14.2)
++		if (core_sys == SYS_NEOGEO && !s)
++		{
++			static uint16_t hb = 0;
++			static bool on = false;
++			static uint64_t since = 0;
++			if (neo_prearm && !on) since = now;
++			// a load that never finished (no ROM set): the machine must not wait forever
++			if (neo_prearm && now - since > 120000) { neo_prearm = false; post_message("Netplay: no game loaded"); }
++			if (neo_prearm)
++			{
++				mb.wr(MB_CTRL, ctrl_word(true, false, 0, false, ++hb));
++				neo_armed = decode_status(mb.rd(MB_STATUS)).state == FS_ARMED;
++				on = true;
++			}
++			else if (on)
++			{
++				mb.wr(MB_CTRL, ctrl_word(false, false, 0));
++				neo_armed = false;
++				on = false;
++			}
+ 		}
+ 
+ 		if (udp) udp->tick(now);
+@@ -2044,10 +2079,17 @@ static bool gba_has_wireless()
+ }
+ 
+ // The loaded core: SYS_NES, SYS_SNES, SYS_GB2P, SYS_ARCADE, SYS_GBA, or -1 for one without netplay
++// The Neo Geo netplay core: the OSD option "Netplay" (SPEC.md 14.2)
++static bool neogeo_has_netplay()
++{
++	return confstr_any([](const char *p) { return strstr(p, ",Netplay,netplay.ini,") != nullptr; });
++}
++
+ static int netplay_system()
+ {
+ 	const char *n = user_io_get_core_name();
+ 	if (!strcasecmp(n, "GBA") && gba_has_wireless()) return SYS_GBA;
++	if (!strcasecmp(n, "NEOGEO") && neogeo_has_netplay()) return SYS_NEOGEO;
+ 	if (!strcasecmp(n, "NES")) return SYS_NES;
+ 	if (!strcasecmp(n, "SNES")) return SYS_SNES;
+ 	if (!strcasecmp(n, "GAMEBOY2P")) return SYS_GB2P;
+@@ -2064,6 +2106,7 @@ static const char *osd_netplay_bits()
+ 	case SYS_GB2P:   return "[47:46]";
+ 	case SYS_ARCADE: return "[127:126]";
+ 	case SYS_GBA:    return "[46:45]";
++	case SYS_NEOGEO: return "[46:45]";
+ 	default:         return "[89:88]";
+ 	}
+ }
+@@ -2214,6 +2257,160 @@ static unsigned char gb_index(const std::string &name)
+ 
+ static void begin_session(const char *name, unsigned char index, char opensave);
+ 
++// ---------------------------------------------------------------------------
++// Neo Geo (SPEC.md 14)
++
++// The ROM set's identity: a folder (the Darksoft layout) by the files the game
++// runs from, all but the sprites (crom*) and the ADPCM samples (vrom*), which
++// decide no game timing and are most of the size; a .zip or .neo by the file.
++static bool neogeo_md5(const char *name, uint8_t out[16])
++{
++	std::string full = getFullPath(name);
++	struct stat st;
++	if (stat(full.c_str(), &st)) return false;
++	if (!S_ISDIR(st.st_mode)) return md5_file(name, out, nullptr, 0);
++	std::vector<std::string> files;
++	if (DIR *d = opendir(full.c_str()))
++	{
++		while (dirent *e = readdir(d))
++		{
++			std::string n = e->d_name;
++			if (n.empty() || n[0] == '.' || !strncasecmp(n.c_str(), "crom", 4) || !strncasecmp(n.c_str(), "vrom", 4)) continue;
++			struct stat fs;
++			if (!stat((full + "/" + n).c_str(), &fs) && S_ISREG(fs.st_mode)) files.push_back(n);
++		}
++		closedir(d);
++	}
++	if (files.empty()) return false;
++	std::sort(files.begin(), files.end());
++	MD5Context ctx;
++	MD5Init(&ctx);
++	uint8_t buf[16384];
++	for (const std::string &n : files)
++	{
++		MD5Update(&ctx, (const uint8_t *)n.c_str(), (unsigned)n.size() + 1);
++		FILE *f = fopen((full + "/" + n).c_str(), "rb");
++		if (!f) return false;
++		size_t k;
++		while ((k = fread(buf, 1, sizeof(buf), f)) > 0) MD5Update(&ctx, buf, (unsigned)k);
++		fclose(f);
++	}
++	MD5Final(out, &ctx);
++	return true;
++}
++
++// The BIOS files the loader sends (neogeo_romset_tx): the system ROM it picks,
++// sfix.sfix and 000-lo.lo, from the folder they are in (the ROM set's, or a
++// folder above it).
++static bool neogeo_bios_md5(const char *name, uint8_t out[16])
++{
++	std::string dir = getFullPath(name);
++	for (int up = 0; up < 3; up++)
++	{
++		size_t sl = dir.rfind('/');
++		if (sl == std::string::npos) return false;
++		dir.resize(sl);
++		struct stat st;
++		if (!stat((dir + "/000-lo.lo").c_str(), &st)) break;
++		if (up == 2) return false;
++	}
++	bool orig = user_io_status_get("[22]") & 1, mvs = user_io_status_get("[1]") & 1;
++	struct stat st;
++	std::string sys = (!orig && !stat((dir + "/uni-bios.rom").c_str(), &st)) ? "uni-bios.rom" : mvs ? "sp-s2.sp1" : "neo-epo.sp1";
++	MD5Context ctx;
++	MD5Init(&ctx);
++	uint8_t buf[16384];
++	for (const std::string &n : { sys, std::string("sfix.sfix"), std::string("000-lo.lo") })
++	{
++		MD5Update(&ctx, (const uint8_t *)n.c_str(), (unsigned)n.size() + 1);
++		FILE *f = fopen((dir + "/" + n).c_str(), "rb");
++		if (!f) continue;                   // the loader goes on without it, so does the md5
++		size_t k;
++		while ((k = fread(buf, 1, sizeof(buf), f)) > 0) MD5Update(&ctx, buf, (unsigned)k);
++		fclose(f);
++	}
++	MD5Final(out, &ctx);
++	return true;
++}
++
++// The ROM set to load once the core is up again: the core reload restarts
++// Main, and DDR3 keeps what is in it. Behind the mailbox's rings: magic, the
++// time (CLOCK_MONOTONIC ms, which a restart of Main keeps), the path. Taken
++// only within 30 s, so nothing left over ever loads a game by itself.
++constexpr uint32_t NEO_PEND = 0x3000;
++constexpr uint64_t NEO_PEND_MAGIC = 0x31444E4550504E4EULL;   // "NNPPEND1"
++
++static void neo_pending_put(const char *name)
++{
++	volatile uint8_t *m = (volatile uint8_t *)shmem_map(mailbox_phys(SYS_NEOGEO), MB_SIZE);
++	if (!m) return;
++	Mailbox mb { m };
++	size_t n = strlen(name);
++	if (n > MB_SIZE - NEO_PEND - 24) n = MB_SIZE - NEO_PEND - 24;
++	for (size_t i = 0; i <= n; i++) m[NEO_PEND + 16 + i] = i < n ? (uint8_t)name[i] : 0;
++	mb.wr(NEO_PEND + 8, now_ms());
++	mb.wr(NEO_PEND, NEO_PEND_MAGIC);
++	shmem_unmap((void *)m, MB_SIZE);
++}
++
++static std::string neo_pending_take()
++{
++	std::string r;
++	volatile uint8_t *m = (volatile uint8_t *)shmem_map(mailbox_phys(SYS_NEOGEO), MB_SIZE);
++	if (!m) return r;
++	Mailbox mb { m };
++	if (mb.rd(NEO_PEND) == NEO_PEND_MAGIC && now_ms() - mb.rd(NEO_PEND + 8) < 30000)
++		for (size_t i = NEO_PEND + 16; i < MB_SIZE && m[i]; i++) r += (char)m[i];
++	mb.wr(NEO_PEND, 0);
++	shmem_unmap((void *)m, MB_SIZE);
++	return r;
++}
++
++static Mode current_mode()
++{
++	static const Mode osd_modes[4] = { M_OFF, M_OFF, M_HOST, M_JOIN };
++	uint32_t osd = user_io_status_get(osd_netplay_bits());
++	return osd ? osd_modes[osd & 3] : cfg.mode;
++}
++
++// neogeo_loader, before a ROM set loads. A session needs a machine that has
++// not run since the FPGA was loaded, armed before the load (SPEC.md 14.2):
++// the first load after the core gets armed here; a later one loads the core
++// again first, and the ROM set after it (true: the core is being loaded).
++bool netplay_neogeo_before(const char *name, int cd_en)
++{
++	if (own_reload || !core_armed || core_sys != SYS_NEOGEO) return false;
++	bool ran = neo_ran;
++	neo_ran = true;                         // the machine runs after this load, with or without a session
++	if (cd_en || current_mode() == M_OFF) return false;
++	if (ran)
++	{
++		// the core again, then this ROM set (netplay_start() finds it in DDR3)
++		neo_pending_put(name);
++		post_message("Netplay: loading the core again for a fresh start");
++		netplay_stop();
++		fpga_load_rbf(get_rbf_path());      // does not return on a MiSTer (Main restarts)
++		return true;
++	}
++	if (!thread_running) start_thread();
++	neo_armed = false;
++	neo_prearm = true;
++	for (uint64_t t = now_ms(); !neo_armed && now_ms() - t < 1000; ) usleep(1000);
++	if (!neo_armed)
++	{
++		neo_prearm = false;
++		post_message("Netplay: the core did not respond");
++	}
++	return false;
++}
++
++// neogeo_loader, after the ROM set has loaded
++void netplay_neogeo_loaded(const char *name, int cd_en)
++{
++	if (own_reload || !core_armed || core_sys != SYS_NEOGEO || cd_en || !neo_prearm) return;
++	begin_session(name, 1, 0);
++}
++
+ // Arcade hooks from mra_loader.cpp (SPEC.md 12.2)
+ void netplay_note_arcade_rom(int index, const unsigned char *md5)
+ {
+@@ -2340,7 +2537,12 @@ static void begin_session(const char *name_in, unsigned char index, char opensav
+ 			seq = rom_seq + 1;               // this load's rom_seq, below
+ 		}
+ 		std::string arc_id;
+-		if (core_sys == SYS_ARCADE)
++		if (core_sys == SYS_NEOGEO)
++		{
++			// ROM sets are folders or zips, not single files: no room folder
++			if (mode == M_JOIN) room = "*";   // the oldest waiting room with this ROM set
++		}
++		else if (core_sys == SYS_ARCADE)
+ 		{
+ 			// an MRA from _Arcade/_Netplay joins the room written into it
+ 			if (osd != 1 && in_rooms(full) && arc_room_id(full, &arc_id))
+@@ -2397,6 +2599,15 @@ static void begin_session(const char *name_in, unsigned char index, char opensav
+ 			return;
+ 		}
+ 	}
++	else if (core_sys == SYS_NEOGEO)
++	{
++		if (!neogeo_md5(name, li.rom_md5) || !neogeo_bios_md5(name, li.boot_md5))
++		{
++			post_message("Netplay: cannot read the ROM set or the BIOS");
++			neo_prearm = false;
++			return;
++		}
++	}
+ 	else if (core_sys == SYS_ARCADE)
+ 	{
+ 		// no file to read: the ROM as Main assembled it from the MRA (SPEC.md 12.2)
+@@ -2406,7 +2617,7 @@ static void begin_session(const char *name_in, unsigned char index, char opensav
+ 	}
+ 	else if (!md5_file(name, li.rom_md5, hdr, sizeof(hdr))) return;
+ 	if (core_sys != SYS_GB2P) memcpy(li.rom2_md5, li.rom_md5, 16);
+-	if (cfg.server[0] && core_sys != SYS_ARCADE && core_sys != SYS_GBA)    // arcade games never come from the server; GBA: each its own game
++	if (cfg.server[0] && core_sys != SYS_ARCADE && core_sys != SYS_GBA && core_sys != SYS_NEOGEO)    // arcade and Neo Geo games never come from the server; GBA: each its own game
+ 	{
+ 		std::lock_guard<std::mutex> g(cat_mtx);
+ 		if (!catalog.empty() && (!catalog.count(md5_hex(li.rom_md5)) || !catalog.count(md5_hex(li.rom2_md5))))
+@@ -2416,6 +2627,7 @@ static void begin_session(const char *name_in, unsigned char index, char opensav
+ 	if (core_sys == SYS_SNES) li.rom_region = snes_refused(name);
+ 	else if (core_sys == SYS_GB2P) li.rom_region = has_ext(gb_rom1, ".bin") || has_ext(gb_rom2, ".bin");   // MegaDuck
+ 	else if (core_sys == SYS_ARCADE) li.rom_region = arc_nvram;
++	else if (core_sys == SYS_NEOGEO) li.rom_region = 0;      // a cartridge (CDs never get here)
+ 	else li.rom_region = rom_region_from_header(hdr, sizeof(hdr), dot ? dot + 1 : "");
+ 	core_build(li.core_build);
+ 
+@@ -2427,7 +2639,8 @@ static void begin_session(const char *name_in, unsigned char index, char opensav
+ 	size_t d = sav.rfind('.');
+ 	if (d != std::string::npos) sav.resize(d);
+ 	sav += ".sav";
+-	if (core_sys == SYS_ARCADE || !md5_file(sav.c_str(), li.sav_md5, nullptr, 0)) memset(li.sav_md5, 0, 16);
++	// Neo Geo: the memory card is unplugged in a session (SPEC.md 14.2)
++	if (core_sys == SYS_ARCADE || core_sys == SYS_NEOGEO || !md5_file(sav.c_str(), li.sav_md5, nullptr, 0)) memset(li.sav_md5, 0, 16);
+ 
+ 	if (core_sys == SYS_GB2P)
+ 	{
+@@ -2443,6 +2656,13 @@ static void begin_session(const char *name_in, unsigned char index, char opensav
+ 		gb_boot_md5(li.boot_md5);
+ 		li.rtc_time = local_unix_time();
+ 	}
++	if (core_sys == SYS_NEOGEO)
++	{
++		li.neo.sys_type  = (uint8_t)user_io_status_get("[1]");
++		li.neo.video     = (uint8_t)user_io_status_get("[3]");
++		li.neo.bios_orig = (uint8_t)user_io_status_get("[22]");
++		li.neo.dips      = (uint8_t)user_io_status_get("[9:7]");
++	}
+ 	if (core_sys == SYS_SNES)
+ 	{
+ 		li.snes.region      = (uint8_t)user_io_status_get("[15:14]");
+@@ -2506,8 +2726,13 @@ void netplay_start(void)
+ 	gb_rom1.clear(); gb_rom2.clear();   // gb_boot already holds the boot ROMs of this core load
+ 	arc_xml.clear(); arc_roms.clear(); arc_pending = false; dip_applied = false;
+ 	core_armed = true;
+-	// arcade: no games from the server, no room folder (the games are MRA files, SPEC.md 12.5)
+-	if (cfg.server[0] && core_sys != SYS_ARCADE) server_games_start();
++	// arcade: no games from the server, no room folder (the games are MRA files, SPEC.md 12.5);
++	// Neo Geo: none either (ROM sets are folders and zips, SPEC.md 14)
++	if (cfg.server[0] && core_sys != SYS_ARCADE && core_sys != SYS_NEOGEO) server_games_start();
++	// Neo Geo: the core was loaded again for a session; its ROM set follows (netplay_poll)
++	neo_ran = false;
++	neo_prearm = false;
++	if (core_sys == SYS_NEOGEO) neo_pending = neo_pending_take();
+ 	// GBA: the adapter answers the game from the start, paired or not (SPEC.md 13.4)
+ 	if (core_sys == SYS_GBA && !thread_running) start_thread();
+ }
+@@ -2546,6 +2771,14 @@ void netplay_poll(void)
+ 	}
+ 	if (!thread_running && !core_armed) return;   // lobby messages come before any session
+ 
++	// Neo Geo: the ROM set the core was loaded again for (SPEC.md 14.2)
++	if (core_armed && core_sys == SYS_NEOGEO && !neo_pending.empty())
++	{
++		std::string p = neo_pending;
++		neo_pending.clear();
++		neogeo_romset_tx((char *)p.c_str(), 0);
++	}
++
+ 	// Arcade: there is no game load to start a session after the MRA, so a
+ 	// change of the OSD option starts (or stops) one (SPEC.md 12.2)
+ 	if (core_armed && core_sys == SYS_ARCADE && !arc_xml.empty())
+@@ -2584,7 +2817,12 @@ void netplay_poll(void)
+ 			opensave = rom_opensave;
+ 		}
+ 		own_reload = true;                 // keep netplay_note_file from starting a new session
+-		if (core_sys == SYS_ARCADE)
++		if (core_sys == SYS_NEOGEO)
++		{
++			// nothing: the machine has been held in reset since before the
++			// ROM set loaded, and starts when the session does (SPEC.md 14.2)
++		}
++		else if (core_sys == SYS_ARCADE)
+ 		{
+ 			// SPEC.md 12.4: no ROM load (the core clears its RAM itself while
+ 			// armed); the session's DIP switches, the host's, go in instead
+diff --git a/support/netplay/netplay.h b/support/netplay/netplay.h
+index d5bc5e5..f26313d 100644
+--- a/support/netplay/netplay.h
++++ b/support/netplay/netplay.h
+@@ -1,4 +1,4 @@
+-// netplay.h — NES, SNES, Game Boy 2P and arcade lockstep netplay, Main_MiSTer integration (SPEC.md 7, 10, 11, 12)
++// netplay.h — NES, SNES, Game Boy 2P, arcade and Neo Geo lockstep netplay, Main_MiSTer integration (SPEC.md 7, 10, 11, 12, 14)
+ 
+ #ifndef NETPLAY_H
+ #define NETPLAY_H
+@@ -14,5 +14,9 @@ void netplay_note_dip(void);                             // mra_loader: DIP swit
+ // ("" when there is none: a message says why), nullptr for any other entry
+ const char *netplay_rooms_dir(unsigned char index);
+ bool netplay_take_file(const char *name, unsigned char index);   // user_io_file_tx: true = a room was picked, nothing goes to the core
++// Neo Geo (SPEC.md 14.2), from neogeo_romset_tx: before (true = the core is being
++// loaded again for a fresh session, do not load) and after a ROM set loads
++bool netplay_neogeo_before(const char *name, int cd_en);
++void netplay_neogeo_loaded(const char *name, int cd_en);
+ 
+ #endif
+diff --git a/support/netplay/netplay_proto.cpp b/support/netplay/netplay_proto.cpp
+index 2873bda..eb650d9 100644
+--- a/support/netplay/netplay_proto.cpp
++++ b/support/netplay/netplay_proto.cpp
+@@ -44,6 +44,7 @@ Status decode_status(uint64_t w)
+ 	s.state  = (uint8_t)((w >> 24) & 0x07);
+ 	s.error  = (uint8_t)(w >> 16);
+ 	s.stalls = (uint16_t)w;
++	s.ran    = (w >> 27) & 1;
+ 	return s;
+ }
+ 
+@@ -86,6 +87,14 @@ uint32_t pack_settings(const SnesSettings &s)
+ 	     | (uint32_t)(s.sufami_swap & 1) << 12;
+ }
+ 
++uint32_t pack_settings(const NeoSettings &s)
++{
++	return (uint32_t)(s.sys_type & 1)
++	     | (uint32_t)(s.video & 1) << 1
++	     | (uint32_t)(s.bios_orig & 1) << 2
++	     | (uint32_t)(s.dips & 7) << 3;
++}
++
+ const char *reject_text(uint8_t r)
+ {
+ 	switch (r)
+@@ -104,6 +113,7 @@ const char *reject_text(uint8_t r)
+ 	case REJ_CHIP:      return "Game chip not supported in netplay";
+ 	case REJ_OTHER_SYSTEM: return "The other player runs another console";
+ 	case REJ_NVRAM:     return "Games with NVRAM are not supported yet";
++	case REJ_BIOS:      return "Different BIOS files";
+ 	default:          return "Rejected";
+ 	}
+ }
+@@ -112,6 +122,10 @@ const char *reject_text(System s, uint8_t r)
+ {
+ 	if (s == SYS_ARCADE && r == REJ_ROM)  return "Different ROM set (MRA or zip)";
+ 	if (s == SYS_ARCADE && r == REJ_CORE) return "Different core version (update both)";
++	if (s == SYS_NEOGEO && r == REJ_ROM)  return "Different ROM set";
++	if (s == SYS_NEOGEO && r == REJ_CORE) return "Different core version (update both)";
++	if (s == SYS_NEOGEO && r == REJ_SYSTEM) return "Neo Geo CD is not supported";
++	if (s == SYS_NEOGEO && r == REJ_SETTINGS) return "Different System Type, Video Mode, BIOS or DIP setting";
+ 	return reject_text(r);
+ }
+ 
+@@ -148,6 +162,13 @@ uint8_t check_local_arcade(uint8_t rom_ok, uint8_t delay)
+ 	return REJ_OK;
+ }
+ 
++uint8_t check_local_neogeo(uint8_t rom_ok, uint8_t delay)
++{
++	if (delay < 2 || delay > 15) return REJ_DELAY;
++	if (rom_ok) return REJ_SYSTEM;
++	return REJ_OK;
++}
++
+ uint8_t rom_region_from_header(const uint8_t *hdr, size_t len, const char *ext)
+ {
+ 	if (ext && (!strcasecmp(ext, "fds") || !strcasecmp(ext, "nsf"))) return 3;
+diff --git a/support/netplay/netplay_proto.h b/support/netplay/netplay_proto.h
+index b6ef8e2..6485549 100644
+--- a/support/netplay/netplay_proto.h
++++ b/support/netplay/netplay_proto.h
+@@ -1,4 +1,4 @@
+-// netplay_proto.h — NES, SNES, Game Boy 2P and arcade netplay: wire format and mailbox layout (SPEC.md 4, 7, 10, 11, 12)
++// netplay_proto.h — NES, SNES, Game Boy 2P, arcade and Neo Geo netplay: wire format and mailbox layout (SPEC.md 4, 7, 10, 11, 12, 14)
+ //
+ // Pure data handling with no I/O, so it builds and is unit tested on x86.
+ 
+@@ -15,15 +15,17 @@ namespace netplay {
+ // SNES is version 2: a system byte in HELLO and 16-bit input samples. Game Boy
+ // 2P is version 3: version 2 plus a second ROM, the boot ROMs and the RTC time
+ // in HELLO (SPEC.md 11.5). Arcade (jtframe cores) is version 4: version 3
+-// plus the DIP switches (SPEC.md 12.4).
++// plus the DIP switches (SPEC.md 12.4). Neo Geo speaks version 4 too, with its
++// own system byte (SPEC.md 14).
+ 
+-enum System : uint8_t { SYS_NES = 0, SYS_SNES = 1, SYS_GB2P = 2, SYS_ARCADE = 3, SYS_GBA = 4 };   // SYS_GBA: wireless adapter, not lockstep (SPEC.md 13)
++enum System : uint8_t { SYS_NES = 0, SYS_SNES = 1, SYS_GB2P = 2, SYS_ARCADE = 3, SYS_GBA = 4,   // SYS_GBA: wireless adapter, not lockstep (SPEC.md 13)
++                        SYS_NEOGEO = 5 };
+ 
+ // ---------------------------------------------------------------------------
+ // DDR3 mailbox, shared with rtl/netplay.sv of each core
+ 
+ constexpr uint32_t MB_PHYS       = 0x3C000000;   // NES, Game Boy 2P (SPEC.md 11.3) and arcade (12.3)
+-constexpr uint32_t MB_PHYS_SNES  = 0x3FC00000;   // SNES (SPEC.md 10.3)
++constexpr uint32_t MB_PHYS_SNES  = 0x3FC00000;   // SNES (SPEC.md 10.3) and Neo Geo (14.3)
+ constexpr uint32_t MB_SIZE       = 0x4000;
+ 
+ constexpr uint32_t MB_MAGIC      = 0x0000;
+@@ -38,11 +40,13 @@ constexpr uint64_t MAGIC_VALUE   = 0x313030504E53454EULL;   // "NESNP001"
+ constexpr uint64_t MAGIC_SNES    = 0x3130504E53454E53ULL;   // "SNESNP01"
+ constexpr uint64_t MAGIC_GB2P    = 0x3130504E50324247ULL;   // "GB2PNP01"
+ constexpr uint64_t MAGIC_ARCADE  = 0x3130504E44435241ULL;   // "ARCDNP01"
++constexpr uint64_t MAGIC_NEOGEO  = 0x3130504E47454F4EULL;   // "NEOGNP01"
+ 
+-inline uint32_t mailbox_phys(System s) { return s == SYS_SNES ? MB_PHYS_SNES : MB_PHYS; }
++inline uint32_t mailbox_phys(System s) { return s == SYS_SNES || s == SYS_NEOGEO ? MB_PHYS_SNES : MB_PHYS; }
+ inline uint64_t mailbox_magic(System s)
+ {
+-	return s == SYS_SNES ? MAGIC_SNES : s == SYS_GB2P ? MAGIC_GB2P : s == SYS_ARCADE ? MAGIC_ARCADE : MAGIC_VALUE;
++	return s == SYS_SNES ? MAGIC_SNES : s == SYS_GB2P ? MAGIC_GB2P : s == SYS_ARCADE ? MAGIC_ARCADE
++	     : s == SYS_NEOGEO ? MAGIC_NEOGEO : MAGIC_VALUE;
+ }
+ 
+ enum FpgaState : uint8_t { FS_IDLE = 0, FS_ARMED = 1, FS_PRIME = 2, FS_RUN = 3, FS_ERROR = 4 };
+@@ -54,6 +58,7 @@ struct Status
+ 	uint8_t  state;
+ 	uint8_t  error;
+ 	uint16_t stalls;
++	bool     ran;      // Neo Geo: the machine has run since the FPGA was loaded (SPEC.md 14.2)
+ };
+ 
+ inline uint32_t ring_off(uint32_t base, uint32_t frame) { return base + (frame & (MB_RING - 1)) * 8; }
+@@ -63,16 +68,18 @@ inline uint32_t ring_off(uint32_t base, uint32_t frame) { return base + (frame &
+ constexpr uint32_t CTRL_MAGIC    = 0x4C525443;   // "CTRL"
+ 
+ // join: Game Boy 2P only, CTRL[2] = this MiSTer plays gb2 (rumble, SPEC.md 11.3)
+-inline uint64_t ctrl_word(bool enable, bool run, uint8_t session, bool join = false)
++// heartbeat: Neo Geo only, CTRL[31:16], changed all the time while enabled: the
++// core arms only on a moving one and ends a session when it stands (SPEC.md 14.3)
++inline uint64_t ctrl_word(bool enable, bool run, uint8_t session, bool join = false, uint16_t heartbeat = 0)
+ {
+ 	if (!enable) return 0;
+-	return (uint64_t)CTRL_MAGIC << 32 | (uint64_t)session << 8 | (join ? 4u : 0u) | (run ? 2u : 0u) | 1u;
++	return (uint64_t)CTRL_MAGIC << 32 | (uint64_t)heartbeat << 16 | (uint64_t)session << 8 | (join ? 4u : 0u) | (run ? 2u : 0u) | 1u;
+ }
+ 
+ // INPUT[f]: both 32-bit halves carry the frame tag and session, so a torn
+ // 64-bit store is never mistaken for a valid entry.
+ //   NES, GB2P: {f[15:0], sess[7:0], joy[7:0]}     SNES, arcade: {f[11:0], sess[7:0], joy[11:0]}
+-inline bool joy12(System s) { return s == SYS_SNES || s == SYS_ARCADE; }
++inline bool joy12(System s) { return s == SYS_SNES || s == SYS_ARCADE || s == SYS_NEOGEO; }
+ inline uint32_t entry_tag(System s, uint32_t frame, uint8_t session)
+ {
+ 	return joy12(s) ? (frame & 0xFFF) << 20 | (uint32_t)session << 12
+@@ -147,6 +154,17 @@ struct SnesSettings
+ 
+ uint32_t pack_settings(const SnesSettings &s);
+ 
++// The Neo Geo core's settings that change emulation (SPEC.md 14)
++struct NeoSettings
++{
++	uint8_t sys_type;      // status [1] System Type: 0 Console (AES), 1 Arcade (MVS)
++	uint8_t video;         // status [3] Video Mode: 0 NTSC, 1 PAL
++	uint8_t bios_orig;     // status [22] BIOS: 0 UniBIOS, 1 Original
++	uint8_t dips;          // status [9:7] DIP switches (MVS)
++};
++
++uint32_t pack_settings(const NeoSettings &s);
++
+ // Why a session cannot start, or 0 if it can. Same codes go into HELLO_ACK.
+ enum Reject : uint8_t
+ {
+@@ -164,6 +182,7 @@ enum Reject : uint8_t
+ 	REJ_CHIP,          // SNES: MSU-1, BS-X, a real-time clock or the SPC player
+ 	REJ_OTHER_SYSTEM,  // the peer runs another console
+ 	REJ_NVRAM,         // arcade: a game with NVRAM (SPEC.md 12.4)
++	REJ_BIOS,          // Neo Geo: a different BIOS (SPEC.md 14)
+ };
+ 
+ const char *reject_text(uint8_t r);
+@@ -178,6 +197,8 @@ uint8_t check_local(const SnesSettings &s, uint8_t rom_ok, uint8_t delay);
+ uint8_t check_local(const GbSettings &s, uint8_t rom_ok, uint8_t delay);
+ // Arcade: rom_ok 0 = supported, 1 = the game has NVRAM (REJ_NVRAM)
+ uint8_t check_local_arcade(uint8_t rom_ok, uint8_t delay);
++// Neo Geo: rom_ok 0 = a cartridge, 1 = a CD (REJ_SYSTEM)
++uint8_t check_local_neogeo(uint8_t rom_ok, uint8_t delay);
+ 
+ // rom_region from the iNES header: 0 NTSC, 1 PAL, 2 Dendy/multi, 3 Vs. or not iNES.
+ uint8_t rom_region_from_header(const uint8_t *hdr, size_t len, const char *ext);
+@@ -197,7 +218,8 @@ constexpr uint8_t  PROTO_VERSION_ARCADE = 4;     // arcade: version 3 + dip
+ constexpr uint8_t  PROTO_VERSION_MAX = PROTO_VERSION_ARCADE;
+ inline uint8_t proto_version(System s)
+ {
+-	return s == SYS_SNES ? PROTO_VERSION_SNES : s == SYS_GB2P ? PROTO_VERSION_GB2P : s == SYS_ARCADE ? PROTO_VERSION_ARCADE : PROTO_VERSION;
++	return s == SYS_SNES ? PROTO_VERSION_SNES : s == SYS_GB2P ? PROTO_VERSION_GB2P
++	     : s == SYS_ARCADE || s == SYS_NEOGEO ? PROTO_VERSION_ARCADE : PROTO_VERSION;
+ }
+ // 16-bit input samples on the wire (all but NES; arcade uses 12 bits)
+ inline bool wide_input(System s) { return s != SYS_NES; }
+diff --git a/support/netplay/netplay_session.cpp b/support/netplay/netplay_session.cpp
+index 2d637ba..6c09f32 100644
+--- a/support/netplay/netplay_session.cpp
++++ b/support/netplay/netplay_session.cpp
+@@ -24,6 +24,17 @@ void Session::set_local(const LocalInfo &info)
+ {
+ 	info_ = info;
+ 	have_info_ = true;
++	// Neo Geo: the main thread armed the core (session 0) before the ROM set
++	// loaded; keep it armed until the session has an id (SPEC.md 14.2)
++	if (sys() == SYS_NEOGEO) { ctrl_en_ = true; ctrl_run_ = false; }
++}
++
++void Session::set_ctrl(bool enable, bool run)
++{
++	ctrl_en_ = enable;
++	ctrl_run_ = run;
++	bool neo = sys() == SYS_NEOGEO;
++	mb_.wr(MB_CTRL, ctrl_word(enable, run, sess_, plays_gb2(), neo ? ++hb_ : 0));
+ }
+ 
+ // ---------------------------------------------------------------------------
+@@ -47,7 +58,7 @@ void Session::fail(uint64_t now, uint8_t bye_reason, const char *fmt, ...)
+ 	va_end(ap);
+ 	msg_seq_++;
+ 
+-	if (phase_ >= PH_ARM) mb_.wr(MB_CTRL, ctrl_word(false, false, sess_));
++	if (phase_ >= PH_ARM || ctrl_en_) set_ctrl(false, false);
+ 	if (net_ && phase_ >= PH_HANDSHAKE)
+ 	{
+ 		Packet p {};
+@@ -64,7 +75,7 @@ void Session::fail(uint64_t now, uint8_t bye_reason, const char *fmt, ...)
+ void Session::finish_ok(uint64_t now, const char *text)
+ {
+ 	(void)now;
+-	mb_.wr(MB_CTRL, ctrl_word(false, false, sess_));
++	set_ctrl(false, false);
+ 	say("%s", text);
+ 	phase_ = PH_DONE;
+ }
+@@ -114,6 +125,7 @@ uint32_t Session::packed_settings() const
+ 	case SYS_SNES: return pack_settings(info_.snes);
+ 	case SYS_GB2P: return pack_settings(info_.gb);
+ 	case SYS_ARCADE: return 0;   // the DIP switches are the host's (SPEC.md 12.4)
++	case SYS_NEOGEO: return pack_settings(info_.neo);
+ 	default:       return pack_settings(info_.settings);
+ 	}
+ }
+@@ -130,6 +142,7 @@ uint8_t Session::compare_peer(const Hello &h) const
+ 	if (memcmp(h.sav_md5, info_.sav_md5, 16)) return REJ_SAV;
+ 	if (h.settings != packed_settings()) return REJ_SETTINGS;
+ 	if (sys() == SYS_GB2P && memcmp(h.boot_md5, info_.boot_md5, 16)) return REJ_SETTINGS;
++	if (sys() == SYS_NEOGEO && memcmp(h.boot_md5, info_.boot_md5, 16)) return REJ_BIOS;
+ 	return REJ_OK;
+ }
+ 
+@@ -137,6 +150,9 @@ uint8_t Session::compare_peer(const Hello &h) const
+ 
+ void Session::step(uint64_t now)
+ {
++	// Neo Geo: a new heartbeat on every step while CTRL is enabled (SPEC.md 14.3)
++	if (sys() == SYS_NEOGEO && ctrl_en_ && phase_ != PH_DONE) set_ctrl(ctrl_en_, ctrl_run_);
++
+ 	// Drain the socket first: handshake and run both depend on it.
+ 	if (net_ && phase_ != PH_DONE && phase_ != PH_WAIT_CORE)
+ 	{
+@@ -151,21 +167,34 @@ void Session::step(uint64_t now)
+ 	{
+ 	case PH_WAIT_CORE:
+ 		if (!have_info_ || mb_.rd(MB_MAGIC) != mailbox_magic(sys())) break;
++		if (sys() == SYS_NEOGEO)
++		{
++			// The core was armed before the ROM set loaded and holds the
++			// machine in reset (SPEC.md 14.2). Not armed: it has run, and a
++			// session would start from what the game left behind.
++			if (decode_status(mb_.rd(MB_STATUS)).state != FS_ARMED)
++			{
++				fail(now, 0, "Netplay: load the game again (the core was not held)");
++				break;
++			}
++		}
+ 		// A previous session may have just written CTRL=0: wait until the core
+ 		// has seen it, or a fast re-arm would land before it ever went IDLE.
+-		if (decode_status(mb_.rd(MB_STATUS)).state != FS_IDLE)
++		else if (decode_status(mb_.rd(MB_STATUS)).state != FS_IDLE)
+ 		{
+-			mb_.wr(MB_CTRL, ctrl_word(false, false, 0));
++			set_ctrl(false, false);
+ 			break;
+ 		}
+ 		{
+ 			uint8_t r = sys() == SYS_SNES ? check_local(info_.snes, info_.rom_region, delay_)
+ 			          : sys() == SYS_GB2P ? check_local(info_.gb, info_.rom_region, delay_)
+ 			          : sys() == SYS_ARCADE ? check_local_arcade(info_.rom_region, delay_)
++			          : sys() == SYS_NEOGEO ? check_local_neogeo(info_.rom_region, delay_)
+ 			                              : check_local(info_.settings, info_.rom_region, delay_);
+ 			if (r != REJ_OK)
+ 			{
+-				// nothing armed yet: no BYE, no CTRL write
++				// nothing armed yet: no BYE, no CTRL write (Neo Geo: the machine goes)
++				if (ctrl_en_) set_ctrl(false, false);
+ 				say("Netplay: %s", reject_text(sys(), r));
+ 				failed_ = true;
+ 				phase_ = PH_DONE;
+@@ -352,7 +381,7 @@ void Session::arm(uint64_t now)
+ 		mb_.wr(MB_CRC + i * 8, INVALID_WORD);
+ 		mb_.wr(MB_INPUT + i * 8, INVALID_WORD);
+ 	}
+-	mb_.wr(MB_CTRL, ctrl_word(true, false, sess_, plays_gb2()));
++	set_ctrl(true, false);
+ 	phase_ = PH_ARM;
+ 	t_phase_ = now;
+ 	say("Netplay: arming core");
+@@ -368,7 +397,7 @@ void Session::reload_done(uint64_t now)
+ 
+ void Session::start_run(uint64_t now)
+ {
+-	mb_.wr(MB_CTRL, ctrl_word(true, true, sess_, plays_gb2()));
++	set_ctrl(true, true);
+ 	phase_ = PH_RUN;
+ 	t_rx_ = now;
+ 	t_input_ = 0;
+diff --git a/support/netplay/netplay_session.h b/support/netplay/netplay_session.h
+index aaf285a..50bcadf 100644
+--- a/support/netplay/netplay_session.h
++++ b/support/netplay/netplay_session.h
+@@ -1,4 +1,4 @@
+-// netplay_session.h — NES, SNES, Game Boy 2P and arcade netplay session engine (SPEC.md 3, 4, 7, 10, 11, 12)
++// netplay_session.h — NES, SNES, Game Boy 2P, arcade and Neo Geo netplay session engine (SPEC.md 3, 4, 7, 10, 11, 12, 14)
+ //
+ // Single-threaded and free of OS calls: the mailbox is a plain pointer and
+ // the network sits behind Transport, so the whole engine runs in the x86
+@@ -57,8 +57,10 @@ struct LocalInfo
+ 	Settings settings;          // NES
+ 	SnesSettings snes;          // SNES
+ 	GbSettings gb;              // Game Boy 2P
++	NeoSettings neo;            // Neo Geo (its BIOS files' md5 in boot_md5)
+ 	uint8_t  rom_region;        // NES: see rom_region_from_header(); SNES: 0 supported, 1 refused chip;
+-	                            // Game Boy 2P: 0 supported, 1 MegaDuck; arcade: 0 supported, 1 NVRAM
++	                            // Game Boy 2P: 0 supported, 1 MegaDuck; arcade: 0 supported, 1 NVRAM;
++	                            // Neo Geo: 0 a cartridge, 1 a CD
+ };
+ 
+ // Record/replay data: one controller sample and one CRC per frame.
+@@ -136,6 +138,11 @@ private:
+ 	bool   wide() const { return wide_input(info_.system); }
+ 	bool   plays_gb2() const { return info_.system == SYS_GB2P && mode_ == M_JOIN; }
+ 	uint32_t packed_settings() const;
++	// CTRL. Neo Geo: written with a new heartbeat on every step while enabled,
++	// from the start (the main thread armed the core before the ROM set loaded)
++	void set_ctrl(bool enable, bool run);
++	bool       ctrl_en_ = false, ctrl_run_ = false;
++	uint16_t   hb_ = 0;
+ 
+ 	Mode       mode_;
+ 	uint8_t    delay_;
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index c57b3b4..2b6f966 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -23,6 +23,10 @@ test: test_netplay test_rfu test_rfu_link udp_harness
+ 	NP_SYSTEM=arcade NP_OSD=1 ./run_udp_test.sh
+ 	NP_SYSTEM=arcade NP_OSD=1 NP_OSD_STEPS=1 ./run_udp_test.sh
+ 	NP_SYSTEM=gba ./run_udp_test.sh
++	NP_SYSTEM=neogeo ./run_udp_test.sh
++	NP_SYSTEM=neogeo NP_OSD=1 NP_NEO_RAN=1 ./run_udp_test.sh
++	NP_SYSTEM=neogeo NP_ROMSALT=5 NP_EXPECT="Different ROM set" ./run_udp_test.sh
++	NP_SYSTEM=neogeo NP_BIOSSALT=7 NP_EXPECT="Different BIOS files" ./run_udp_test.sh
+ 	@srv=../../../../server/build/netplay-server-linux-amd64; \
+ 	if [ -x $$srv ]; then srv=$$(cd $$(dirname $$srv) && pwd)/$$(basename $$srv); \
+ 	  NP_SERVER_BIN=$$srv ./run_udp_test.sh && \
+@@ -45,7 +49,9 @@ test: test_netplay test_rfu test_rfu_link udp_harness
+ 	  NP_SYSTEM=gba NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
+ 	  NP_SYSTEM=gba NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_DIRECT=no ./run_udp_test.sh && \
+ 	  NP_SYSTEM=gba NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_GBA_RELOAD=host ./run_udp_test.sh && \
+-	  NP_SYSTEM=gba NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_GBA_RELOAD=join ./run_udp_test.sh; \
++	  NP_SYSTEM=gba NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_GBA_RELOAD=join ./run_udp_test.sh && \
++	  NP_SYSTEM=neogeo NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
++	  NP_SYSTEM=neogeo NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_OSD=1 NP_NEO_RAN=1 ./run_udp_test.sh; \
+ 	else echo "SKIP udp (server): build it with server/build.sh"; fi
+ 
+ test_netplay: $(ENGINE) test_netplay.cpp $(HDRS)
+diff --git a/support/netplay/test/fake_fpga.h b/support/netplay/test/fake_fpga.h
+index b9213e1..b7c9f7b 100644
+--- a/support/netplay/test/fake_fpga.h
++++ b/support/netplay/test/fake_fpga.h
+@@ -38,6 +38,15 @@ struct FakeFpga
+ 	std::vector<uint16_t> posted;                    // LOCAL[] per frame
+ 	std::function<uint16_t(uint64_t)> pad;
+ 
++	// Neo Geo (rtl/netplay/neogeo_netplay.sv, SPEC.md 14.3): arms only on a
++	// heartbeat that moves, ends on one that stands for 350 ms, takes the
++	// session from CTRL while armed, and says when the machine has run
++	bool     loaded = false;                // a ROM set is in: the machine runs unless held
++	bool     ran = false;
++	bool     hb_seen = false;
++	uint16_t hb_last = 0;
++	uint64_t hb_t = 0;
++
+ 	explicit FakeFpga(int i, System s = SYS_NES) : id(i), sys(s)
+ 	{
+ 		mb.wr(MB_MAGIC, mailbox_magic(sys));
+@@ -45,7 +54,7 @@ struct FakeFpga
+ 		pad = [i, m](uint64_t now) { return (uint16_t)(((now / (37 + 11 * i)) * (i ? 0x5B5 : 0x3D3)) & m); };
+ 	}
+ 
+-	void status() { mb.wr(MB_STATUS, (uint64_t)frame << 32 | (uint64_t)state << 24 | (uint64_t)error << 16 | stalls); }
++	void status() { mb.wr(MB_STATUS, (uint64_t)frame << 32 | (uint64_t)(ran ? 1 : 0) << 27 | (uint64_t)state << 24 | (uint64_t)error << 16 | stalls); }
+ 
+ 	bool fetch(uint32_t f, uint16_t *p1, uint16_t *p2)
+ 	{
+@@ -82,11 +91,23 @@ struct FakeFpga
+ 		uint64_t ctrl = mb.rd(MB_CTRL);
+ 		bool ok = (uint32_t)(ctrl >> 32) == CTRL_MAGIC;   // as rtl/netplay.sv
+ 		bool en = ok && (ctrl & 1), run = ok && (ctrl & 2);
++		if (sys == SYS_NEOGEO)
++		{
++			uint16_t hb = (uint16_t)(ctrl >> 16);
++			bool moved = ok && hb_seen && hb != hb_last;
++			hb_seen = ok;
++			hb_last = hb;
++			if (moved) hb_t = now;
++			if (state == FS_IDLE && !moved) en = false;          // a CTRL word nobody changes is left over
++			if (state != FS_IDLE && now - hb_t > 350) en = false; // the heartbeat stopped
++			if (state == FS_ARMED && en) sess = (uint8_t)(ctrl >> 8);
++			if (loaded && (state == FS_IDLE || state == FS_RUN) && !ran) { ran = true; status(); }   // the machine runs
++		}
+ 
+ 		switch (state)
+ 		{
+ 		case FS_IDLE:
+-			if (en) { state = FS_ARMED; sess = (uint8_t)(ctrl >> 8); join = (ctrl >> 2) & 1; frame = 0; error = 0; stalls = 0; have0 = have1 = false; status(); }
++			if (en) { state = FS_ARMED; sess = (uint8_t)(ctrl >> 8); join = (ctrl >> 2) & 1; frame = 0; error = 0; stalls = 0; have0 = have1 = false; hb_t = now; status(); }
+ 			break;
+ 		case FS_ARMED:
+ 			if (!en) { state = FS_IDLE; status(); }
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+index b9ddbfc..26adc1e 100755
+--- a/support/netplay/test/run_udp_test.sh
++++ b/support/netplay/test/run_udp_test.sh
+@@ -49,7 +49,7 @@ h=$(grep RESULT "$tmp/host.log"); j=$(grep RESULT "$tmp/join.log")
+ echo "host: $h"
+ echo "join: $j"
+ hd=${h##*digest=}; jd=${j##*digest=}
+-label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_TWO:+ (two games)}${NP_OSD:+ (OSD mode${NP_OSD_STEPS:+, stepping})}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_INCORE:+, Join room in the core}${NP_DECOY:+, two rooms}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}${NP_GBA_RELOAD:+ ($NP_GBA_RELOAD loads the game again)}"
++label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_TWO:+ (two games)}${NP_NEO_RAN:+ (host played first: core reload)}${NP_OSD:+ (OSD mode${NP_OSD_STEPS:+, stepping})}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_INCORE:+, Join room in the core}${NP_DECOY:+, two rooms}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}${NP_GBA_RELOAD:+ ($NP_GBA_RELOAD loads the game again)}"
+ ok=0
+ [ $hr -eq 0 ] && [ $jr -eq 0 ] && [ -n "$hd" ] && [ "$hd" = "$jd" ] && ok=1
+ # GBA wireless adapter: both linked (and through the server: with the other's name)
+@@ -92,6 +92,13 @@ if [ $ok -eq 1 ] && [ -n "${NP_OSD_STEPS:-}" ]; then
+ 	grep -q "connecting to host\|joining\|peer=" "$tmp/host.log" && { echo "host: a join session started while stepping through the OSD"; ok=0; }
+ 	grep -q "waiting for player 2" "$tmp/join.log" && { echo "join: a host session started while stepping through the OSD"; ok=0; }
+ fi
++# NP_EXPECT=text: the session must not start, and the host must say why
++if [ -n "${NP_EXPECT:-}" ]; then
++	label="$label (refused: $NP_EXPECT)"
++	ok=1
++	grep -q "playing" "$tmp/host.log" "$tmp/join.log" && { echo "a session started"; ok=0; }
++	grep -q "$NP_EXPECT" "$tmp/host.log" || { echo "host: no \"$NP_EXPECT\""; ok=0; }
++fi
+ if [ $ok -eq 1 ]; then
+ 	echo "PASS $label"
+ 	rm -rf "$tmp"
+diff --git a/support/netplay/test/test_netplay.cpp b/support/netplay/test/test_netplay.cpp
+index 5524e91..b164e0e 100644
+--- a/support/netplay/test/test_netplay.cpp
++++ b/support/netplay/test/test_netplay.cpp
+@@ -77,7 +77,7 @@ static LocalInfo make_info(System sys = SYS_NES)
+ 	li.snes.wram = 1;
+ 	li.snes.aram = 3;
+ 	memcpy(li.core_build, sys == SYS_SNES ? "SNES_20261103___" : sys == SYS_GB2P ? "GAMEBOY2P_261107"
+-	                     : sys == SYS_ARCADE ? "v4f2a91c_jtbubl_" : "NES_20261030____", 16);
++	                     : sys == SYS_ARCADE ? "v4f2a91c_jtbubl_" : sys == SYS_NEOGEO ? "NEOGEO_261114___" : "NES_20261030____", 16);
+ 	if (sys == SYS_ARCADE) memcpy(li.rom2_md5, li.rom_md5, 16), li.dip = 0xFFFF;
+ 	memset(li.rom_md5, 0xAB, 16);
+ 	memset(li.rom2_md5, 0xCD, 16);
+@@ -894,6 +894,72 @@ static void test_arcade_record_replay()
+ 	CHECKM(p.dip() == 0xBEEF, "replay dip %llx", (unsigned long long)p.dip());
+ }
+ 
++// Neo Geo (SPEC.md 14): the heartbeat in CTRL, the settings, the `ran` bit, and
++// the session's start on a core armed before the ROM set loaded
++static void test_neogeo()
++{
++	printf("neogeo: heartbeat, settings, pre-armed start, a heartbeat that stops\n");
++	CHECK((uint32_t)ctrl_word(true, false, 0x5A, false, 0x1234) == 0x12345A01u);
++	CHECK((uint32_t)(ctrl_word(true, true, 0x5A, false, 0x1234) >> 32) == CTRL_MAGIC);
++	CHECK(ctrl_word(false, false, 0x5A, false, 0x1234) == 0);
++	CHECK(mailbox_phys(SYS_NEOGEO) == 0x3FC00000 && mailbox_magic(SYS_NEOGEO) == MAGIC_NEOGEO && joy12(SYS_NEOGEO));
++	CHECK(proto_version(SYS_NEOGEO) == PROTO_VERSION_ARCADE);
++	CHECK(decode_status(1ull << 27 | 3ull << 24).ran && decode_status(1ull << 27 | 3ull << 24).state == FS_RUN);
++	CHECK(!decode_status(3ull << 24).ran);
++	{
++		NeoSettings a {}, b {};
++		CHECK(pack_settings(a) == pack_settings(b));
++		b.sys_type = 1; CHECK(pack_settings(a) != pack_settings(b)); b = a;
++		b.video = 1;    CHECK(pack_settings(a) != pack_settings(b)); b = a;
++		b.bios_orig = 1; CHECK(pack_settings(a) != pack_settings(b)); b = a;
++		b.dips = 4;     CHECK(pack_settings(a) != pack_settings(b));
++	}
++	CHECK(check_local_neogeo(0, 3) == REJ_OK && check_local_neogeo(1, 3) == REJ_SYSTEM && check_local_neogeo(0, 1) == REJ_DELAY);
++
++	LocalInfo li = make_info(SYS_NEOGEO);
++	// 1. Not armed before the load: the machine has run, no session
++	{
++		FakeFpga f(0, SYS_NEOGEO);
++		Recording rec;
++		Session r(M_RECORD, 3, f.mb, nullptr, &rec, 9);
++		r.set_local(li);
++		uint64_t now = 0;
++		while (r.phase() != PH_DONE && now < 1000) { now++; r.step(now); f.step(now); }
++		CHECKM(r.failed() && strstr(r.message(), "load the game again"), "not armed: %s", r.message());
++	}
++	// 2. Armed (session 0, a moving heartbeat) before the load: the session
++	//    runs, and the core takes the session's id while it is armed
++	{
++		FakeFpga f(0, SYS_NEOGEO);
++		Recording rec;
++		uint64_t now = 0;
++		for (uint16_t hb = 1; f.state != FS_ARMED && now < 100; hb++) { now++; f.mb.wr(MB_CTRL, ctrl_word(true, false, 0, false, hb)); f.step(now); }
++		CHECK(f.state == FS_ARMED && f.sess == 0);
++		f.loaded = true;
++		Session r(M_RECORD, 3, f.mb, nullptr, &rec, 9);
++		r.set_local(li);
++		while (f.frame < 300 && now < 60000)
++		{
++			now++;
++			r.step(now); f.step(now);
++			if (r.reload_requested() && now % 40 == 0) r.reload_done(now);
++		}
++		CHECKM(f.frame >= 300 && !r.failed(), "pre-armed: frame %u, %s", f.frame, r.message());
++		CHECK(f.sess == r.session_id() && f.sess != 0);
++		CHECK(f.ran);
++		// 3. The heartbeat stops (Main hangs): the core ends the session
++		for (uint64_t t = 0; t < 400; t++) { now++; f.step(now); }
++		CHECK(f.state == FS_IDLE && (f.error & FE_CTRL_DROP));
++	}
++	// 4. A CTRL word left in DDR3 (enabled, the heartbeat standing) never arms the core
++	{
++		FakeFpga f(0, SYS_NEOGEO);
++		f.mb.wr(MB_CTRL, ctrl_word(true, false, 0, false, 77));
++		for (uint64_t now = 1; now < 2000; now++) f.step(now);
++		CHECK(f.state == FS_IDLE);
++	}
++}
++
+ int main()
+ {
+ 	test_packets();
+@@ -930,6 +996,7 @@ int main()
+ 	test_arcade_session();
+ 	test_arcade_rejects();
+ 	test_arcade_record_replay();
++	test_neogeo();
+ 
+ 	if (g_fail) { printf("FAIL: %d of %d checks\n", g_fail, g_checks); return 1; }
+ 	printf("PASS: %d checks\n", g_checks);
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index 2673969..19f3fa8 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -7,6 +7,8 @@
+ // Prints "RESULT frames=<n> digest=<hash of every input seen>" on success.
+ // run_udp_test.sh starts a host and a join and compares the digests.
+ 
++#include <thread>
++#include <atomic>
+ #include <stdio.h>
+ #include <dirent.h>
+ #include <sys/stat.h>
+@@ -32,7 +34,7 @@ static std::string workdir;
+ static int         reloads = 0;
+ // NP_SYSTEM=snes: the SNES core (SPEC.md 10); NP_SYSTEM=gb2p: Game Boy 2P (SPEC.md 11);
+ // NP_SYSTEM=arcade: a jtframe arcade core loaded from an MRA (SPEC.md 12); else NES
+-static bool        snes = false, gb2p = false, arcade = false, gba = false;
++static bool        snes = false, gb2p = false, arcade = false, gba = false, neogeo = false;
+ static uint64_t    gba_mb[0x1000 / 8];      // GBA: the wireless adapter's mailbox (gba_rfu.sv's side is faked below)
+ static sw_struct   sw;                      // arcade: the DIP switches as mra_loader keeps them
+ static std::string dip_sends;               // arcade: what went to the core, in order
+@@ -46,7 +48,7 @@ static int         spi_cmd = -1, spi_words = 0;
+ // --- stubs for the MiSTer functions netplay.cpp uses ------------------------
+ 
+ // arcade: the MRA's set name, and with orig the core's own name (as Main has them)
+-char *user_io_get_core_name(int orig) { static char n[] = "NES", sn[] = "SNES", g[] = "GAMEBOY2P", a[] = "bublboblr", ao[] = "JTBUBL", ga[] = "GBA"; return gba ? ga : arcade ? (orig ? ao : a) : gb2p ? g : snes ? sn : n; }
++char *user_io_get_core_name(int orig) { static char n[] = "NES", sn[] = "SNES", g[] = "GAMEBOY2P", a[] = "bublboblr", ao[] = "JTBUBL", ga[] = "GBA", ng[] = "NEOGEO"; return neogeo ? ng : gba ? ga : arcade ? (orig ? ao : a) : gb2p ? g : snes ? sn : n; }
+ char *user_io_get_core_path(const char *, int) { static char p[] = "games/NES", sp[] = "games/SNES", g[] = "games/GAMEBOY2P", ga[] = "games/GBA"; return gba ? ga : gb2p ? g : snes ? sp : p; }
+ char is_arcade() { return arcade; }
+ static bool menu_mode = false;              // NP_MENU: the join starts in the main menu
+@@ -76,6 +78,9 @@ char *user_io_get_confstr(int index)
+ 	// GBA as GBA.sv's CONF_STR: the Link Port and Netplay options (SPEC.md 13)
+ 	static char gn[] = "GBA", gl[] = "P2O[44],Link Port,Off,Wireless Adapter", gnp[] = "P2O[46:45],Netplay,netplay.ini,Off,Host,Join";
+ 	if (gba) return index == 0 ? gn : index == 1 ? gl : index == 2 ? gnp : index == 3 ? b : nullptr;
++	// Neo Geo as neogeo.sv's CONF_STR (SPEC.md 14.2)
++	static char nn[] = "NEOGEO", nl[] = "FS1,*,Load ROM set", nnp[] = "oDE,Netplay,netplay.ini,Off,Host,Join";
++	if (neogeo) return index == 0 ? nn : index == 1 ? nl : index == 2 ? nnp : index == 3 ? b : nullptr;
+ 	return index == 0 ? (gb2p ? ga : snes ? sa : a) : index == 1 ? b : nullptr;
+ }
+ 
+@@ -85,8 +90,8 @@ static bool osd_visible = false;            // NP_OSD_STEPS: the OSD is open whi
+ char user_io_osd_is_visible() { return osd_visible; }
+ uint32_t user_io_status_get(const char *opt, int)
+ {
+-	if (!strcmp(opt, gba ? "[46:45]" : arcade ? "[127:126]" : gb2p ? "[47:46]" : snes ? "[59:58]" : "[89:88]")) return osd_netplay;
+-	if (arcade) return 0;
++	if (!strcmp(opt, gba || neogeo ? "[46:45]" : arcade ? "[127:126]" : gb2p ? "[47:46]" : snes ? "[59:58]" : "[89:88]")) return osd_netplay;
++	if (arcade || neogeo) return 0;   // Neo Geo: AES, NTSC, UniBIOS, DIPs off
+ 	if (gb2p) return !strcmp(opt, "[6]") ? status6 : 0;
+ 	if (snes && (!strcmp(opt, "[22:21]") || !strcmp(opt, "[45:44]"))) return 1;   // WRAM/ARAM 00FF
+ 	if (!strcmp(opt, "[66:65]")) return 1;   // RAM Clear $00
+@@ -137,7 +142,7 @@ void Info(const char *message, int, int, int, int) { printf("[osd] %s\n", messag
+ void *shmem_map(uint32_t phys, uint32_t)
+ {
+ 	if (gba) return phys == 0x3C000000 ? (void *)gba_mb : nullptr;
+-	if (phys != mailbox_phys(arcade ? SYS_ARCADE : gb2p ? SYS_GB2P : snes ? SYS_SNES : SYS_NES)) { printf("[harness] wrong mailbox address %08x\n", phys); return nullptr; }
++	if (phys != mailbox_phys(neogeo ? SYS_NEOGEO : arcade ? SYS_ARCADE : gb2p ? SYS_GB2P : snes ? SYS_SNES : SYS_NES)) { printf("[harness] wrong mailbox address %08x\n", phys); return nullptr; }
+ 	return fpga->own;
+ }
+ 
+@@ -308,6 +313,114 @@ static int run_arcade(bool host, bool osd, uint32_t want)
+ 	return ok ? 0 : 1;
+ }
+ 
++// Neo Geo (SPEC.md 14, T3n). The loader, as neogeo_romset_tx does it with
++// netplay: the hook before, the ROM set into the core, the hook after. The
++// core reload (fpga_load_rbf) restarts Main on a MiSTer; here run_neogeo()
++// does what the new process would: a fresh core (DDR3 keeps the mailbox),
++// netplay_start(), and netplay_poll() loads the ROM set it was for.
++static bool        core_reload = false;
++static int         core_reloads = 0;
++static std::thread stepper;
++static std::atomic<bool> stepping { false };
++const char *get_rbf_path() { return "_Console/NeoGeo_netplay.rbf"; }
++int fpga_load_rbf(const char *name, const char *, const char *)
++{
++	printf("[harness] core reload %s\n", name);
++	core_reload = true;
++	return 0;
++}
++int neogeo_romset_tx(char *name, int cd_en)
++{
++	if (netplay_neogeo_before(name, cd_en)) return 1;
++	printf("[harness] ROM set %s loaded\n", name);
++	fpga->loaded = true;
++	netplay_neogeo_loaded(name, cd_en);
++	return 1;
++}
++static void step_start()
++{
++	stepping = true;
++	stepper = std::thread([] { while (stepping) { fpga->step(now_ms()); usleep(300); } });
++}
++static void step_stop() { stepping = false; if (stepper.joinable()) stepper.join(); }
++
++// NP_NEO_RAN: this side plays the game alone first (OSD Off): the session then
++// needs the core loaded again (SPEC.md 14.2). NP_ROMSALT=n: another ROM set
++// on the join, NP_BIOSSALT=n: another BIOS (the handshake must refuse them;
++// run_udp_test.sh NP_EXPECT checks the reason).
++static int run_neogeo(bool host, uint32_t want)
++{
++	std::string home = getFullPath("games/NeoGeo"), set = home + "/game";
++	mkdir(getFullPath("games"), 0755);
++	mkdir(home.c_str(), 0755);
++	mkdir(set.c_str(), 0755);
++	// the salts give the join (only) another ROM set or BIOS
++	int salt = !host && getenv("NP_ROMSALT") ? atoi(getenv("NP_ROMSALT")) : 0, bsalt = !host && getenv("NP_BIOSSALT") ? atoi(getenv("NP_BIOSSALT")) : 0;
++	make_rom((set + "/prom").c_str(), 1 + salt);
++	make_rom((set + "/m1rom").c_str(), 2);
++	make_rom((set + "/crom0").c_str(), 3 + (host ? 0 : 9));   // the sprites may differ: not part of the identity
++	make_rom((home + "/uni-bios.rom").c_str(), 4 + bsalt);
++	make_rom((home + "/sfix.sfix").c_str(), 5);
++	make_rom((home + "/000-lo.lo").c_str(), 6);
++	char game[] = "games/NeoGeo/game";
++
++	fpga = new FakeFpga(host ? 0 : 1, SYS_NEOGEO);
++	step_start();
++	netplay_start();
++	bool ran_first = getenv("NP_NEO_RAN") && host;
++	if (ran_first)
++	{
++		uint32_t o = osd_netplay;
++		osd_netplay = 1;                          // Off: no session, the machine runs
++		neogeo_romset_tx(game, 0);
++		for (uint64_t t = now_ms(); now_ms() - t < 300; usleep(1000)) netplay_poll();
++		if (!fpga->ran) { printf("[harness] the machine did not run\n"); return 1; }
++		osd_netplay = o;
++	}
++	neogeo_romset_tx(game, 0);
++
++	uint64_t t0 = now_ms();
++	uint64_t limit = getenv("NP_EXPECT") ? 8000 : 60000;   // a refused one ends early
++	while (fpga->frame < want && now_ms() - t0 < limit)
++	{
++		if (core_reload)
++		{
++			// what the restarted Main sees: a fresh core, DDR3 as it was
++			core_reload = false;
++			core_reloads++;
++			step_stop();
++			FakeFpga *old = fpga;
++			fpga = new FakeFpga(host ? 0 : 1, SYS_NEOGEO);
++			memcpy(fpga->own, old->own, sizeof(fpga->own));
++			fpga->mb.wr(MB_MAGIC, mailbox_magic(SYS_NEOGEO));
++			fpga->status();
++			delete old;
++			step_start();
++			netplay_start();
++		}
++		netplay_poll();
++		usleep(500);
++	}
++	uint32_t reached = fpga->frame;
++	// a refused session: wait for the messages to show (1.5 s each)
++	for (uint64_t t = now_ms(); now_ms() - t < (getenv("NP_EXPECT") ? 6000 : 500); usleep(500)) netplay_poll();
++	netplay_stop();
++	step_stop();
++
++	uint64_t digest = 1469598103934665603ULL;
++	uint32_t n = 0;
++	for (auto &p : fpga->seen)
++	{
++		if (n++ >= want) break;
++		digest = (digest ^ p.first) * 1099511628211ULL;
++		digest = (digest ^ p.second) * 1099511628211ULL;
++	}
++	int want_core = ran_first ? 1 : 0;
++	if (core_reloads != want_core) printf("[harness] %d core reloads, expected %d\n", core_reloads, want_core);
++	printf("RESULT frames=%u stalls=%u reloads=%d core_reloads=%d digest=%016llx\n", reached, fpga->stalls, reloads, core_reloads, (unsigned long long)digest);
++	return (reached >= want && reloads == 0 && core_reloads == want_core) ? 0 : 1;
++}
++
+ // GBA with the wireless adapter (SPEC.md 13.6, T3w): the core's side of the
+ // mailbox as gba_rfu.sv does it, one command at a time; the scripts are what a
+ // game sends (LinkRawWireless): the host opens a room and waits for a client
+@@ -469,6 +582,7 @@ int main(int argc, char **argv)
+ 	gb2p = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "gb2p");
+ 	arcade = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "arcade");
+ 	gba = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "gba");
++	neogeo = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "neogeo");
+ 	two = gb2p && getenv("NP_TWO") != nullptr;
+ 	const char *sysdir = gb2p ? "GAMEBOY2P" : snes ? "SNES" : "NES", *ext = gb2p ? ".gb" : snes ? ".sfc" : ".nes";
+ 	if (argc == 4 && !strcmp(argv[1], "makerom")) { make_rom(argv[2], atoi(argv[3])); return 0; }
+@@ -501,6 +615,7 @@ int main(int argc, char **argv)
+ 
+ 	if (arcade) return run_arcade(host, osd, want);
+ 	if (gba) return run_gba(host);
++	if (neogeo) return run_neogeo(host, want);
+ 
+ 	std::string game = std::string("game") + ext;
+ 	if (server)
+-- 
+2.43.0
+

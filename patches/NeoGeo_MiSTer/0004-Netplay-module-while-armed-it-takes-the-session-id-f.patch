@@ -1,0 +1,29 @@
+From 74008ff3db5ae885b0d062705e5ecb066037eca4 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 14 Nov 2026 16:32:45 +0100
+Subject: [PATCH] Netplay module: while armed it takes the session id from CTRL
+ (Main arms with session 0 before the ROM set loads)
+---
+ rtl/netplay/neogeo_netplay.sv | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/rtl/netplay/neogeo_netplay.sv b/rtl/netplay/neogeo_netplay.sv
+index 2b6b0ca..831455a 100644
+--- a/rtl/netplay/neogeo_netplay.sv
++++ b/rtl/netplay/neogeo_netplay.sv
+@@ -377,6 +377,12 @@ always_ff @(posedge clk) begin
+ 						p_status  <= 1'b1;
+ 					end
+ 					S_ARMED: begin
++						// Main_MiSTer arms before the ROM set loads, before the
++						// players have agreed on a session: it comes later
++						if (ctrl_en) begin
++							sess    <= ddr_dout[15:8];
++							is_join <= ddr_dout[2];
++						end
+ 						if (!ctrl_en || hb_dead) begin state <= S_IDLE; waiting <= 1'b0; post <= 8'd0; p_status <= 1'b1; p_local <= 1'b0; p_crc <= 1'b0; end
+ 						else if (ctrl_run)       begin state <= S_PRIME; p_status <= 1'b1; end
+ 					end
+-- 
+2.43.0
+

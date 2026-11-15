@@ -1,0 +1,238 @@
+From 468241530569ef5ecfb073400d0882970e8eb8f6 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 14 Nov 2026 17:58:36 +0100
+Subject: [PATCH 44/46] netplay: Neo Geo ROM set identity from the program and
+ M1 as the loader sends them (by their place in the core) plus the cart
+ configuration: the same game from a Darksoft folder, a MAME zip or a .neo
+ matches; T3n: a join with the program in two files
+---
+ support/neogeo/neogeo_loader.cpp     |  4 +-
+ support/netplay/netplay.cpp          | 65 ++++++++++++++--------------
+ support/netplay/netplay.h            |  8 +++-
+ support/netplay/test/Makefile        |  1 +
+ support/netplay/test/run_udp_test.sh |  4 +-
+ support/netplay/test/udp_harness.cpp | 24 +++++++++-
+ 6 files changed, 67 insertions(+), 39 deletions(-)
+
+diff --git a/support/neogeo/neogeo_loader.cpp b/support/neogeo/neogeo_loader.cpp
+index 139b581..a24ba97 100644
+--- a/support/neogeo/neogeo_loader.cpp
++++ b/support/neogeo/neogeo_loader.cpp
+@@ -334,6 +334,8 @@ static uint32_t load_rom_to_mem(const char* path, const char* name, uint8_t neo_
+ 		{
+ 			memset(base, ((index>=16) && (index<64)) ? 8 : 0, partsz);
+ 			if (partszf) FileReadAdv(&f, base, partszf);
++			// netplay: the game's identity is its program as the core gets it
++			netplay_neogeo_data(index, addr + (size - remain), (const uint8_t *)base, partsz);
+ 		}
+ 
+ 		ProgressMessage("Loading", dispname, size - (remain - partsz), size);
+@@ -1278,6 +1280,6 @@ int neogeo_romset_tx(char* name, int cd_en)
+ 
+ 	user_io_status_set("[0]", 0); // Release reset
+ 
+-	netplay_neogeo_loaded(name, cd_en);
++	netplay_neogeo_loaded(name, cd_en, set_config(0, 0));
+ 	return 1;
+ }
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index df94f2c..92eee01 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -2260,42 +2260,27 @@ static void begin_session(const char *name, unsigned char index, char opensave);
+ // ---------------------------------------------------------------------------
+ // Neo Geo (SPEC.md 14)
+ 
+-// The ROM set's identity: a folder (the Darksoft layout) by the files the game
+-// runs from, all but the sprites (crom*) and the ADPCM samples (vrom*), which
+-// decide no game timing and are most of the size; a .zip or .neo by the file.
+-static bool neogeo_md5(const char *name, uint8_t out[16])
+-{
+-	std::string full = getFullPath(name);
+-	struct stat st;
+-	if (stat(full.c_str(), &st)) return false;
+-	if (!S_ISDIR(st.st_mode)) return md5_file(name, out, nullptr, 0);
+-	std::vector<std::string> files;
+-	if (DIR *d = opendir(full.c_str()))
+-	{
+-		while (dirent *e = readdir(d))
+-		{
+-			std::string n = e->d_name;
+-			if (n.empty() || n[0] == '.' || !strncasecmp(n.c_str(), "crom", 4) || !strncasecmp(n.c_str(), "vrom", 4)) continue;
+-			struct stat fs;
+-			if (!stat((full + "/" + n).c_str(), &fs) && S_ISREG(fs.st_mode)) files.push_back(n);
+-		}
+-		closedir(d);
+-	}
+-	if (files.empty()) return false;
+-	std::sort(files.begin(), files.end());
++// The ROM set's identity: the program (P ROMs) and the Z80's ROM (M1) as the
++// loader sends them to the core, by where they land, and the cart's
++// configuration word (protection chips, wait states). The same game gives the
++// same md5 from a Darksoft folder, a MAME zip or a .neo file; the sprites and
++// the ADPCM samples decide no game timing and are left out.
++static std::map<uint32_t, std::vector<uint8_t>> neo_rom;   // core address -> data
++static bool neo_rom_md5(uint32_t config, uint8_t out[16])
++{
++	if (neo_rom.empty()) return false;
+ 	MD5Context ctx;
+ 	MD5Init(&ctx);
+-	uint8_t buf[16384];
+-	for (const std::string &n : files)
++	uint32_t prog = 0;
++	for (auto &c : neo_rom)
+ 	{
+-		MD5Update(&ctx, (const uint8_t *)n.c_str(), (unsigned)n.size() + 1);
+-		FILE *f = fopen((full + "/" + n).c_str(), "rb");
+-		if (!f) return false;
+-		size_t k;
+-		while ((k = fread(buf, 1, sizeof(buf), f)) > 0) MD5Update(&ctx, buf, (unsigned)k);
+-		fclose(f);
++		if (c.first >= 0x10000000 && !prog++) MD5Update(&ctx, (const uint8_t *)"M1", 2);   // the Z80's ROM after the program
++		MD5Update(&ctx, c.second.data(), (unsigned)c.second.size());
+ 	}
++	uint8_t cf[4] = { (uint8_t)config, (uint8_t)(config >> 8), (uint8_t)(config >> 16), (uint8_t)(config >> 24) };
++	MD5Update(&ctx, cf, 4);
+ 	MD5Final(out, &ctx);
++	neo_rom.clear();                      // up to 10 MB: not kept
+ 	return true;
+ }
+ 
+@@ -2380,6 +2365,7 @@ static Mode current_mode()
+ bool netplay_neogeo_before(const char *name, int cd_en)
+ {
+ 	if (own_reload || !core_armed || core_sys != SYS_NEOGEO) return false;
++	neo_rom.clear();
+ 	bool ran = neo_ran;
+ 	neo_ran = true;                         // the machine runs after this load, with or without a session
+ 	if (cd_en || current_mode() == M_OFF) return false;
+@@ -2404,10 +2390,23 @@ bool netplay_neogeo_before(const char *name, int cd_en)
+ 	return false;
+ }
+ 
++// neogeo_loader, a piece of ROM on its way to the core: the program (P1 at
++// $200000, its second 512 KB at $280000, P2 at $300000 in the core's SDRAM) and
++// M1 (kept apart, above them)
++void netplay_neogeo_data(int index, uint32_t offset, const uint8_t *data, uint32_t len)
++{
++	if (!core_armed || core_sys != SYS_NEOGEO) return;
++	uint32_t at = index == 4 ? 0x200000 : index == 5 ? 0x280000 : index == 6 ? 0x300000 : index == 9 ? 0x10000000 : 0;
++	if (!at || !len) return;
++	neo_rom[at + offset].assign(data, data + len);
++}
++
+ // neogeo_loader, after the ROM set has loaded
+-void netplay_neogeo_loaded(const char *name, int cd_en)
++static uint32_t neo_config = 0;
++void netplay_neogeo_loaded(const char *name, int cd_en, uint32_t config)
+ {
+ 	if (own_reload || !core_armed || core_sys != SYS_NEOGEO || cd_en || !neo_prearm) return;
++	neo_config = config;
+ 	begin_session(name, 1, 0);
+ }
+ 
+@@ -2601,7 +2600,7 @@ static void begin_session(const char *name_in, unsigned char index, char opensav
+ 	}
+ 	else if (core_sys == SYS_NEOGEO)
+ 	{
+-		if (!neogeo_md5(name, li.rom_md5) || !neogeo_bios_md5(name, li.boot_md5))
++		if (!neo_rom_md5(neo_config, li.rom_md5) || !neogeo_bios_md5(name, li.boot_md5))
+ 		{
+ 			post_message("Netplay: cannot read the ROM set or the BIOS");
+ 			neo_prearm = false;
+diff --git a/support/netplay/netplay.h b/support/netplay/netplay.h
+index f26313d..9de4ebb 100644
+--- a/support/netplay/netplay.h
++++ b/support/netplay/netplay.h
+@@ -15,8 +15,12 @@ void netplay_note_dip(void);                             // mra_loader: DIP swit
+ const char *netplay_rooms_dir(unsigned char index);
+ bool netplay_take_file(const char *name, unsigned char index);   // user_io_file_tx: true = a room was picked, nothing goes to the core
+ // Neo Geo (SPEC.md 14.2), from neogeo_romset_tx: before (true = the core is being
+-// loaded again for a fresh session, do not load) and after a ROM set loads
++// loaded again for a fresh session, do not load) and after a ROM set loads (with
++// the cart's configuration word); in between each piece of ROM as it goes to the
++// core (index, offset in the index, data): the program and M1 make its identity
++#include <stdint.h>
+ bool netplay_neogeo_before(const char *name, int cd_en);
+-void netplay_neogeo_loaded(const char *name, int cd_en);
++void netplay_neogeo_data(int index, uint32_t offset, const uint8_t *data, uint32_t len);
++void netplay_neogeo_loaded(const char *name, int cd_en, uint32_t config);
+ 
+ #endif
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index 2b6f966..f690636 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -25,6 +25,7 @@ test: test_netplay test_rfu test_rfu_link udp_harness
+ 	NP_SYSTEM=gba ./run_udp_test.sh
+ 	NP_SYSTEM=neogeo ./run_udp_test.sh
+ 	NP_SYSTEM=neogeo NP_OSD=1 NP_NEO_RAN=1 ./run_udp_test.sh
++	NP_SYSTEM=neogeo NP_NEO_SPLIT_JOIN=1 ./run_udp_test.sh
+ 	NP_SYSTEM=neogeo NP_ROMSALT=5 NP_EXPECT="Different ROM set" ./run_udp_test.sh
+ 	NP_SYSTEM=neogeo NP_BIOSSALT=7 NP_EXPECT="Different BIOS files" ./run_udp_test.sh
+ 	@srv=../../../../server/build/netplay-server-linux-amd64; \
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+index 26adc1e..d39e644 100755
+--- a/support/netplay/test/run_udp_test.sh
++++ b/support/netplay/test/run_udp_test.sh
+@@ -39,7 +39,7 @@ if [ -n "${NP_DECOY:-}" ]; then
+ 	dp=$!
+ fi
+ sleep 0.3
+-"$bin" join "$tmp/join" "$frames" > "$tmp/join.log" 2>&1 &
++${NP_NEO_SPLIT_JOIN:+env NP_NEO_SPLIT=1} "$bin" join "$tmp/join" "$frames" > "$tmp/join.log" 2>&1 &
+ jp=$!
+ wait $hp; hr=$?
+ wait $jp; jr=$?
+@@ -49,7 +49,7 @@ h=$(grep RESULT "$tmp/host.log"); j=$(grep RESULT "$tmp/join.log")
+ echo "host: $h"
+ echo "join: $j"
+ hd=${h##*digest=}; jd=${j##*digest=}
+-label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_TWO:+ (two games)}${NP_NEO_RAN:+ (host played first: core reload)}${NP_OSD:+ (OSD mode${NP_OSD_STEPS:+, stepping})}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_INCORE:+, Join room in the core}${NP_DECOY:+, two rooms}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}${NP_GBA_RELOAD:+ ($NP_GBA_RELOAD loads the game again)}"
++label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_TWO:+ (two games)}${NP_NEO_RAN:+ (host played first: core reload)}${NP_NEO_SPLIT_JOIN:+ (the join has the program in two files)}${NP_OSD:+ (OSD mode${NP_OSD_STEPS:+, stepping})}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_INCORE:+, Join room in the core}${NP_DECOY:+, two rooms}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}${NP_GBA_RELOAD:+ ($NP_GBA_RELOAD loads the game again)}"
+ ok=0
+ [ $hr -eq 0 ] && [ $jr -eq 0 ] && [ -n "$hd" ] && [ "$hd" = "$jd" ] && ok=1
+ # GBA wireless adapter: both linked (and through the server: with the other's name)
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index 19f3fa8..6a0e043 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -329,12 +329,34 @@ int fpga_load_rbf(const char *name, const char *, const char *)
+ 	core_reload = true;
+ 	return 0;
+ }
++// the loader sends the program (index 4) and M1 (index 9) through the netplay
++// hook. NP_NEO_SPLIT: this side's ROM set has the program in two files, P1 and
++// P2 (index 6), as another format does: the identity must be the same.
++static void neo_send(int index, uint32_t offset, const std::vector<uint8_t> &d, size_t from, size_t len)
++{
++	for (size_t i = 0; i < len; i += 4096)
++		netplay_neogeo_data(index, offset + (uint32_t)i, d.data() + from + i, (uint32_t)std::min((size_t)4096, len - i));
++}
+ int neogeo_romset_tx(char *name, int cd_en)
+ {
+ 	if (netplay_neogeo_before(name, cd_en)) return 1;
++	auto rd = [&](const char *f) {
++		std::vector<uint8_t> d;
++		if (FILE *h = fopen(getFullPath((std::string(name) + "/" + f).c_str()), "rb"))
++		{
++			int c;
++			while ((c = fgetc(h)) != EOF) d.push_back((uint8_t)c);
++			fclose(h);
++		}
++		return d;
++	};
++	std::vector<uint8_t> p = rd("prom"), m = rd("m1rom");
++	if (getenv("NP_NEO_SPLIT")) { size_t h = p.size() / 2; neo_send(4, 0, p, 0, h); neo_send(6, 0, p, h, p.size() - h); }
++	else neo_send(4, 0, p, 0, p.size());
++	neo_send(9, 0, m, 0, m.size());
+ 	printf("[harness] ROM set %s loaded\n", name);
+ 	fpga->loaded = true;
+-	netplay_neogeo_loaded(name, cd_en);
++	netplay_neogeo_loaded(name, cd_en, 0x00800000);
+ 	return 1;
+ }
+ static void step_start()
+-- 
+2.43.0
+

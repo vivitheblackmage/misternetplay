@@ -1,6 +1,6 @@
-# NES, SNES, Game Boy, GBA and arcade netplay for MiSTer
+# NES, SNES, Game Boy, GBA, Neo Geo and arcade netplay for MiSTer
 
-Play NES, Super NES, Game Boy link-cable games and Bubble Bobble (arcade)
+Play NES, Super NES, Game Boy link-cable games, Neo Geo (AES) and Bubble Bobble (arcade)
 together on two [MiSTer FPGA](https://github.com/MiSTer-devel/Wiki_MiSTer/wiki) boards over the
 internet or a LAN. Both MiSTers run the real core in lockstep: each frame's controller input is sent to the other side, and both
 run exactly the same frames with the same input. A checksum of the game state
@@ -20,6 +20,10 @@ It comes in these parts:
   MiSTer runs both Game Boys; the host plays Game Boy 1, the other player Game
   Boy 2, so link-cable games (Tetris, Tennis, Dr. Mario, trading and battles)
   work over the network.
+- **Neo Geo core** (`NeoGeo_netplay.rbf`): the MiSTer Neo Geo core with the
+  netplay module, for cartridge games in Console (AES) mode. Both CPUs (68000
+  and Z80) were made to run exactly alike on any two MiSTers; the changes are
+  in SPEC.md section 14.
 - **Arcade core** (`jtbubl-netplay.rbf`, Bubble Bobble): Jotego's jtbubl core
   with the netplay module added to his jtframe framework, so other jtframe
   arcade cores can follow. It goes next to the normal `jtbubl.rbf`, which stays
@@ -69,6 +73,13 @@ MiSTer-devel project.
   without picture glitches. In simulation (Verilator): the whole jtbubl core on
   two simulated MiSTers stays in sync, with the same order of every clock
   enable, and a changed input is caught as a desync in the frame it happens.
+- Neo Geo on hardware: two MiSTers over the internet through the lobby server,
+  nine sessions with different games and no desync (among them Over Top, Double Dragon,
+  Pulstar, Art of Fighting, Shock Troopers 2nd Squad and Aero Fighters 3), and
+  a recorded Neo Turf Masters session replayed with identical results over
+  9,000 frames. In simulation (Verilator): the whole core makes the same writes
+  with both CPUs, at the same clocks, in every frame, with the DDR3's timing,
+  the clock phase, the start and the input's arrival all varied.
 - GBA Wireless Adapter on hardware: two MiSTers over the internet through the
   lobby server (on a Raspberry Pi), Pokémon FireRed/LeafGreen battles and a
   trade in the Union Room, and gba-link-connection's `LinkUniversal_stress` test ROM
@@ -89,16 +100,17 @@ them; it holds our changes as patches on top of exact upstream commits:
 | SNES core (FPGA) | [github.com/MiSTer-devel/SNES_MiSTer](https://github.com/MiSTer-devel/SNES_MiSTer) | `4c2b746` (2026-10-31) | [`patches/SNES_MiSTer/`](patches/SNES_MiSTer) |
 | Game Boy 2P core (FPGA) | [github.com/pomstazlesa/Gameboy2PUW_MiSTer](https://github.com/pomstazlesa/Gameboy2PUW_MiSTer) (branch `Gameboy2P`) | `83e167f` (2025-10-05) | [`patches/Gameboy2P_MiSTer/`](patches/Gameboy2P_MiSTer) |
 | GBA core (FPGA) | [github.com/MiSTer-devel/GBA_MiSTer](https://github.com/MiSTer-devel/GBA_MiSTer) | `93790a0` | [`patches/GBA_MiSTer/`](patches/GBA_MiSTer) |
+| Neo Geo core (FPGA) | [github.com/MiSTer-devel/NeoGeo_MiSTer](https://github.com/MiSTer-devel/NeoGeo_MiSTer) | `ffaab14` | [`patches/NeoGeo_MiSTer/`](patches/NeoGeo_MiSTer) |
 | Arcade core (FPGA) | [github.com/jotego/jtcores](https://github.com/jotego/jtcores) (jtbubl and jtframe) | `15d60ca` (2026-10-23) | [`patches/jtcores/`](patches/jtcores) |
 | Main binary (ARM) | [github.com/MiSTer-devel/Main_MiSTer](https://github.com/MiSTer-devel/Main_MiSTer) | `0827165` (2026-10-30) | [`patches/Main_MiSTer/`](patches/Main_MiSTer) |
 
-The NES and SNES cores are the work of the MiSTer-devel contributors and of the
+The NES, SNES, GBA and Neo Geo cores are the work of the MiSTer-devel contributors and of the
 authors credited in their own READMEs; Main_MiSTer likewise. The Game Boy 2P
 core is pomstazlesa's two-player fork of the MiSTer-devel Game Boy core. The
 arcade core and jtframe are Jotego's (jtcores). All are licensed GPL-3.0, and
 so are our patches.
 
-`./setup.sh` clones the six upstream repositories next to it and applies the
+`./setup.sh` clones the seven upstream repositories next to it and applies the
 patches on a branch called `netplay`.
 
 Everything else here is our own: the lobby server (`server/`), the tools
@@ -138,7 +150,7 @@ pairing through the lobby, and the fixes Pokémon needed over the internet
 | | Needed |
 | --- | --- |
 | MiSTer | Two MiSTers (DE10-Nano) with SDRAM, a network connection (Ethernet is best) and the current MiSTer Linux. Tested on kernel `6.18.38-MiSTer` (glibc 2.31). `MiSTer_online` needs glibc 2.29 or newer, so a MiSTer kept up to date with the official updater (`update_all` or `downloader`) is fine. Check with `uname -r` over ssh. |
-| Game | The same ROM file on both MiSTers (same md5), or the server's copy. NetPong, a free two-player NES test game, is included. Game Boy 2P needs the SDRAM board, as the original core. Bubble Bobble: the ROM set the MiSTer updater installs for Jotego's core (`games/mame/bublbobl.zip`), the same on both MiSTers; arcade games never come from the server. |
+| Game | The same ROM file on both MiSTers (same md5), or the server's copy. NetPong, a free two-player NES test game, is included. Game Boy 2P needs the SDRAM board, as the original core. Bubble Bobble: the ROM set the MiSTer updater installs for Jotego's core (`games/mame/bublbobl.zip`), the same on both MiSTers; arcade games never come from the server. Neo Geo: the same game and the same BIOS files (`uni-bios.rom` or `neo-epo.sp1`, `sfix.sfix`, `000-lo.lo`) on both; Neo Geo games never come from the server either. |
 | Server (optional) | Windows 10/11, or Linux on x86-64, ARM64 or ARMv7, such as Raspberry Pi OS (32- or 64-bit), Debian or Ubuntu. The binaries have no dependencies; the installer needs systemd (without it, run the binary by hand). Tested on Windows 10; Linux x86-64 in the automated tests. One forwarded port (7845, UDP and TCP) on the server's router. |
 | Building (developers) | Linux, tested on Ubuntu 24.04 (also in WSL2 on Windows 10). Docker for Quartus Prime Lite 17.0.2, Verilator 5, g++, Python 3, Go 1.22 (or Docker). See [Building](#building). |
 
@@ -151,8 +163,8 @@ computer. Then on **each** MiSTer:
    (where `_Console` is), over the network share or with the card in a
    computer. None of your files is overwritten:
    - `_Console/NES_netplay.rbf`, `_Console/SNES_netplay.rbf`,
-     `_Console/GAMEBOY2P_netplay.rbf` and `_Console/GBA_netplay.rbf`: the
-     cores, next to the normal ones
+     `_Console/GAMEBOY2P_netplay.rbf`, `_Console/GBA_netplay.rbf` and
+     `_Console/NeoGeo_netplay.rbf`: the cores, next to the normal ones
    - `_Arcade/cores/jtbubl-netplay.rbf` and
      `_Arcade/Bubble Bobble (US, Ver 5.1) [netplay].mra`: the arcade core and
      its MRA, next to Jotego's (which are not changed)
@@ -174,6 +186,8 @@ computer. Then on **each** MiSTer:
    to set up; the DIP switches are the host's during a session.
 7. GBA: start **Console → GBA_netplay**. In the OSD: **Hardware → Link Port →
    Wireless Adapter**. See [GBA Wireless Adapter](#gba-wireless-adapter).
+8. Neo Geo: start **Console → NeoGeo_netplay** with **System Type → Console
+   (AES)**. See [Neo Geo](#neo-geo).
 
 **Switching between the netplay cores:** reboot from the MiSTer's menu first,
 then start the other core. Jumping straight from one core to the
@@ -183,7 +197,7 @@ other can leave netplay without the ROM reload at the start of a session.
 
 - The host forwards **UDP port 7845** in its router to its MiSTer, then picks
   **Netplay → Host** in the OSD (NES_netplay, SNES_netplay,
-  GAMEBOY2P_netplay or GBA_netplay) and loads a game.
+  GAMEBOY2P_netplay, GBA_netplay or NeoGeo_netplay) and loads a game.
 - The other player puts the host's address in `/media/fat/netplay.ini`
   (`peer=<address>`), picks **Netplay → Join** and loads the same game.
 - The OSD shows `Netplay: playing (delay 4)`. Player 1 is the host.
@@ -232,6 +246,25 @@ All settings are described in [`tools/netplay.ini.example`](tools/netplay.ini.ex
   none. Playing with each player's own save is planned for a later version.
 - Not supported: MegaDuck games (`.bin`). OSD reset, *Reload Backup RAM* and
   *Sync Video* are off during netplay.
+
+### Neo Geo
+
+- Both start **NeoGeo_netplay** with the same **System Type** (Console),
+  **BIOS** and **Video Mode** settings, and the same BIOS files in
+  `games/NeoGeo` (`uni-bios.rom`, or `neo-epo.sp1` with BIOS Original;
+  `sfix.sfix`, `000-lo.lo`). The BIOS files are checked.
+- One picks **Netplay → Host**, the other **Join**, and both load the same
+  game. With a server, Join takes the open room with that game; without one,
+  `peer=` as above. There is no room folder for Neo Geo.
+- A game matches by its program and sound CPU ROM, not by its files: the same
+  game from a Darksoft folder, a MAME zip or a `.neo` file finds the other
+  player's room.
+- A session needs a freshly started machine. If a game was played in the core
+  before, the core loads itself again first, and the game follows by itself.
+  With Netplay on, the core starts only once a game is loaded, so there is no
+  BIOS screen before that.
+- The memory card, multitap, spinner and mouse are off during a session.
+  Not supported: Neo Geo CD.
 
 ### Arcade (Bubble Bobble)
 
@@ -321,8 +354,10 @@ The MiSTer boots, but the screen stays black and there is no menu. The new
 | `Set RAM Clear to $00 or $FF` | OSD → Advanced → RAM Clear, then Save settings |
 | `Different core settings` | an OSD setting differs (NES: system type, PPU reset, extra sprites, mask edges, overscan; SNES: region, ROM header, blending, audio clock, initial WRAM/ARAM, GSU slow ROM, Sufami swap): make them the same before loading the game |
 | `Game chip not supported in netplay` | SNES: MSU-1, BS-X/Satellaview, a game with a clock (S-RTC, SPC7110 RTC) or a competition cart |
-| `The other player runs another console` | the two players are in different netplay cores (NES, SNES, Game Boy 2P, arcade) |
+| `The other player runs another console` | the two players are in different netplay cores (NES, SNES, Game Boy 2P, Neo Geo, arcade) |
 | `Different netplay version` | use the same release on both MiSTers |
+| `Different ROM set` | Neo Geo: not the same game (its program) |
+| `Different BIOS files` | Neo Geo: not the same system ROM, `sfix.sfix` or `000-lo.lo` |
 | `Different core version` | arcade: different `jtbubl-netplay.rbf` files: use the same release on both |
 | `server: 2 rooms with this game: pick one` | more than one room with your game is open: pick one in _Netplay/Rooms (arcade: OSD *Join room*) |
 | `rooms need server= in netplay.ini` | arcade *Join room* without a server: use *Netplay → Join* with `peer=` |
@@ -350,16 +385,18 @@ system, not under `/mnt/c`):
 
 ```sh
 sudo apt install -y git make g++ verilator python3 rsync
-./setup.sh                                   # NES_MiSTer/, SNES_MiSTer/, Gameboy2P_MiSTer/, jtcores/ and Main_MiSTer/ with the patches
+./setup.sh                                   # NES_MiSTer/, SNES_MiSTer/, Gameboy2P_MiSTer/, GBA_MiSTer/, NeoGeo_MiSTer/, jtcores/ and Main_MiSTer/ with the patches
 make -C NES_MiSTer/sim lint test             # RTL lint and testbench
 make -C SNES_MiSTer/sim                      # whole SNES core in Verilator (GHDL in Docker): snes_sim
 make -C Main_MiSTer/support/netplay/test     # netplay engine tests, host + join over UDP
 tools/quartus_build.sh                       # the NES core, Quartus 17.0.2 in Docker (10-30 min)
 CORE=SNES tools/quartus_build.sh             # the SNES core (about 40 min)
+CORE=NeoGeo tools/quartus_build.sh           # the Neo Geo core (about 20 min)
+make -C NeoGeo_MiSTer/npsim det ROM=<romset> BIOS=<bios folder>   # whole Neo Geo core in Verilator, six timings compared
 (cd Main_MiSTer && source setup_default_toolchain.sh && make)   # MiSTer_online
 tools/jt_build.sh bubl                       # the arcade core, Quartus 20.1 in Docker (jotego/jtcore20, about 15 min)
 server/build.sh                              # netplay-server, Go in Docker
-tools/make_release.sh v0.4                   # releases/v0.4/ and mister-netplay-v0.4.zip
+tools/make_release.sh v0.6                   # releases/v0.6/ and mister-netplay-v0.6.zip
 ```
 
 The Quartus image: [`tools/quartus-docker/README.md`](tools/quartus-docker/README.md).

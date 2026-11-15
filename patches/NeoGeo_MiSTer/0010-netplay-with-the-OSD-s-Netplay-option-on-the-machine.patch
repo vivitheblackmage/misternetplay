@@ -1,0 +1,326 @@
+From a82a849c427283551c3d8cb8a37fce55bb0102ad Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sun, 15 Nov 2026 12:37:20 +0100
+Subject: [PATCH] netplay: with the OSD's Netplay option on, the machine waits
+ for a game's program, not a boot ROM (Main sends bootrom/neogeo.rom at the
+ core's start; the machine ran it until a game was picked and the 68000's
+ registers carried that into the session: DESYNC at frame 10); the trace gets
+ the 68000's reads and what happened before the session; bench: --bootrom,
+ arms only when Main would
+---
+ neogeo.sv                     | 50 ++++++++++++++++++++++++++++++++---
+ npsim/det.sh                  |  7 +++--
+ npsim/neogeo_sim.cpp          | 22 +++++++++++++--
+ npsim/trace68.py              | 10 ++++++-
+ rtl/netplay/neogeo_netplay.sv | 29 +++++++++++++++++---
+ 5 files changed, 107 insertions(+), 11 deletions(-)
+
+diff --git a/neogeo.sv b/neogeo.sv
+index 24afd64..f2e8774 100644
+--- a/neogeo.sv
++++ b/neogeo.sv
+@@ -278,6 +278,13 @@ reg [14:0] TRASH_ADDR;
+ reg SYSTEM_TYPE, SYSTEM_CD_TYPE;
+ 
+ reg nRESET_CORE;
++// netplay (SPEC.md 14.2): with the OSD's Netplay option on, the machine waits
++// for a game's program, not just any load. Main_MiSTer sends bootrom/neogeo.rom
++// (a BIOS) when the core starts, if there is one; the machine then ran the
++// BIOS and whatever game the SDRAM still held until the player picked one, and
++// the 68000's registers carried that run into the session (DESYNC at frame 10)
++wire np_osd = |status[46:45] & ~status[2];
++reg  np_got_game = 0;                // a game's program has come (set below the load indexes)
+ always @(posedge CLK_48M) begin
+ 	reg rst_n;
+ 	reg got_rom_write = 0;
+@@ -290,7 +297,7 @@ always @(posedge CLK_48M) begin
+ 	if(CLK_EN_24M_N && ~&TRASH_ADDR) TRASH_ADDR <= TRASH_ADDR + 1'b1;
+ 
+ 	// netplay: only the session resets the machine (np_hold_reset), not the OSD
+-	if (status[0] | ((status[14] | buttons[1]) & ~np_active) | np_hold_reset | bk_loading | RESET | ~got_rom_write) begin
++	if (status[0] | ((status[14] | buttons[1]) & ~np_active) | np_hold_reset | bk_loading | RESET | ~got_rom_write | (np_osd & ~np_got_game)) begin
+ 		TRASH_ADDR <= 0;
+ 		SYSTEM_TYPE <= status[1];	// Latch the system type on reset
+ 		SYSTEM_CD_TYPE <= status[2];
+@@ -551,6 +558,8 @@ wire np_bk_loading;                   // the core reads the save file (assigned
+ //   {fclk[18:3], UDS, LDS, A[23:17], A[15:9], 4'd7, 4'b0, A[8:1], data}
+ // 8 a frame starts (vertical blank): {frame of the session, 4'd8, 28'd0}
+ // 9 the 68000 acknowledges an interrupt: {fclk[18:3], 16'd0, 4'd9, 25'd0, level}
++// 10 a read of the 68000 outside the BIOS ROM (0xC) and the LSPC (0x3C) whose
++//   data differs from the last one traced in its part, as 7 (at its end)
+ localparam NP_TRACE68 = 1'b1;
+ wire [31:0] np_dbg_clk;
+ reg        np_ev;
+@@ -563,10 +572,17 @@ reg [31:0] ev_frame;
+ reg [18:0] ev_fclk;
+ reg [17:0] ev_last [8];
+ reg  [7:0] ev_seen;
++reg [15:0] ev_rlast [8];
++reg  [7:0] ev_rseen;
++reg        ev_as, ev_rd68;
++reg [23:1] ev_ra68;
++reg [15:0] ev_rd68d;
++reg  [1:0] ev_rs68;
+ always @(posedge CLK_48M) begin
+ 	reg iow_now, ior_now, ack_now, iack_now;
+-	reg [2:0] part;
++	reg [2:0] part, rpart;
+ 	reg [17:0] w;
++	reg rok;
+ 	iow_now = ~nIORQ & ~nSDWR;
+ 	ior_now = ~nIORQ & ~nSDRD;
+ 	ack_now = ~nIORQ & nSDRD & nSDWR;
+@@ -606,11 +622,30 @@ always @(posedge CLK_48M) begin
+ 			default:     part = 3'd7;
+ 		endcase
+ 		w = {~nUDS, ~nLDS, FX68K_DATAOUT};
++		// a read: what the 68000 takes, at the end of its cycle
++		ev_as <= ~nAS;
++		if (~nAS) begin ev_rd68 <= M68K_RW & ~&{FC2, FC1, FC0}; ev_ra68 <= M68K_ADDR; ev_rd68d <= FX68K_DATAIN; ev_rs68 <= {~nUDS, ~nLDS}; end
++		casez (ev_ra68[23:17])
++			7'b0000_???: begin rpart = 3'd0; rok = 1'b1; end
++			7'b0001_???: begin rpart = 3'd1; rok = 1'b1; end
++			7'b0010_???: begin rpart = 3'd2; rok = 1'b1; end
++			7'b0011_000: begin rpart = 3'd3; rok = 1'b1; end
++			7'b0011_110: begin rpart = 3'd5; rok = 1'b0; end
++			7'b0011_???: begin rpart = 3'd4; rok = 1'b1; end
++			7'b01??_???: begin rpart = 3'd6; rok = 1'b1; end
++			7'b1100_???: begin rpart = 3'd7; rok = 1'b0; end
++			default:     begin rpart = 3'd7; rok = 1'b1; end
++		endcase
+ 		if (np_w68_now & ~np_w68 & (~ev_seen[part] | (ev_last[part] != w))) begin
+ 			ev_seen[part] <= 1'b1;
+ 			ev_last[part] <= w;
+ 			np_ev_w <= {ev_fclk[18:3], ~nUDS, ~nLDS, M68K_ADDR[23:17], M68K_ADDR[15:9], 4'd7, 4'd0, M68K_ADDR[8:1], FX68K_DATAOUT};
+ 		end
++		else if (ev_as & nAS & ev_rd68 & rok & (~ev_rseen[rpart] | (ev_rlast[rpart] != ev_rd68d))) begin
++			ev_rseen[rpart] <= 1'b1;
++			ev_rlast[rpart] <= ev_rd68d;
++			np_ev_w <= {ev_fclk[18:3], ev_rs68, ev_ra68[23:17], ev_ra68[15:9], 4'd10, 4'd0, ev_ra68[8:1], ev_rd68d};
++		end
+ 		else if (ev_iack_p) begin
+ 			ev_iack_p <= 1'b0;
+ 			np_ev_w <= {ev_fclk[18:3], 16'd0, 4'd9, 25'd0, M68K_ADDR[3:1]};
+@@ -620,7 +655,7 @@ always @(posedge CLK_48M) begin
+ 			np_ev_w <= {ev_frame, 4'd8, 28'd0};
+ 		end
+ 		else np_ev <= 1'b0;
+-		if (np_hold_reset) begin ev_frame <= 32'd0; ev_mark <= 1'b0; ev_iack_p <= 1'b0; ev_seen <= 8'd0; end
++		if (np_hold_reset) begin ev_frame <= 32'd0; ev_mark <= 1'b0; ev_iack_p <= 1'b0; ev_seen <= 8'd0; ev_rseen <= 8'd0; end
+ 	end
+ end
+ reg  np_wz80;
+@@ -692,6 +727,15 @@ parameter INDEX_CROM0 = 15;
+ parameter INDEX_VROMS = 16;
+ parameter INDEX_CROMS = 64;
+ 
++// netplay: a game's program (P1/P2: straight, or the loader's copy command for them)
++always @(posedge CLK_48M) begin
++	if (ioctl_download & ioctl_wr & ((ioctl_index == INDEX_MEMCP && ioctl_addr[3:0] == 4'd0 && ~ioctl_dout[15]
++	                                  && ioctl_dout[7:0] >= INDEX_P1ROM_A && ioctl_dout[7:0] <= INDEX_P2ROM)
++	                                 || (ioctl_index >= INDEX_P1ROM_A && ioctl_index <= INDEX_P2ROM)))
++		np_got_game <= 1;
++	if (RESET) np_got_game <= 0;
++end
++
+ wire video_mode = status[3];
+ 
+ wire       ms5p_bank  = cfg[17];
+diff --git a/npsim/det.sh b/npsim/det.sh
+index a6d8bad..dbfbd3c 100755
+--- a/npsim/det.sh
++++ b/npsim/det.sh
+@@ -17,6 +17,9 @@
+ # another time (so it is still going on when the session starts, or not).
+ # b, c, e, f start the load 2 to 10 clocks later after the core's start than
+ # a and d (--boot-delay: Main's time from the core load to the ROM load).
++# c and e get a boot ROM at the core's start (Main_MiSTer sends
++# bootrom/neogeo.rom when there is one), 25 and 12 frames before the ROM set:
++# the machine must not run on it before the session.
+ # (The bench writes INPUT[k] one frame ahead; input later than that holds the
+ # machine at the frame start.)
+ #
+@@ -48,9 +51,9 @@ run() {   # name, options...
+ }
+ run a --ddr-lat 12 --fill 1 --rtc 08020261114170957 --sd 2000 "$@" &
+ run b --ddr-lat 12 --ddr-jit 40 --ddr-busy 20 --seed 1 --stall 100 1600000 --boot-delay 2 --fill 2 --rtc 08020261114170951 --sd 20000 "$@" &
+-run c --ddr-lat 30 --seed 2 --stall 300 1200000 --boot-delay 4 --fill 3 --rtc 08040260803092301 --sd 60000 "$@" &
++run c --ddr-lat 30 --seed 2 --stall 300 1200000 --boot-delay 4 --fill 3 --rtc 08040260803092301 --sd 60000 --bootrom 25 "$@" &
+ run d --ddr-lat 12 --phase 1 --start-delay 1600000 --seed 3 --stall 50 800000 --sd 0 "$@" &
+-run e --ddr-lat 12 --start-delay 16000000 --seed 4 --stall 100 4800000 --boot-delay 6 --fill 5 --rtc 08070201231235959 --sd 40000 "$@" &
++run e --ddr-lat 12 --start-delay 16000000 --seed 4 --stall 100 4800000 --boot-delay 6 --fill 5 --rtc 08070201231235959 --sd 40000 --bootrom 12 "$@" &
+ run f --ddr-lat 12 --ddr-jit 40 --ddr-busy 20 --seed 7 --stall 500 800000 --boot-delay 10 --fill 6 "$@" &
+ wait
+ for n in a b c d e f; do
+diff --git a/npsim/neogeo_sim.cpp b/npsim/neogeo_sim.cpp
+index 456cb40..33b59ed 100644
+--- a/npsim/neogeo_sim.cpp
++++ b/npsim/neogeo_sim.cpp
+@@ -36,6 +36,10 @@
+ //                     sector answered N clocks after the request (Main_MiSTer
+ //                     answers from its main loop); default: no save file
+ //     --rtc H         the time Main_MiSTer gives the core (hps_io's RTC word, hex)
++//     --bootrom F     Main_MiSTer finds bootrom/neogeo.rom at the core's start
++//                     and sends it (index 0, straight through ioctl; here the
++//                     system ROM), then F frames pass before the ROM set loads
++//                     (the player picks a game). The machine must not run then.
+ //     --mvs           System Type: Arcade (default: Console, AES)
+ //     --no-netplay    OSD Netplay: Off (default: Host)
+ //     --bios FILE     system ROM in the bios folder (default uni-bios.rom)
+@@ -95,6 +99,7 @@ static uint64_t clk96_count = 0;
+ // on a clock with BUSY low, read data comes back later with DOUT_READY.
+ static int sd_lat = -1;
+ static int boot_delay = 0;
++static int bootrom_frames = -1;
+ static const uint32_t DDR_BASE = 0x30000000, DDR_SIZE = 0x10000000;
+ static uint8_t *ddr;
+ static int ddr_lat = 12, ddr_jit = 0, ddr_busy_pm = 0;
+@@ -489,9 +494,10 @@ static void ctrl_write()
+ static uint16_t script_p1(uint32_t k) { int f = k % 60; return (f >= 20 && f < 26 ? 0x100 : 0) | (f >= 40 && f < 43 ? 0x010 : 0) | (f >= 50 && f < 56 ? 0x001 : 0); }
+ static uint16_t script_p2(uint32_t k) { int f = k % 60; return (f >= 30 && f < 36 ? 0x100 : 0) | (f >= 45 && f < 48 ? 0x010 : 0) | (f >= 10 && f < 13 ? 0x002 : 0); }
+ 
++static bool bench_armed = false;     // Main_MiSTer has armed netplay (before the ROM load)
+ static void main_poll()             // every 512 clocks of 48 MHz
+ {
+-	if ((clk48_count & 16383) == 0) { heartbeat++; ctrl_write(); }   // about every 0.34 ms
++	if (bench_armed && (clk48_count & 16383) == 0) { heartbeat++; ctrl_write(); }   // about every 0.34 ms
+ 	uint64_t st = mb_read(MB_STATUS);
+ 	uint32_t state = (uint32_t)(st >> 24) & 7, frame = (uint32_t)(st >> 32);
+ 	static uint32_t shown = 99;
+@@ -585,6 +591,7 @@ int main(int argc, char **argv)
+ 		else if (a == "--ztrace") { ztrace_a = num(); ztrace_b = num(); }
+ 		else if (a == "--snap") { if (i + 1 >= argc) return 2; snap_file = argv[++i]; }
+ 		else if (a == "--boot-delay") boot_delay = num();
++		else if (a == "--bootrom") bootrom_frames = num();
+ 		else if (a == "--sd") { sd_lat = num(); plus.push_back("+sdlat=" + std::to_string(sd_lat)); }
+ 		else if (a == "--fill") { fill = num(); plus.push_back("+fill=" + std::to_string(fill)); }
+ 		else if (a == "--rtc") { if (i + 1 >= argc) return 2; plus.push_back(std::string("+rtc=") + argv[++i]); }
+@@ -627,8 +634,19 @@ int main(int argc, char **argv)
+ 	top->reset = 0;
+ 	run48(8000);                       // the SDRAM's start-up
+ 	run48(boot_delay);                 // Main_MiSTer takes its time before it loads the ROM set
++	if (bootrom_frames >= 0)
++	{
++		// user_io.cpp at the core's start: bootrom/<core name>.rom, if there is one
++		std::vector<uint8_t> b = read_file(bios + "/" + sysrom);
++		set_index(0);
++		set_download(1);
++		for (size_t i = 0; i + 1 < b.size(); i += 2) tx_word((uint16_t)(b[i] | b[i + 1] << 8));
++		set_download(0);
++		fprintf(stderr, "  boot ROM %s sent, %d frames before the ROM set\n", sysrom, bootrom_frames);
++		for (int f = 0; f < bootrom_frames; f++) run48(811000);
++	}
+ 
+-	if (session) { ctrl_write(); run48(20000); }   // Main arms netplay before it loads the ROM set
++	if (session) { bench_armed = true; ctrl_write(); run48(20000); }   // Main arms netplay before it loads the ROM set
+ 	fprintf(stderr, "loading %s\n", rom.c_str());
+ 	load_romset(rom, bios, sysrom);
+ 	sess_loaded = true;
+diff --git a/npsim/trace68.py b/npsim/trace68.py
+index ad9fa64..4bfa843 100644
+--- a/npsim/trace68.py
++++ b/npsim/trace68.py
+@@ -4,7 +4,8 @@ Main_MiSTer's netplay/neogeo-dbg-<mode>.txt or neogeo_sim's output (T lines),
+ and compare two of them.
+ 
+   trace68.py <file>            one line per event: frame, clock in the frame,
+-                               what (wr address data strobes / iack level)
++                               what (wr/rd address data strobes, iack level,
++                               the start event: what happened before the session)
+   trace68.py <file a> <file b> the first events that differ, with context
+ """
+ import sys
+@@ -27,6 +28,13 @@ def load(path):
+                 uds, lds = hi >> 15 & 1, hi >> 14 & 1
+                 addr = (hi >> 7 & 0x7F) << 17 | (hi & 0x7F) << 9 | d8 << 1
+                 ev.append((frame, clk, "wr %06x %04x %s" % (addr, a16, "UL"[0] * uds + "UL"[1] * lds)))
++            elif kind == 10:
++                clk = (hi >> 16) << 3
++                uds, lds = hi >> 15 & 1, hi >> 14 & 1
++                addr = (hi >> 7 & 0x7F) << 17 | (hi & 0x7F) << 9 | d8 << 1
++                ev.append((frame, clk, "rd %06x %04x %s" % (addr, a16, "UL"[0] * uds + "UL"[1] * lds)))
++            elif kind == 11:
++                ev.append((frame, 0, "before the session: machine ran %d clocks, armed %d, dropped %d (%d heartbeat)" % (hi, d8, a16 >> 8, a16 & 255)))
+             elif kind == 9:
+                 ev.append((frame, (hi >> 16) << 3, "iack %d" % (a16 & 7)))
+             else:
+diff --git a/rtl/netplay/neogeo_netplay.sv b/rtl/netplay/neogeo_netplay.sv
+index 67a4c70..9656fe4 100644
+--- a/rtl/netplay/neogeo_netplay.sv
++++ b/rtl/netplay/neogeo_netplay.sv
+@@ -206,6 +206,11 @@ logic  [6:0] dq_frame;
+ logic  [1:0] p_dbg;           // words of the last frame still to write
+ // the trace: events on their way to DDR3 (a queue of 16), and where they go
+ logic [31:0] t_clk;           // machine clocks since the release
++// before the session (the trace's first event, kind 11): machine clocks the
++// machine ran outside a session, times armed, times dropped to IDLE (any
++// reason, and for a dead heartbeat)
++logic [31:0] pre_run;
++logic  [7:0] n_arm, n_drop, n_hbdrop;
+ assign dbg_clk = t_clk;
+ logic [63:0] tq [16];
+ logic  [3:0] tq_w, tq_r;
+@@ -266,6 +271,7 @@ always_ff @(posedge clk) begin
+ 	vbl_prev  <= vblank;
+ 	if (post != 8'd0) post <= post - 8'd1;
+ 	if (machine_run) ran <= 1'b1;
++	if (machine_run && dbg_tick && state != S_RUN && pre_run != 32'hFFFFFFFF) pre_run <= pre_run + 32'd1;
+ 	if (!hb_dead) hb_age <= hb_age + 1'd1;
+ 
+ 	if (!hold) hold_age <= 8'd0;
+@@ -319,7 +325,11 @@ always_ff @(posedge clk) begin
+ 			end
+ 		end
+ 	end
+-	if (start0) begin t_clk <= 32'd0; t_in <= 10'd0; t_out <= 10'd0; t_push <= 10'd0; tq_w <= 4'd0; tq_r <= 4'd0; end
++	if (start0) begin
++		t_clk <= 32'd0; t_out <= 10'd0; tq_r <= 4'd0;
++		tq[0] <= {pre_run, 4'd11, 4'd0, n_arm, n_drop, n_hbdrop};
++		tq_w  <= 4'd1; t_in <= 10'd1; t_push <= 10'd1;
++	end
+ 
+ 	// -----------------------------------------------------------------------
+ 	// Per-frame work in RUN
+@@ -456,6 +466,7 @@ always_ff @(posedge clk) begin
+ 				case (state)
+ 					S_IDLE: if (ctrl_en && hb_moved) begin
+ 						state     <= S_ARMED;
++						if (n_arm != 8'hFF) n_arm <= n_arm + 8'd1;
+ 						sess      <= ddr_dout[15:8];
+ 						is_join   <= ddr_dout[2];
+ 						error     <= 8'd0;
+@@ -473,10 +484,18 @@ always_ff @(posedge clk) begin
+ 							sess    <= ddr_dout[15:8];
+ 							is_join <= ddr_dout[2];
+ 						end
+-						if (!ctrl_en || hb_dead) begin state <= S_IDLE; waiting <= 1'b0; post <= 8'd0; p_status <= 1'b1; p_local <= 1'b0; p_crc <= 1'b0; end
++						if (!ctrl_en || hb_dead) begin
++							state <= S_IDLE; waiting <= 1'b0; post <= 8'd0; p_status <= 1'b1; p_local <= 1'b0; p_crc <= 1'b0;
++							if (n_drop != 8'hFF) n_drop <= n_drop + 8'd1;
++							if (hb_dead && n_hbdrop != 8'hFF) n_hbdrop <= n_hbdrop + 8'd1;
++						end
+ 						else if (ctrl_run)       begin state <= S_PRIME; p_status <= 1'b1; end
+ 					end
+-					S_PRIME, S_ERROR: if ((!ctrl_en || hb_dead) && !start0) begin state <= S_IDLE; waiting <= 1'b0; post <= 8'd0; p_status <= 1'b1; p_local <= 1'b0; p_crc <= 1'b0; end
++					S_PRIME, S_ERROR: if ((!ctrl_en || hb_dead) && !start0) begin
++						state <= S_IDLE; waiting <= 1'b0; post <= 8'd0; p_status <= 1'b1; p_local <= 1'b0; p_crc <= 1'b0;
++						if (n_drop != 8'hFF) n_drop <= n_drop + 8'd1;
++						if (hb_dead && n_hbdrop != 8'hFF) n_hbdrop <= n_hbdrop + 8'd1;
++					end
+ 					S_RUN: if (!ctrl_en || hb_dead) begin
+ 						error[ERR_CTRL_DROP] <= 1'b1;
+ 						state <= S_IDLE; waiting <= 1'b0; post <= 8'd0; p_status <= 1'b1; p_local <= 1'b0; p_crc <= 1'b0;
+@@ -496,6 +515,10 @@ always_ff @(posedge clk) begin
+ 		sess       <= 8'd0;
+ 		is_join    <= 1'b0;
+ 		ran        <= 1'b0;
++		pre_run    <= 32'd0;
++		n_arm      <= 8'd0;
++		n_drop     <= 8'd0;
++		n_hbdrop   <= 8'd0;
+ 		have0      <= 1'b0;
+ 		have1      <= 1'b0;
+ 		a_p1       <= 12'd0;
+-- 
+2.43.0
+

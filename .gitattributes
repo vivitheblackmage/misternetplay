@@ -8,3 +8,5 @@
 # GBA_MiSTer has CRLF files: its patches must keep their CRs to apply
 patches/GBA_MiSTer/*.patch -text
 *.gba binary
+# NeoGeo_MiSTer has CRLF files too
+patches/NeoGeo_MiSTer/*.patch -text

@@ -1,0 +1,1227 @@
+From 4b4613d9d679edd4ee774e1226df3ef9063a8863 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 14 Nov 2026 12:29:31 +0100
+Subject: [PATCH 1/3] npsim: the whole core (emu) in Verilator with an exact
+ SDRAM chip model and a DDR3 with adjustable timing; det.sh: the same game on
+ six MiSTers (DDR3 timing, clock phase, reset time, a session before) must
+ give the same CPU writes per frame
+---
+ npsim/.gitignore     |   3 +
+ npsim/Makefile       |  53 +++++
+ npsim/det.sh         |  74 +++++++
+ npsim/neogeo_sim.cpp | 481 +++++++++++++++++++++++++++++++++++++++++++
+ npsim/prep.py        |  92 +++++++++
+ npsim/sdram_chip.sv  |  55 +++++
+ npsim/sim_top.sv     | 144 +++++++++++++
+ npsim/stubs.sv       | 220 ++++++++++++++++++++
+ npsim/synth.sh       |  20 ++
+ 9 files changed, 1142 insertions(+)
+ create mode 100644 npsim/.gitignore
+ create mode 100644 npsim/Makefile
+ create mode 100755 npsim/det.sh
+ create mode 100644 npsim/neogeo_sim.cpp
+ create mode 100755 npsim/prep.py
+ create mode 100644 npsim/sdram_chip.sv
+ create mode 100644 npsim/sim_top.sv
+ create mode 100644 npsim/stubs.sv
+ create mode 100755 npsim/synth.sh
+
+diff --git a/npsim/.gitignore b/npsim/.gitignore
+new file mode 100644
+index 0000000..057794e
+--- /dev/null
++++ b/npsim/.gitignore
+@@ -0,0 +1,3 @@
++build/
++obj/
++frame*.ppm
+diff --git a/npsim/Makefile b/npsim/Makefile
+new file mode 100644
+index 0000000..2f72f46
+--- /dev/null
++++ b/npsim/Makefile
+@@ -0,0 +1,53 @@
++# The whole Neo Geo core in Verilator (netplay research/neogeo-aes-netplay.md).
++#
++#   make -C npsim                     build obj/neogeo_sim
++#   obj/neogeo_sim <romset folder> <bios folder> --frames 300 --seed 1
++#   make -C npsim det ROM=<romset folder> BIOS=<bios folder> [FRAMES=200]
++#                                     determinism: the same game with three
++#                                     different DDR3 timings must give the same
++#                                     state checksum in every frame (det.sh)
++#
++# Run neogeo_sim in a folder that holds the 68000's microcode (microrom.mem,
++# nanorom.mem from rtl/cpu/FX68K; det.sh links them).
++#
++# The VHDL (Z80) goes through ghdl in the Docker image hdlc/ghdl:yosys;
++# Verilator runs locally.
++BUILD  := build
++CORE   := $(abspath ..)
++VFLAGS := -O3 --no-timing --no-assert --x-assign 0 --x-initial 0 -Wno-fatal -Wno-WIDTH -Wno-PINMISSING -Wno-UNOPTFLAT \
++          -Wno-CASEINCOMPLETE -Wno-UNUSED -Wno-LATCH -Wno-UNSIGNED -Wno-MULTIDRIVEN -Wno-IMPLICIT \
++          -Wno-SELRANGE -Wno-COMBDLY -Wno-TIMESCALEMOD -Wno-DEFPARAM -Wno-ASCRANGE -Wno-CASEX \
++          -Wno-STMTDLY -Wno-INITIALDLY -Wno-BLKANDNBLK -Wno-SYMRSVDWORD -Wno-PINCONNECTEMPTY \
++          -Wno-CMPCONST -Wno-CASEOVERLAP -Wno-MODDUP -Wno-GENUNNAMED -Wno-PROCASSWIRE \
++          +1364-2005ext+v +1800-2017ext+sv --top-module sim_top \
++          +incdir+$(abspath $(BUILD)) +incdir+$(CORE) +incdir+$(CORE)/rtl/cpu/FX68K
++SIMSRC := sim_top.sv stubs.sv sdram_chip.sv
++GEN    := $(BUILD)/vlog/sdram_sim.sv $(BUILD)/vlog/T80pa.v $(BUILD)/vlog/CEGen.v
++
++all: obj/neogeo_sim
++
++$(BUILD)/files.f: prep.py ../files.qip ../rtl/mem/sdram.sv
++	python3 -I prep.py .. $(BUILD)
++
++$(BUILD)/vlog/sdram_sim.sv: $(BUILD)/files.f
++
++$(BUILD)/vlog/T80pa.v: $(BUILD)/files.f synth.sh
++	./synth.sh
++
++$(BUILD)/vlog/CEGen.v: $(BUILD)/vlog/T80pa.v
++
++lint: $(BUILD)/files.f $(GEN) $(SIMSRC)
++	verilator --lint-only $(VFLAGS) $(SIMSRC) $(GEN) $(CORE)/sys/video_cleaner.sv -f $(BUILD)/files.f
++
++obj/neogeo_sim: $(BUILD)/files.f $(GEN) $(SIMSRC) neogeo_sim.cpp Makefile
++	verilator --cc --exe --build -j 0 $(VFLAGS) -CFLAGS "-O2 -std=c++17" -Mdir obj -o neogeo_sim \
++	  $(SIMSRC) $(GEN) $(CORE)/sys/video_cleaner.sv -f $(BUILD)/files.f neogeo_sim.cpp
++
++FRAMES ?= 200
++det: obj/neogeo_sim
++	./det.sh $(ROM) $(BIOS) $(FRAMES)
++
++clean:
++	rm -rf $(BUILD) obj
++
++.PHONY: all lint det clean
+diff --git a/npsim/det.sh b/npsim/det.sh
+new file mode 100755
+index 0000000..5bf730f
+--- /dev/null
++++ b/npsim/det.sh
+@@ -0,0 +1,74 @@
++#!/usr/bin/env bash
++# Determinism test: the same game, with the same buttons on the same frames, on
++# six "MiSTers" that differ in what a lockstep session cannot control:
++#
++#   a  the reference: DDR3 answers after 12 clocks
++#   b  DDR3 answers after 12 + 0..40 clocks and is busy now and then
++#   c  DDR3 answers after 30 clocks
++#   d  the 48 MHz clock starts one 96 MHz clock later (decided when the PLL
++#      locks), and the reset is released 500,000 clocks of 48 MHz later
++#   e  the reset is released 215,617 clocks of 48 MHz later
++#   f  the core played before (WARM frames), then got the OSD's reset
++#
++# In a lockstep session every frame's checksums of the 68000's and the Z80's
++# writes (s68, sz80) must be the same on all of them, counted from the first
++# frame in which the 68000 runs.
++#
++#   det.sh <romset folder> <bios folder> [frames] [extra neogeo_sim options]
++#   WARM=120 (frames played before the reset in run f)
++#
++# PASS: s68 and sz80 equal to run a's in every frame of every run. Also says
++# where the timing and the picture first differ.
++set -u
++here="$(cd "$(dirname "$0")" && pwd)"
++usage="usage: det.sh <romset folder> <bios folder> [frames]"
++rom="$(realpath "${1:?$usage}")"
++bios="$(realpath "${2:?$usage}")"
++frames="${3:-200}"
++shift; shift; [ $# -gt 0 ] && shift
++sim="$here/obj/neogeo_sim"
++[ -x "$sim" ] || { echo "build it first: make -C $here"; exit 2; }
++work="$here/build/det"
++rm -rf "$work"
++run() {   # name, options...
++	local n=$1; shift
++	mkdir -p "$work/$n"
++	( cd "$work/$n" && ln -sf "$here"/../rtl/cpu/FX68K/microrom.mem "$here"/../rtl/cpu/FX68K/nanorom.mem . &&
++	  "$sim" "$rom" "$bios" --frames "$frames" --play "$@" > out.txt 2> err.txt )
++}
++run a --ddr-lat 12 "$@" &
++run b --ddr-lat 12 --ddr-jit 40 --ddr-busy 20 --seed 1 "$@" &
++run c --ddr-lat 30 "$@" &
++run d --ddr-lat 12 --phase 1000001 "$@" &
++run e --ddr-lat 12 --phase 431234 "$@" &
++run f --ddr-lat 12 --warm "${WARM:-120}" "$@" &
++wait
++for n in a b c d e f; do
++	grep -q '^RESULT' "$work/$n/out.txt" || { echo "FAIL: run $n did not finish:"; tail -3 "$work/$n/out.txt" "$work/$n/err.txt"; exit 1; }
++done
++python3 -I - "$work" <<'PY'
++import sys, re
++work = sys.argv[1]
++what = {"b": "DDR3 jitter", "c": "DDR3 slower", "d": "other clock phase", "e": "reset later", "f": "played before"}
++runs = {}
++for n in "abcdef":
++    r = [dict(re.findall(r"(\w+)=(\w+)", l)) for l in open(f"{work}/{n}/out.txt") if l.startswith("F ")]
++    live = next((i for i, x in enumerate(r) if int(x["c68"]) > 0), len(r))
++    runs[n] = r[live:]          # from the first frame in which the 68000 runs
++a = runs["a"]
++print(f"{len(a)} frames from the 68000's first bus cycle; first frame that differs from run a:")
++print(f"  {'run':22s} {'68000':>6s} {'Z80':>6s} {'timing':>6s} {'picture':>7s}")
++bad = False
++for n in "bcdef":
++    r = runs[n]
++    m = min(len(a), len(r))
++    def first(key):
++        return next((str(i) for i in range(m) if a[i][key] != r[i][key]), "-")
++    s, z = first("s68"), first("sz80")
++    bad |= s != "-" or z != "-"
++    print(f"  {n + ' ' + what[n]:22s} {s:>6s} {z:>6s} {first('time'):>6s} {first('pic'):>7s}")
++if bad:
++    print("FAIL det: the CPUs' writes are not the same on every MiSTer")
++    sys.exit(1)
++print("PASS det: the 68000's and the Z80's writes are the same in all frames of all runs")
++PY
+diff --git a/npsim/neogeo_sim.cpp b/npsim/neogeo_sim.cpp
+new file mode 100644
+index 0000000..c236740
+--- /dev/null
++++ b/npsim/neogeo_sim.cpp
+@@ -0,0 +1,481 @@
++// neogeo_sim.cpp - runs the whole Neo Geo core (sim_top.sv) in Verilator and
++// prints a checksum of what the two CPUs did in every frame.
++//
++//   neogeo_sim <romset folder> <bios folder> [options]
++//     --frames N      frames to run after the reset is released (default 60)
++//     --ddr-lat L     DDR3 read latency in 96 MHz clocks (default 12)
++//     --ddr-jit J     plus 0..J clocks, drawn per read (default 0)
++//     --ddr-busy P    per mille of idle clocks on which DDR3 turns busy for a
++//                     while (another port has the memory) (default 0)
++//     --seed S        seed of the DDR3 timing (default 1)
++//     --phase N       the reset is released N/2 clocks of 48 MHz later (where
++//                     the free-running counters stand at that moment); an odd
++//                     N also starts the 48 MHz clock one 96 MHz clock later
++//                     (which 96 MHz edge the 48 MHz one rises with is decided
++//                     when the PLL locks)
++//     --warm F        play F frames first (with --play's buttons), then reset
++//                     the core (OSD "Reset & apply", no new ROM load) and
++//                     report the frames after that: a core that ran before
++//     --play          press buttons (P1 Start, A, Right; P2 Start, A) on fixed
++//                     frames, the same in every run
++//     --mvs           System Type: Arcade (default: Console, AES)
++//     --bios FILE     system ROM in the bios folder (default uni-bios.rom)
++//     --ppm N         write frame N's picture to frameN.ppm (may repeat)
++//     --quiet         only the summary
++//     --zlog FILE     every write of the Z80 (frame, clock in the frame, port or
++//                     memory, address, data), to compare two runs' streams
++//     --ztrace A B    print the Z80's bus cycles, its NMI and interrupt lines
++//                     and the 68000's accesses to the sound latch ($320000) in
++//                     frames A to B (stderr)
++//
++// The bench is Main_MiSTer for the core: it holds the reset (status bit 0),
++// puts the ROMs into DDR3 and tells the core to copy them, as
++// support/neogeo/neogeo_loader.cpp does for a romset folder in the Darksoft
++// layout (prom, srom, crom0, m1rom, vroma0) without special chips, and it is
++// the DDR3 memory itself. The DDR3's timing is the one thing that differs
++// between two MiSTers here; the SDRAM is the core's own and is modelled
++// exactly (sdram_chip.sv).
++//
++// Per frame (vertical blanking to vertical blanking):
++//   s68    checksum of every write of the 68000 (address, data, strobes), in
++//          order: the game's state. A lockstep session must agree on it.
++//   sz80   the same for the Z80 (memory and port writes): the sound driver
++//   time   both, in the order they happen, with each write's clock within the
++//          frame: any shift in time at all
++//   pic    checksum of the picture
++//   c68    bus cycles of the 68000; w68, wz80: writes of the 68000 and the Z80
++//   zwait / ymwait  48 MHz clocks the Z80 waited for its ROM and the YM2610
++//          stood still for ADPCM data (both DDR3)
++
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++#include <deque>
++#include "Vsim_top.h"
++#include "verilated.h"
++
++static Vsim_top *top;
++static uint64_t clk96_count = 0;
++
++// ---------------------------------------------------------------- DDR3 ----
++// Avalon-MM as the MiSTer framework gives it to a core: 64-bit words, the
++// address in words from 0 (the core adds 0x30000000 >> 3), a command is taken
++// on a clock with BUSY low, read data comes back later with DOUT_READY.
++static const uint32_t DDR_BASE = 0x30000000, DDR_SIZE = 0x10000000;
++static uint8_t *ddr;
++static int ddr_lat = 12, ddr_jit = 0, ddr_busy_pm = 0;
++static uint64_t rng_state = 1;
++static uint32_t rnd()
++{
++	rng_state ^= rng_state << 13; rng_state ^= rng_state >> 7; rng_state ^= rng_state << 17;
++	return (uint32_t)(rng_state >> 16);
++}
++struct Beat { uint64_t at; uint64_t data; };
++static std::deque<Beat> beats;
++static int busy_left = 0;
++static uint64_t ddr_reads = 0, ddr_writes = 0;
++
++static uint64_t ddr_word(uint32_t waddr)
++{
++	uint64_t byte = ((uint64_t)waddr << 3) - DDR_BASE, v = 0;
++	if (byte + 8 <= DDR_SIZE) memcpy(&v, ddr + byte, 8);
++	return v;
++}
++
++// One 96 MHz clock of the memory. sample() is taken before the rising edge
++// (what the core drove, and the BUSY it sees at that edge); after() runs after
++// the edge and sets what the core sees at the next one.
++struct DdrIn { bool we, rd, busy; uint32_t addr; unsigned burst; uint64_t din; uint8_t be; };
++static DdrIn ddr_sample()
++{
++	return { (bool)top->DDRAM_WE, (bool)top->DDRAM_RD, (bool)top->DDRAM_BUSY, top->DDRAM_ADDR, top->DDRAM_BURSTCNT, top->DDRAM_DIN, top->DDRAM_BE };
++}
++static void ddr_after(const DdrIn &s)
++{
++	uint64_t edge = clk96_count - 1;        // the edge that just happened; the next one is clk96_count
++	if (!s.busy)
++	{
++		if (s.we)
++		{
++			uint64_t byte = ((uint64_t)s.addr << 3) - DDR_BASE;
++			if (byte + 8 <= DDR_SIZE)
++				for (int i = 0; i < 8; i++)
++					if (s.be >> i & 1) ddr[byte + i] = (uint8_t)(s.din >> (8 * i));
++			ddr_writes++;
++		}
++		else if (s.rd)
++		{
++			uint64_t at = edge + ddr_lat + (ddr_jit ? rnd() % (ddr_jit + 1) : 0);
++			if (!beats.empty() && at <= beats.back().at) at = beats.back().at + 1;
++			for (unsigned i = 0; i < s.burst; i++) beats.push_back({at + i, ddr_word(s.addr + i)});
++			ddr_reads++;
++		}
++	}
++	top->DDRAM_DOUT_READY = 0;
++	if (!beats.empty() && beats.front().at <= clk96_count)
++	{
++		top->DDRAM_DOUT = beats.front().data;
++		top->DDRAM_DOUT_READY = 1;
++		beats.pop_front();
++	}
++	// busy only while no data is on its way (the core's ddram.sv looks at
++	// nothing while BUSY is high)
++	if (busy_left > 0) busy_left--;
++	else if (beats.empty() && !top->DDRAM_DOUT_READY && ddr_busy_pm && (int)(rnd() % 1000) < ddr_busy_pm)
++		busy_left = 1 + rnd() % 24;
++	top->DDRAM_BUSY = busy_left > 0 && beats.empty() && !top->DDRAM_DOUT_READY;
++}
++
++// -------------------------------------------------------------- monitor ----
++static const uint64_t FNV = 1099511628211ULL;
++struct Frame
++{
++	uint64_t s68 = 14695981039346656037ULL, sz80 = 14695981039346656037ULL, time = 14695981039346656037ULL, pic = 14695981039346656037ULL;
++	uint32_t w68 = 0, wz80 = 0, zwait = 0, ymwait = 0, clocks = 0, c68 = 0, rst = 0;
++};
++static Frame fr;
++static bool prev_w68 = false, prev_wz80 = false, prev_vbl = false, prev_as = false;
++static std::vector<std::vector<uint32_t>> rows;
++static std::vector<uint32_t> row;
++static std::vector<int> ppm_frames;
++static int frame_no = -1;        // -1: before the first vertical blanking after reset
++static bool quiet = false, play = false;
++static int ztrace_a = -1, ztrace_b = -1;
++static FILE *zlog = nullptr;
++static int total_frames = 0;
++static uint64_t all_s68 = 14695981039346656037ULL, all_sz80 = 14695981039346656037ULL, all_time = 14695981039346656037ULL;
++
++static void mix(uint64_t &h, uint64_t v) { h = (h ^ v) * FNV; }
++
++static void event(uint32_t kind, uint32_t addr, uint32_t data)
++{
++	uint64_t e = (uint64_t)kind << 56 | (uint64_t)addr << 24 | data;
++	mix(kind & 0x10 ? fr.sz80 : fr.s68, e);
++	mix(fr.time, e);
++	mix(fr.time, fr.clocks);
++}
++
++static void end_frame()
++{
++	for (auto &r : rows) for (uint32_t p : r) mix(fr.pic, p);
++	if (frame_no >= 0)
++	{
++		mix(all_s68, fr.s68);
++		mix(all_sz80, fr.sz80);
++		mix(all_time, fr.time);
++		if (!quiet)
++			printf("F %4d c68=%-6u w68=%-6u wz80=%-5u s68=%016llx sz80=%016llx time=%016llx pic=%016llx zwait=%u ymwait=%u%s\n", frame_no, fr.c68, fr.w68, fr.wz80,
++			       (unsigned long long)fr.s68, (unsigned long long)fr.sz80, (unsigned long long)fr.time, (unsigned long long)fr.pic, fr.zwait, fr.ymwait,
++			       fr.rst ? " (in reset)" : "");
++		for (int f : ppm_frames)
++			if (f == frame_no && !rows.empty())
++			{
++				size_t w = 0;
++				for (auto &r : rows) if (r.size() > w) w = r.size();
++				char name[64];
++				snprintf(name, sizeof(name), "frame%d.ppm", frame_no);
++				FILE *o = fopen(name, "wb");
++				fprintf(o, "P6 %zu %zu 255\n", w, rows.size());
++				for (auto &r : rows)
++					for (size_t x = 0; x < w; x++)
++					{
++						uint32_t p = x < r.size() ? r[x] : 0;
++						fputc(p >> 16, o); fputc(p >> 8 & 255, o); fputc(p & 255, o);
++					}
++				fclose(o);
++			}
++		fflush(stdout);
++	}
++	rows.clear();
++	row.clear();
++	fr = Frame();
++	frame_no++;
++	total_frames++;
++	if (play)
++	{
++		// the same buttons on the same frames in every run (bits: 0 Right, 4 A, 8 Start)
++		int f = total_frames % 60;
++		top->joystick_0 = (f >= 20 && f < 26 ? 0x100 : 0) | (f >= 40 && f < 43 ? 0x010 : 0) | (f >= 50 && f < 56 ? 0x001 : 0);
++		top->joystick_1 = (f >= 30 && f < 36 ? 0x100 : 0) | (f >= 45 && f < 48 ? 0x010 : 0);
++	}
++}
++
++// --ztrace: one line per bus cycle of the Z80 (at its end, when the data is there)
++static void ztrace()
++{
++	static bool rd = false, wr = false, nmi = false, irq = false, rst = false, as = false;
++	static uint32_t addr = 0, data = 0, a68 = 0, d68 = 0;
++	static bool io = false, rw68 = false;
++	bool r = !top->z80_rd_n && (!top->z80_mreq_n || !top->z80_iorq_n), w = !top->z80_wr_n && (!top->z80_mreq_n || !top->z80_iorq_n);
++	if (r) { addr = top->z80_addr; data = top->z80_din; io = top->z80_mreq_n; }
++	if (rd && !r) fprintf(stderr, "z80 %d.%06u %s %04x -> %02x\n", frame_no, fr.clocks, io ? "in " : "rd ", addr, data);
++	if (w && !wr) fprintf(stderr, "z80 %d.%06u %s %04x <- %02x\n", frame_no, fr.clocks, top->z80_mreq_n ? "out" : "wr ", top->z80_addr, top->z80_dout);
++	rd = r; wr = w;
++	if (!top->z80_nmi_n != nmi) { nmi = !top->z80_nmi_n; fprintf(stderr, "z80 %d.%06u NMI %d\n", frame_no, fr.clocks, nmi); }
++	if (!top->z80_int_n != irq) { irq = !top->z80_int_n; fprintf(stderr, "z80 %d.%06u INT %d\n", frame_no, fr.clocks, irq); }
++	if (!top->z80_reset_n != rst) { rst = !top->z80_reset_n; fprintf(stderr, "z80 %d.%06u RESET %d\n", frame_no, fr.clocks, rst); }
++	bool a = !top->m68k_as_n && (top->m68k_addr & 0xfe0000) == 0x320000;
++	if (a) { a68 = top->m68k_addr; rw68 = top->m68k_rw; d68 = rw68 ? top->m68k_din : top->m68k_dout; }
++	if (as && !a) fprintf(stderr, "68k %d.%06u %s %06x %04x\n", frame_no, fr.clocks, rw68 ? "rd" : "wr", a68, d68);
++	as = a;
++}
++
++// after every rising 48 MHz edge
++static void monitor()
++{
++	fr.clocks++;
++	if (!top->z80_wait_n) fr.zwait++;
++	if (!top->ym_cen_ok) fr.ymwait++;
++	if (!top->core_reset_n) fr.rst++;
++	bool as = !top->m68k_as_n;
++	if (as && !prev_as) fr.c68++;     // a bus cycle of the 68000
++	prev_as = as;
++
++	bool w68 = !top->m68k_rw && !top->m68k_as_n && (!top->m68k_uds_n || !top->m68k_lds_n);
++	if (w68 && !prev_w68)
++	{
++		fr.w68++;
++		event(1 | (!top->m68k_uds_n) << 1 | (!top->m68k_lds_n) << 2, top->m68k_addr, top->m68k_dout);
++	}
++	prev_w68 = w68;
++
++	bool wz = !top->z80_wr_n && (!top->z80_mreq_n || !top->z80_iorq_n);
++	if (wz && !prev_wz80)
++	{
++		fr.wz80++;
++		event(top->z80_iorq_n ? 0x10 : 0x11, top->z80_addr, top->z80_dout);
++		if (zlog && frame_no >= 0) fprintf(zlog, "%d %u %s %04x %02x\n", frame_no, fr.clocks, top->z80_iorq_n ? "wr" : "out", top->z80_addr, top->z80_dout);
++	}
++	prev_wz80 = wz;
++
++	if (top->vid_ce)
++	{
++		if (!top->vid_vblank && !top->vid_hblank) row.push_back(top->vid_r << 16 | top->vid_g << 8 | top->vid_b);
++		else if (!row.empty()) { rows.push_back(row); row.clear(); }
++	}
++	if (frame_no >= ztrace_a && frame_no <= ztrace_b) ztrace();
++	bool vbl = top->vid_vblank;
++	if (vbl && !prev_vbl) end_frame();
++	prev_vbl = vbl;
++}
++
++// --------------------------------------------------------------- clocks ----
++static bool watching = false;
++static bool half = false;      // the next 96 MHz edge is the one where 48 MHz falls
++static void step96()           // one 96 MHz period
++{
++	DdrIn d = ddr_sample();
++	top->clk96 = 1; top->clk48 = !half; top->eval();
++	clk96_count++;
++	ddr_after(d);
++	if (watching && !half) monitor();
++	top->clk96 = 0; top->eval();
++	half = !half;
++}
++static void clk48_cycle() { step96(); step96(); }
++static void run48(int n) { while (n-- > 0) clk48_cycle(); }
++
++// ---------------------------------------------- Main_MiSTer's side (ioctl) ----
++static bool skip_add = false;
++static void io_wait()
++{
++	for (int i = 0; top->ioctl_wait; i++)
++	{
++		clk48_cycle();
++		if (i > 400000000) { fprintf(stderr, "ioctl_wait never ends\n"); exit(2); }
++	}
++}
++static void set_index(int i) { top->ioctl_index = i; run48(4); }
++static void set_download(int on)
++{
++	io_wait();
++	if (on) { top->ioctl_addr = 0; top->ioctl_download = 1; skip_add = true; }
++	else { if (top->ioctl_download) top->ioctl_addr = top->ioctl_addr + 2; top->ioctl_download = 0; }
++	run48(8);
++}
++static void tx_word(uint16_t w)   // FIO_FILE_TX_DAT: one word (WIDE=1), or one byte in its low half
++{
++	io_wait();
++	if (!skip_add) top->ioctl_addr = top->ioctl_addr + 2;
++	skip_add = false;
++	top->ioctl_dout = w;
++	run48(1);
++	top->ioctl_wr = 1;
++	run48(1);
++	top->ioctl_wr = 0;
++	run48(6);
++}
++
++static std::vector<uint8_t> read_file(const std::string &path, bool must = true)
++{
++	std::vector<uint8_t> d;
++	FILE *f = fopen(path.c_str(), "rb");
++	if (!f)
++	{
++		if (must) { fprintf(stderr, "cannot open %s\n", path.c_str()); exit(2); }
++		return d;
++	}
++	fseek(f, 0, SEEK_END);
++	d.resize(ftell(f));
++	fseek(f, 0, SEEK_SET);
++	if (fread(d.data(), 1, d.size(), f) != d.size()) { fprintf(stderr, "cannot read %s\n", path.c_str()); exit(2); }
++	fclose(f);
++	return d;
++}
++
++// neogeo_loader.cpp: fix_convert, spr_convert_dbl
++static void fix_convert(const uint8_t *in, uint8_t *out, uint32_t size)
++{
++	for (uint32_t i = 0; i < size; i++) out[i] = in[(i & ~0x1F) | ((i >> 2) & 7) | ((i & 1) << 3) | (((i & 2) << 3) ^ 0x10)];
++}
++static void spr_convert_dbl(const uint16_t *in, uint16_t *out, uint32_t size)
++{
++	for (uint32_t i = 0; i < size; i++) out[i] = in[(i & ~0x3F) | ((i ^ 1) & 1) | ((i >> 1) & 0x1E) | (((i & 2) ^ 2) << 4)];
++}
++
++enum { NEO_RAW, NEO_FIX, NEO_SPR };
++static uint32_t config = 0;
++static int phase = 0;
++
++static void notify_core(int index, uint32_t size)
++{
++	if (index == 4 || index == 6) size = (size + 0xFFFFF) & ~0xFFFFFu;
++	int memcp = !(index == 9 || (index >= 16 && index < 64));
++	set_index(10);
++	set_download(1);
++	tx_word(index); tx_word((uint16_t)size); tx_word(size >> 16); tx_word(memcp); tx_word(0);
++	set_download(0);
++}
++static void notify_conf()
++{
++	set_index(10);
++	set_download(1);
++	tx_word(0x8000); tx_word((uint16_t)config); tx_word(config >> 16); tx_word(0); tx_word(0);
++	set_download(0);
++}
++// neogeo_tx -> load_rom_to_mem + notify_core
++static uint32_t neogeo_tx(const std::string &dir, const char *name, int type, int index, uint32_t size = 0)
++{
++	std::vector<uint8_t> d = read_file(dir + "/" + name, false);
++	if (d.empty()) return 0;
++	if (size && size < d.size()) d.resize(size);
++	uint32_t map = (index >= 16 && index < 64) ? (index - 16) * 0x80000 : index == 9 ? 0x2000000 : 0x8000000;
++	if (map + d.size() > DDR_SIZE) { fprintf(stderr, "%s does not fit\n", name); exit(2); }
++	size_t pad = (d.size() + 127) & ~(size_t)127;      // the conversions work on whole tiles
++	d.resize(pad);
++	if (type == NEO_FIX) fix_convert(d.data(), ddr + map, (uint32_t)pad);
++	else if (type == NEO_SPR) spr_convert_dbl((const uint16_t *)d.data(), (uint16_t *)(ddr + map), (uint32_t)(pad / 2));
++	else memcpy(ddr + map, d.data(), pad);
++	fprintf(stderr, "  %-12s index %2d, %u bytes\n", name, index, (unsigned)pad);
++	notify_core(index, (uint32_t)pad);
++	return (uint32_t)pad;
++}
++
++static void load_romset(const std::string &rom, const std::string &bios, const char *sysrom)
++{
++	top->status = top->status | 1;     // hold the reset
++	run48(2000);
++	config = 0;
++	notify_conf();
++	if (!neogeo_tx(rom, "prom", NEO_RAW, 4)) { fprintf(stderr, "no prom in %s\n", rom.c_str()); exit(2); }
++	neogeo_tx(rom, "p1rom", NEO_RAW, 4);
++	neogeo_tx(rom, "p2rom", NEO_RAW, 6);
++	neogeo_tx(rom, "srom", NEO_FIX, 8);
++	neogeo_tx(rom, "crom0", NEO_SPR, 15);
++	neogeo_tx(rom, "m1rom", NEO_RAW, 9);
++	neogeo_tx(rom, "vroma0", NEO_RAW, 16);
++	bool vromb = neogeo_tx(rom, "vromb0", NEO_RAW, 48) != 0;
++	if (!vromb) config |= 1u << 23;    // use_pcm
++	if (!neogeo_tx(bios, sysrom, NEO_RAW, 0, 0x20000)) { fprintf(stderr, "no %s in %s\n", sysrom, bios.c_str()); exit(2); }
++	neogeo_tx(bios, "sfix.sfix", NEO_FIX, 2);
++	// 000-lo.lo: straight through ioctl, a byte per word
++	std::vector<uint8_t> lo = read_file(bios + "/000-lo.lo");
++	set_index(1);
++	set_download(1);
++	for (size_t i = 0; i < 0x10000 && i < lo.size(); i++) tx_word(lo[i]);
++	set_download(0);
++	notify_conf();
++	fprintf(stderr, "  loaded after %llu clocks of 96 MHz, config %08x\n", (unsigned long long)clk96_count, config);
++	run48(phase / 2);
++	top->status = top->status & ~1ULL; // release the reset
++}
++
++int main(int argc, char **argv)
++{
++	Verilated::commandArgs(argc, argv);
++	std::string rom, bios;
++	const char *sysrom = "uni-bios.rom";
++	int frames = 60, warm = 0;
++	bool mvs = false;
++	for (int i = 1; i < argc; i++)
++	{
++		std::string a = argv[i];
++		auto num = [&]() { if (i + 1 >= argc) { fprintf(stderr, "%s needs a value\n", a.c_str()); exit(2); } return atoi(argv[++i]); };
++		if (a == "--frames") frames = num();
++		else if (a == "--ddr-lat") ddr_lat = num();
++		else if (a == "--ddr-jit") ddr_jit = num();
++		else if (a == "--ddr-busy") ddr_busy_pm = num();
++		else if (a == "--seed") rng_state = 0x9E3779B97F4A7C15ULL * (uint64_t)(num() + 1);
++		else if (a == "--ppm") ppm_frames.push_back(num());
++		else if (a == "--bios") { if (i + 1 >= argc) return 2; sysrom = argv[++i]; }
++		else if (a == "--mvs") mvs = true;
++		else if (a == "--phase") phase = num();
++		else if (a == "--warm") warm = num();
++		else if (a == "--play") play = true;
++		else if (a == "--quiet") quiet = true;
++		else if (a == "--ztrace") { ztrace_a = num(); ztrace_b = num(); }
++		else if (a == "--zlog") { if (i + 1 >= argc) return 2; zlog = fopen(argv[++i], "w"); }
++		else if (a[0] == '-') { fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
++		else if (rom.empty()) rom = a;
++		else if (bios.empty()) bios = a;
++	}
++	if (rom.empty() || bios.empty() || ddr_lat < 2)
++	{
++		fprintf(stderr, "usage: neogeo_sim <romset folder> <bios folder> [--frames N] [--ddr-lat L] [--ddr-jit J] [--ddr-busy P] [--seed S]\n"
++		                "       [--phase N] [--warm F] [--play] [--mvs] [--bios FILE] [--ppm N] [--quiet]\n");
++		return 2;
++	}
++	ddr = (uint8_t *)calloc(DDR_SIZE, 1);
++	top = new Vsim_top;
++	// Console (AES), UniBIOS, NTSC, memory card unplugged; a 128 MB SDRAM module
++	top->status = (mvs ? 2 : 0) | 1 << 4;
++	top->sdram_sz = 0x8003;
++	top->reset = 1;
++	if (phase & 1) { half = true; step96(); half = false; }   // one 96 MHz clock with 48 MHz still low
++	run48(200);
++	top->reset = 0;
++	run48(8000);                       // the SDRAM's start-up
++
++	fprintf(stderr, "loading %s\n", rom.c_str());
++	load_romset(rom, bios, sysrom);
++	watching = true;
++	uint64_t limit = (uint64_t)(frames + 3) * 900000;     // a frame is about 811,000 clocks of 48 MHz
++	if (warm > 0)
++	{
++		// a session before this one: play, then the OSD's reset (status bit 14)
++		bool q = quiet, pl = play;
++		quiet = true; play = true;
++		for (uint64_t n = 0; frame_no < warm && n < (uint64_t)(warm + 3) * 900000; n++) clk48_cycle();
++		fprintf(stderr, "  warmed up %d frames, reset\n", frame_no);
++		watching = false;
++		top->joystick_0 = 0; top->joystick_1 = 0;
++		top->status = top->status | 1ULL << 14;
++		run48(5000 + phase / 2);
++		top->status = top->status & ~(1ULL << 14);
++		quiet = q; play = pl;
++		frame_no = -1; total_frames = 0; fr = Frame(); rows.clear(); row.clear();
++		prev_w68 = prev_wz80 = prev_as = false; prev_vbl = top->vid_vblank;
++		all_s68 = all_sz80 = all_time = 14695981039346656037ULL;
++		watching = true;
++	}
++	for (uint64_t n = 0; frame_no < frames && n < limit; n++) clk48_cycle();
++	if (frame_no < frames) { printf("FAIL: only %d of %d frames (no vertical blanking?)\n", frame_no < 0 ? 0 : frame_no, frames); return 1; }
++	printf("RESULT frames=%d s68=%016llx sz80=%016llx time=%016llx ddr_reads=%llu ddr_writes=%llu\n", frames, (unsigned long long)all_s68,
++	       (unsigned long long)all_sz80, (unsigned long long)all_time, (unsigned long long)ddr_reads, (unsigned long long)ddr_writes);
++	if (zlog) fclose(zlog);
++	top->final();
++	return 0;
++}
+diff --git a/npsim/prep.py b/npsim/prep.py
+new file mode 100755
+index 0000000..5cc63c4
+--- /dev/null
++++ b/npsim/prep.py
+@@ -0,0 +1,92 @@
++#!/usr/bin/env python3
++"""Prepares the Verilator build of the Neo Geo core (npsim/Makefile runs it).
++
++  prep.py <core dir> <build dir>
++
++- build/files.f: the core's Verilog and SystemVerilog files, taken from the
++  Quartus project (files.qip and the .qip files it names), so the simulation
++  builds what the FPGA build builds. Left out: the VHDL files (the Z80 and the
++  CD clock generator are converted by synth.sh), the PLL, and rtl/mem/sdram.sv.
++- build/vhdl.txt: the VHDL files, for synth.sh.
++- build/vlog/sdram_sim.sv: rtl/mem/sdram.sv with its state machine untouched;
++  only the pins change: the bidirectional data bus (procedural 'Z, which
++  Verilator does not take) becomes two buses to a chip model inside the module
++  (npsim/sdram_chip.sv), and Altera's clock output cell goes away.
++- build/build_id.v: a fixed build date.
++"""
++import os, re, sys
++
++core, build = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
++os.makedirs(os.path.join(build, "vlog"), exist_ok=True)
++
++vlog, vhdl = [], []
++
++
++def qip(path):
++    base = os.path.dirname(path)
++    for line in open(path, encoding="latin-1"):
++        m = re.match(r"\s*set_global_assignment\s+-name\s+(\w+)\s+(.*)", line)
++        if not m:
++            continue
++        kind, arg = m.group(1), m.group(2).strip()
++        j = re.match(r"\[file join \$::quartus\(qip_path\)\s+(\S+)\s*\]", arg)
++        f = os.path.normpath(os.path.join(base, j.group(1) if j else arg))
++        if kind == "QIP_FILE":
++            qip(f)
++        elif kind in ("VERILOG_FILE", "SYSTEMVERILOG_FILE"):
++            vlog.append(f)
++        elif kind == "VHDL_FILE":
++            vhdl.append(f)
++
++
++qip(os.path.join(core, "files.qip"))
++
++skip = {os.path.join(core, "rtl/mem/sdram.sv")}
++vlog = [f for f in vlog if f not in skip]
++for f in vlog + vhdl:
++    if not os.path.isfile(f):
++        sys.exit("prep.py: missing " + f)
++
++with open(os.path.join(build, "files.f"), "w") as o:
++    o.write("\n".join(vlog) + "\n")
++with open(os.path.join(build, "vhdl.txt"), "w") as o:
++    o.write("\n".join(os.path.relpath(f, core) for f in vhdl) + "\n")
++with open(os.path.join(build, "build_id.v"), "w") as o:
++    o.write('`define BUILD_DATE "000000"\n')
++
++# ---- the SDRAM controller for simulation ----
++s = open(os.path.join(core, "rtl/mem/sdram.sv"), encoding="latin-1").read()
++
++
++def rep(old, new, count=1):
++    global s
++    if s.count(old) != count:
++        sys.exit("prep.py: rtl/mem/sdram.sv changed: expected %d of %r, found %d" % (count, old, s.count(old)))
++    s = s.replace(old, new)
++
++
++rep("inout  reg [15:0] SDRAM_DQ,", "inout      [15:0] SDRAM_DQ,    // not used in simulation: the chip is inside\n\t//")
++rep("\tdout <= SDRAM_DQ;\n\tSDRAM_DQ <= 'Z;", "\tdout <= dq_chip;\n\tdq_oe <= 0;")
++rep("SDRAM_DQ   <= saved_data;", "dq_ctl <= saved_data; dq_oe <= 1;")
++rep("SDRAM_DQ      <= cpdin;", "dq_ctl <= cpdin; dq_oe <= 1;")
++i = s.index("altddio_out")
++j = s.index("endmodule", i)
++s = s[:i] + """// simulation: the SDRAM chip (npsim/sdram_chip.sv) instead of the pins
++assign SDRAM_CLK = ~clk;
++reg  [15:0] dq_ctl;
++reg         dq_oe;
++wire [15:0] dq_chip;
++sdram_chip chip_model
++(
++	.clk(clk),
++	.cs_n(SDRAM_nCS), .ras_n(SDRAM_nRAS), .cas_n(SDRAM_nCAS), .we_n(SDRAM_nWE),
++	.a(SDRAM_A), .ba(SDRAM_BA),
++	.dq_in(dq_ctl), .dq_oe(dq_oe), .dq_out(dq_chip)
++);
++
++""" + s[j:]
++if "SDRAM_DQ <=" in s or "<= SDRAM_DQ" in s:
++    sys.exit("prep.py: rtl/mem/sdram.sv still drives or reads SDRAM_DQ")
++with open(os.path.join(build, "vlog/sdram_sim.sv"), "w") as o:
++    o.write("// generated by npsim/prep.py from rtl/mem/sdram.sv\n" + s)
++print("prep.py: %d Verilog files, %d VHDL files" % (len(vlog), len(vhdl)))
+diff --git a/npsim/sdram_chip.sv b/npsim/sdram_chip.sv
+new file mode 100644
+index 0000000..123a955
+--- /dev/null
++++ b/npsim/sdram_chip.sv
+@@ -0,0 +1,55 @@
++// sdram_chip.sv - the SDRAM module behind rtl/mem/sdram.sv, for simulation.
++//
++// Two 32M x 16 chips (the 128 MB MiSTer module: the second chip sees the chip
++// select inverted), CAS latency 2, read bursts of 4 words, single-word writes
++// (the mode the controller sets). Row and column as the controller sends
++// them: word index = {cs, col[9], ba, row, col[8:0]}.
++//
++// The real chip is clocked half a cycle after the controller (its clock is
++// the inverted one). Here it runs on the same edge and sees the controller's
++// registered outputs one clock late, which gives the same data on the same
++// controller clock: a READ sent at edge k is sampled here at k+1, its first
++// word is on dq_out after k+2 and is taken by the controller at k+3.
++module sdram_chip
++(
++	input             clk,
++	input             cs_n, ras_n, cas_n, we_n,
++	input      [12:0] a,
++	input       [1:0] ba,
++	input      [15:0] dq_in,
++	input             dq_oe,
++	output reg [15:0] dq_out
++);
++
++reg [15:0] mem [0:(1<<26)-1];
++
++reg [12:0] row [0:7];        // per chip and bank
++reg [25:0] burst_addr;
++reg  [2:0] burst_left;
++
++wire [2:0] cmd = {ras_n, cas_n, we_n};
++wire [25:0] rw_addr = {cs_n, a[9], ba, row[{cs_n, ba}], a[8:0]};
++
++always @(posedge clk) begin
++	if (burst_left != 0) begin
++		dq_out     <= mem[burst_addr];
++		burst_addr <= {burst_addr[25:2], burst_addr[1:0] + 2'd1};
++		burst_left <= burst_left - 3'd1;
++	end
++
++	case (cmd)
++		3'b011: row[{cs_n, ba}] <= a;                    // ACTIVE
++		3'b101: begin                                    // READ
++			burst_addr <= rw_addr;
++			burst_left <= 3'd4;
++		end
++		3'b100: begin                                    // WRITE
++			if (!a[11]) mem[rw_addr][7:0]  <= dq_in[7:0];
++			if (!a[12]) mem[rw_addr][15:8] <= dq_in[15:8];
++			burst_left <= 0;
++		end
++		default: ;
++	endcase
++end
++
++endmodule
+diff --git a/npsim/sim_top.sv b/npsim/sim_top.sv
+new file mode 100644
+index 0000000..51859d0
+--- /dev/null
++++ b/npsim/sim_top.sv
+@@ -0,0 +1,144 @@
++// sim_top.sv - the whole Neo Geo core (module emu) for Verilator.
++//
++// The bench (neogeo_sim.cpp) gives the two clocks with aligned edges, plays
++// Main_MiSTer's part of a ROM load (status, the ioctl download, DDR3 contents)
++// and is the DDR3 behind DDRAM_*. The SDRAM chip model sits inside the
++// simulation copy of the SDRAM controller (prep.py). The framework's modules
++// are the stubs in stubs.sv, which take their signals from this module's
++// ports.
++//
++// Outputs for the bench: both CPUs' bus signals (the bench makes a checksum of
++// every write, in order), vertical blanking (the frame boundary) and the
++// picture.
++module sim_top
++(
++	input         clk96,
++	input         clk48,          // rises with every second clk96 edge
++	input         reset,
++
++	// hps_io (stubs.sv reads these by name)
++	input  [63:0] status,
++	input  [15:0] joystick_0,
++	input  [15:0] joystick_1,
++	input  [15:0] sdram_sz,
++	input         ioctl_download,
++	input   [7:0] ioctl_index,
++	input         ioctl_wr,
++	input  [26:0] ioctl_addr,
++	input  [15:0] ioctl_dout,
++	output        ioctl_wait,
++
++	// DDR3 (the bench is the memory)
++	input         DDRAM_BUSY,
++	output  [7:0] DDRAM_BURSTCNT,
++	output [28:0] DDRAM_ADDR,
++	input  [63:0] DDRAM_DOUT,
++	input         DDRAM_DOUT_READY,
++	output        DDRAM_RD,
++	output [63:0] DDRAM_DIN,
++	output  [7:0] DDRAM_BE,
++	output        DDRAM_WE,
++
++	// the 68000's bus
++	output [23:0] m68k_addr,
++	output [15:0] m68k_dout,
++	output        m68k_rw, m68k_as_n, m68k_uds_n, m68k_lds_n,
++	// the Z80's bus
++	output [15:0] z80_addr,
++	output  [7:0] z80_dout,
++	output        z80_wr_n, z80_mreq_n, z80_iorq_n,
++	output        z80_rd_n, z80_nmi_n, z80_int_n, z80_reset_n,   // for --ztrace
++	output  [7:0] z80_din,
++	output [15:0] m68k_din,
++	// what the game's timing can depend on
++	output        z80_wait_n,     // the Z80 waits for its ROM (DDR3)
++	output        ym_cen_ok,      // 0: the YM2610 stands still, waiting for ADPCM data (DDR3)
++	output        rom_ready,      // the 68000's ROM word is there (SDRAM)
++	output        core_reset_n,
++
++	// picture and sound
++	output  [7:0] vid_r, vid_g, vid_b,
++	output        vid_ce, vid_hblank, vid_vblank,
++	output [15:0] aud_l, aud_r
++);
++
++wire [45:0] HPS_BUS;
++wire [15:0] SDRAM_DQ;
++wire  [3:0] ADC_BUS;
++wire [12:0] SDRAM_A, VIDEO_ARX, VIDEO_ARY;
++wire  [1:0] SDRAM_BA, LED_POWER, LED_DISK, BUTTONS, AUDIO_MIX, VGA_SL;
++wire  [6:0] USER_OUT;
++wire  [7:0] VGA_R, VGA_G, VGA_B;
++wire        DDRAM_CLK;
++
++emu emu
++(
++	.CLK_50M(clk48),            // only the PLL's reconfiguration runs on it
++	.RESET(reset),
++	.HPS_BUS(HPS_BUS),
++	.CLK_VIDEO(), .CE_PIXEL(),
++	.VIDEO_ARX(VIDEO_ARX), .VIDEO_ARY(VIDEO_ARY),
++	.VGA_R(VGA_R), .VGA_G(VGA_G), .VGA_B(VGA_B),
++	.VGA_HS(), .VGA_VS(), .VGA_DE(), .VGA_F1(), .VGA_SL(VGA_SL),
++	.VGA_SCALER(), .VGA_DISABLE(),
++	.HDMI_WIDTH(12'd1920), .HDMI_HEIGHT(12'd1080),
++	.HDMI_FREEZE(), .HDMI_BLACKOUT(), .HDMI_BOB_DEINT(),
++	.LED_USER(), .LED_POWER(LED_POWER), .LED_DISK(LED_DISK), .BUTTONS(BUTTONS),
++	.CLK_AUDIO(1'b0),
++	.AUDIO_L(aud_l), .AUDIO_R(aud_r), .AUDIO_S(), .AUDIO_MIX(AUDIO_MIX),
++	.ADC_BUS(ADC_BUS),
++	.SD_SCK(), .SD_MOSI(), .SD_MISO(1'b0), .SD_CS(), .SD_CD(1'b1),
++	.DDRAM_CLK(DDRAM_CLK),
++	.DDRAM_BUSY(DDRAM_BUSY),
++	.DDRAM_BURSTCNT(DDRAM_BURSTCNT),
++	.DDRAM_ADDR(DDRAM_ADDR),
++	.DDRAM_DOUT(DDRAM_DOUT),
++	.DDRAM_DOUT_READY(DDRAM_DOUT_READY),
++	.DDRAM_RD(DDRAM_RD),
++	.DDRAM_DIN(DDRAM_DIN),
++	.DDRAM_BE(DDRAM_BE),
++	.DDRAM_WE(DDRAM_WE),
++	.SDRAM_CLK(), .SDRAM_CKE(),
++	.SDRAM_A(SDRAM_A), .SDRAM_BA(SDRAM_BA), .SDRAM_DQ(SDRAM_DQ),
++	.SDRAM_DQML(), .SDRAM_DQMH(),
++	.SDRAM_nCS(), .SDRAM_nCAS(), .SDRAM_nRAS(), .SDRAM_nWE(),
++	.UART_CTS(1'b0), .UART_RTS(), .UART_RXD(1'b0), .UART_TXD(), .UART_DTR(), .UART_DSR(1'b0),
++	.USER_IN(7'h7f), .USER_OUT(USER_OUT),
++	.OSD_STATUS(1'b0)
++);
++
++assign ioctl_wait = (emu.ddr_loading & emu.ddram_wait) | emu.memcp_wait;
++
++assign m68k_addr  = {emu.M68K_ADDR, 1'b0};
++assign m68k_dout  = emu.FX68K_DATAOUT;
++assign m68k_rw    = emu.M68K_RW;
++assign m68k_as_n  = emu.nAS;
++assign m68k_uds_n = emu.nUDS;
++assign m68k_lds_n = emu.nLDS;
++
++assign z80_addr   = emu.Z80_SDA;
++assign z80_dout   = emu.Z80_SDD_OUT;
++assign z80_wr_n   = emu.Z80_nSDWR;
++assign z80_mreq_n = emu.Z80_nMREQ;
++assign z80_iorq_n = emu.nIORQ;
++
++assign z80_rd_n    = emu.Z80_nSDRD;
++assign z80_nmi_n   = emu.Z80_nNMI;
++assign z80_int_n   = emu.Z80_nINT;
++assign z80_reset_n = emu.Z80_nRESET;
++assign z80_din     = emu.SDD_IN;
++assign m68k_din    = emu.FX68K_DATAIN;
++
++assign z80_wait_n   = emu.Z80_nWAIT;
++assign ym_cen_ok    = emu.adpcm_en;
++assign rom_ready    = emu.PROM_DATA_READY;
++assign core_reset_n = emu.nRESET;
++
++assign vid_r      = emu.r;
++assign vid_g      = emu.g;
++assign vid_b      = emu.b;
++assign vid_ce     = emu.ce_pix;
++assign vid_hblank = emu.hblank;
++assign vid_vblank = emu.vblank;
++
++endmodule
+diff --git a/npsim/stubs.sv b/npsim/stubs.sv
+new file mode 100644
+index 0000000..1b6e28f
+--- /dev/null
++++ b/npsim/stubs.sv
+@@ -0,0 +1,220 @@
++// stubs.sv - what stands in for the MiSTer framework and Altera's cells when
++// the whole core (module emu, neogeo.sv) runs in Verilator.
++//
++// The framework's side is driven from the test bench: the stubs take their
++// signals from sim_top's ports by hierarchical name, so the C++ side sets them
++// like any other input.
++
++// ---- block RAM (rtl/mem/dpram.v: dpram, spram, cpram) ----
++// Synchronous read (address registered, output not), both ports. Port B may be
++// narrower than port A (cpram: 64-bit words written, 16-bit words read, the
++// low word first). Starts as zeros, as "power_up_uninitialized = FALSE".
++module altsyncram #(
++	parameter widthad_a = 1, widthad_b = 1, width_a = 1, width_b = 1,
++	parameter numwords_a = 0, numwords_b = 0, width_byteena_a = 1, width_byteena_b = 1,
++	parameter init_file = "", operation_mode = "", intended_device_family = "", lpm_type = "",
++	parameter wrcontrol_wraddress_reg_b = "", address_reg_b = "", indata_reg_b = "", address_aclr_b = "",
++	parameter clock_enable_input_a = "", clock_enable_input_b = "",
++	parameter clock_enable_output_a = "", clock_enable_output_b = "",
++	parameter outdata_aclr_a = "", outdata_aclr_b = "", outdata_reg_a = "", outdata_reg_b = "",
++	parameter power_up_uninitialized = "", read_during_write_mode_mixed_ports = "",
++	parameter read_during_write_mode_port_a = "", read_during_write_mode_port_b = ""
++)
++(
++	input  [widthad_a-1:0] address_a,
++	input  [widthad_b-1:0] address_b,
++	input                  clock0, clock1,
++	input    [width_a-1:0] data_a,
++	input    [width_b-1:0] data_b,
++	input                  wren_a, wren_b,
++	output   [width_a-1:0] q_a,
++	output   [width_b-1:0] q_b,
++	input                  aclr0, aclr1, addressstall_a, addressstall_b,
++	input                  byteena_a, byteena_b,
++	input                  clocken0, clocken1, clocken2, clocken3,
++	output           [2:0] eccstatus,
++	input                  rden_a, rden_b
++);
++
++localparam RATIO = width_a / width_b;        // 1, or 4 for cpram
++localparam SUB   = widthad_b - widthad_a;    // address bits inside a port A word
++
++reg [width_a-1:0] mem [0:(1<<widthad_a)-1];
++reg [widthad_a-1:0] ra;
++reg [widthad_b-1:0] rb;
++
++// port B's clock: clock1 where the instance uses it, else clock0 (cpram)
++wire clkb = (address_reg_b == "CLOCK1") ? clock1 : clock0;
++
++integer i;
++initial begin
++	for (i = 0; i < (1<<widthad_a); i = i + 1) mem[i] = '0;
++	if (outdata_reg_a == "CLOCK0" || outdata_reg_b == "CLOCK1" || outdata_reg_b == "CLOCK0") begin
++		$display("altsyncram stub: registered outputs are not modelled");
++		$finish;
++	end
++end
++
++always @(posedge clock0) begin
++	if (wren_a) mem[address_a] <= data_a;
++	ra <= address_a;
++end
++assign q_a = mem[ra];
++
++generate
++	if (RATIO == 1) begin : same
++		always @(posedge clkb) begin
++			if (wren_b) mem[address_b] <= data_b;
++			rb <= address_b;
++		end
++		assign q_b = mem[rb];
++	end
++	else begin : narrow
++		always @(posedge clkb) rb <= address_b;
++		wire [width_a-1:0] w = mem[rb[widthad_b-1:SUB]];
++		assign q_b = w[rb[SUB-1:0] * width_b +: width_b];
++	end
++endgenerate
++
++assign eccstatus = 0;
++
++endmodule
++
++// ---- the PLL: 96 and 48 MHz come from the test bench, edges aligned ----
++module pll
++(
++	input         refclk,
++	input         rst,
++	output        outclk_0,
++	output        outclk_1,
++	input  [63:0] reconfig_to_pll,
++	output [63:0] reconfig_from_pll,
++	output        locked
++);
++assign outclk_0 = sim_top.clk96;
++assign outclk_1 = sim_top.clk48;
++assign reconfig_from_pll = 0;
++assign locked = 1;
++endmodule
++
++module pll_cfg
++(
++	input         mgmt_clk,
++	input         mgmt_reset,
++	output        mgmt_waitrequest,
++	input         mgmt_read,
++	output [31:0] mgmt_readdata,
++	input         mgmt_write,
++	input   [5:0] mgmt_address,
++	input  [31:0] mgmt_writedata,
++	output [63:0] reconfig_to_pll,
++	input  [63:0] reconfig_from_pll
++);
++assign mgmt_waitrequest = 0;
++assign mgmt_readdata = 0;
++assign reconfig_to_pll = 0;
++endmodule
++
++// ---- hps_io: status, controllers and the file download, from the bench ----
++module hps_io #(parameter CONF_STR = "", parameter WIDE = 0, parameter VDNUM = 1)
++(
++	input         clk_sys,
++	inout  [45:0] HPS_BUS,
++	output        forced_scandoubler,
++	output [15:0] joystick_0, joystick_1, joystick_2, joystick_3,
++	output  [8:0] spinner_0, spinner_1,
++	output [24:0] ps2_mouse,
++	output  [1:0] buttons,
++	output [10:0] ps2_key,
++	output [63:0] status,
++	input  [15:0] status_menumask,
++	output [64:0] RTC,
++	output [15:0] sdram_sz,
++	output [21:0] gamma_bus,
++	output        ioctl_wr,
++	output [26:0] ioctl_addr,
++	output [15:0] ioctl_dout,
++	output        ioctl_download,
++	output  [7:0] ioctl_index,
++	input         ioctl_wait,
++	input  [31:0] sd_lba[VDNUM],
++	input   [VDNUM-1:0] sd_rd,
++	input   [VDNUM-1:0] sd_wr,
++	output  [VDNUM-1:0] sd_ack,
++	output  [7:0] sd_buff_addr,
++	output [15:0] sd_buff_dout,
++	input  [15:0] sd_buff_din[VDNUM],
++	output        sd_buff_wr,
++	output  [VDNUM-1:0] img_mounted,
++	output        img_readonly,
++	output [63:0] img_size,
++	inout  [35:0] EXT_BUS
++);
++assign forced_scandoubler = 0;
++assign joystick_0 = sim_top.joystick_0;
++assign joystick_1 = sim_top.joystick_1;
++assign joystick_2 = 0;
++assign joystick_3 = 0;
++assign spinner_0 = 0;
++assign spinner_1 = 0;
++assign ps2_mouse = 0;
++assign buttons = 0;
++assign ps2_key = 0;
++assign status = sim_top.status;
++assign RTC = 0;
++assign sdram_sz = sim_top.sdram_sz;
++assign gamma_bus = 0;
++assign ioctl_wr = sim_top.ioctl_wr;
++assign ioctl_addr = sim_top.ioctl_addr;
++assign ioctl_dout = sim_top.ioctl_dout;
++assign ioctl_download = sim_top.ioctl_download;
++assign ioctl_index = sim_top.ioctl_index;
++assign sd_ack = 0;
++assign sd_buff_addr = 0;
++assign sd_buff_dout = 0;
++assign sd_buff_wr = 0;
++assign img_mounted = 0;
++assign img_readonly = 0;
++assign img_size = 0;
++// the CD's extension bus: nobody talks
++assign EXT_BUS[34:33] = 2'b00;
++assign EXT_BUS[31:16] = 16'd0;
++endmodule
++
++// ---- video: the core's own picture goes straight through ----
++module video_mixer #(parameter LINE_LENGTH = 768, parameter HALF_DEPTH = 0, parameter GAMMA = 0)
++(
++	input            CLK_VIDEO,
++	output           CE_PIXEL,
++	input            ce_pix,
++	input            scandoubler,
++	input            hq2x,
++	output           freeze_sync,
++	input      [7:0] R, G, B,
++	input            HSync, VSync, HBlank, VBlank,
++	output     [7:0] VGA_R, VGA_G, VGA_B,
++	output           VGA_VS, VGA_HS, VGA_DE
++);
++assign CE_PIXEL = ce_pix;
++assign freeze_sync = 0;
++assign {VGA_R, VGA_G, VGA_B} = {R, G, B};
++assign VGA_VS = VSync;
++assign VGA_HS = HSync;
++assign VGA_DE = ~(HBlank | VBlank);
++endmodule
++
++module video_freak
++(
++	input             CLK_VIDEO,
++	input             VGA_DE_IN,
++	output            VGA_DE,
++	output     [12:0] VIDEO_ARX,
++	output     [12:0] VIDEO_ARY,
++	input      [11:0] ARX, ARY, CROP_SIZE,
++	input       [4:0] CROP_OFF,
++	input       [2:0] SCALE
++);
++assign VGA_DE = VGA_DE_IN;
++assign VIDEO_ARX = {1'b0, ARX};
++assign VIDEO_ARY = {1'b0, ARY};
++endmodule
+diff --git a/npsim/synth.sh b/npsim/synth.sh
+new file mode 100755
+index 0000000..9722f20
+--- /dev/null
++++ b/npsim/synth.sh
+@@ -0,0 +1,20 @@
++#!/usr/bin/env bash
++# The core's VHDL (the Z80 T80pa, the CD's CEGen) -> Verilog for Verilator,
++# with ghdl synth in the Docker image hdlc/ghdl:yosys. build/vhdl.txt (prep.py)
++# lists the files in the order of the Quartus project.
++set -u
++cd "$(dirname "$0")"
++mkdir -p build/vlog build/ghdl
++t80=$(grep -i '/T80' build/vhdl.txt | sed 's|^|/src/|' | tr '\n' ' ')
++# analysis order: the package first, the wrapper last
++order=""
++for f in T80_Pack T80_Reg T80_MCode T80_ALU T80 T80pa; do
++	for g in $t80; do [ "$(basename "$g" .vhd)" = "$f" ] && order="$order $g"; done
++done
++ceg=$(grep -i 'CEGen' build/vhdl.txt | sed 's|^|/src/|')
++docker run --rm -u "$(id -u):$(id -g)" -v "$PWD/..":/src:ro -v "$PWD/build":/out -w /out hdlc/ghdl:yosys sh -c "
++  ghdl synth --std=08 -fsynopsys -frelaxed --workdir=/out/ghdl --out=verilog $order -e T80pa > /out/vlog/T80pa.v 2> /out/vlog/T80pa.log || exit 1
++  ghdl synth --std=08 -fsynopsys -frelaxed --workdir=/out/ghdl --out=verilog $ceg -e CEGen > /out/vlog/CEGen.v 2> /out/vlog/CEGen.log || exit 1"
++rc=$?
++grep -h error build/vlog/T80pa.log build/vlog/CEGen.log | sort -u | head -20
++[ $rc -eq 0 ] && grep -q '^module T80pa' build/vlog/T80pa.v && grep -q '^module CEGen' build/vlog/CEGen.v
+-- 
+2.43.0
+

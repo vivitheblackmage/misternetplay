@@ -1,0 +1,443 @@
+From 9a8350fcacf7a8bdce947643ef4f6d67ac16fdf0 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 14 Nov 2026 20:29:53 +0100
+Subject: [PATCH] netplay: the session starts at a vertical blank and after the
+ save file is in (both moved the machine's first frame between MiSTers: DESYNC
+ at frame 8 and 11 on hardware); per-frame diagnostics in the mailbox (DBG);
+ bench: save file (--sd), garbage in memory (--fill), RTC (--rtc)
+---
+ neogeo.sv                     | 21 +++++++++++--
+ npsim/det.sh                  | 17 ++++++----
+ npsim/neogeo_sim.cpp          | 32 +++++++++++++++++++
+ npsim/sdram_chip.sv           | 14 +++++++++
+ npsim/sim_top.sv              |  1 +
+ npsim/stubs.sv                | 37 +++++++++++++++++-----
+ rtl/netplay/neogeo_netplay.sv | 59 +++++++++++++++++++++++++++++++++--
+ 7 files changed, 163 insertions(+), 18 deletions(-)
+
+diff --git a/neogeo.sv b/neogeo.sv
+index 72e8265..3e986d1 100644
+--- a/neogeo.sv
++++ b/neogeo.sv
+@@ -38,7 +38,7 @@
+ 
+ module emu
+ (
+-	`include "sys/emu_ports.vh"
++	`include "sys/emu_ports.vh"
+ );
+ 
+ assign ADC_BUS  = 'Z;
+@@ -533,18 +533,32 @@ wire CHBL, nBNKB, VCS;
+ reg  np_w68;
+ wire np_w68_now = ~M68K_RW & ~nAS & ~(nUDS & nLDS);
+ always @(posedge CLK_48M) np_w68 <= np_w68_now;
++// diagnostics: every write of the Z80, in its first clock; the Z80 waiting for
++// the SDRAM, the YM2610's ADPCM data late (assigned where those are)
++wire np_dbg_zwait, np_dbg_late;
++wire np_bk_loading;                   // the core reads the save file (assigned below)
++reg  np_wz80;
++wire np_wz80_now = ~nSDWR & (~nMREQ | ~nIORQ);
++always @(posedge CLK_48M) np_wz80 <= np_wz80_now;
+ 
+ neogeo_netplay NETPLAY
+ (
+ 	.clk(CLK_48M),
+ 	.reset(RESET),
+-	.downloading(status[0] | ioctl_download),
++	// the save file's loading (bk_loading) resets the machine too: a session
++	// starts after it, or the machine would leave reset later on one MiSTer
++	.downloading(status[0] | ioctl_download | np_bk_loading),
+ 	.vblank(~nBNKB),
+ 	.machine_run(nRESET),
+ 	.st_en(np_w68_now & ~np_w68),
+ 	.st({M68K_ADDR[23:1], nUDS, FX68K_DATAOUT}),
+ 	// this side's player 1, the combination buttons folded in
+ 	.local_joy({joystick_0_hps[11:8], joystick_0_hps[7:4] | {{2{joystick_0_hps[13]}}, {2{joystick_0_hps[12]}}}, joystick_0_hps[3:0]}),
++	.dbg_tick(CLK_EN_24M_P),
++	.dbg_z80_en(np_wz80_now & ~np_wz80),
++	.dbg_z80({~nIORQ, SDA, SDD_OUT}),
++	.dbg_zwait(np_dbg_zwait),
++	.dbg_late(np_dbg_late),
+ 	.rfsh_req(np_rfsh),
+ 	.active(np_active),
+ 	.hold_reset(np_hold_reset),
+@@ -652,6 +666,7 @@ end
+ wire bk_load    = status[21];
+ wire bk_save    = status[12] | (bk_autosave & OSD_STATUS);
+ reg  bk_loading = 0;
++assign np_bk_loading = bk_loading;
+ reg  bk_state   = 0;
+ 
+ always @(posedge clk_sys) begin
+@@ -1692,6 +1707,7 @@ wire M1_READY;
+ wire z80_rom_rd = ~(nSDMRD | nSDROM | SYSTEM_CDx);
+ 
+ wire Z80_nWAIT = M1_READY;
++assign np_dbg_zwait = CLK_EN_4M_P & ~Z80_nWAIT;
+ 
+ cpu_z80 Z80CPU(
+ 	.CLK(CLK_48M),
+@@ -1771,6 +1787,7 @@ reg [7:0] ADPCMA_ACK_COUNTER;
+ reg [10:0] ADPCMB_ACK_COUNTER;
+ wire ADPCMA_DATA_READY = ~((ADPCMA_READ_REQ ^ ADPCMA_READ_ACK) & (ADPCMA_ACK_COUNTER == 8'd0));
+ wire ADPCMB_DATA_READY = ~((ADPCMB_READ_REQ ^ ADPCMB_READ_ACK) & (ADPCMB_ACK_COUNTER == 11'd0));
++assign np_dbg_late = (CLK_EN_4M_P | CLK_EN_4M_N) & ~(ADPCMA_DATA_READY & ADPCMB_DATA_READY);
+ 
+ reg OLD_CD_TR_RD_PCM;
+ reg ADPCMA_RD_DTACK, ADPCMA_RD_WAIT;
+diff --git a/npsim/det.sh b/npsim/det.sh
+index 1b52358..e87c441 100755
+--- a/npsim/det.sh
++++ b/npsim/det.sh
+@@ -10,6 +10,11 @@
+ #   e  the session starts 20 frames later; 10 % of the input up to 6 frames late
+ #      (long holds: the SDRAM is refreshed in them)
+ #   f  DDR3 with jitter, another seed; 50 % of the input up to a frame late
++# Every run but d starts with other garbage in DDR3 and the SDRAM (--fill),
++# as a MiSTer that ran another core or game before, and d with zeros; a, b, c, e
++# get other times from Main (--rtc), d and f none. All but f have a save file
++# that the core reads after the load (--sd), Main answering each sector after
++# another time (so it is still going on when the session starts, or not).
+ # (The bench writes INPUT[k] one frame ahead; input later than that holds the
+ # machine at the frame start.)
+ #
+@@ -39,12 +44,12 @@ run() {   # name, options...
+ 	( cd "$work/$n" && ln -sf "$here"/../rtl/cpu/FX68K/microrom.mem "$here"/../rtl/cpu/FX68K/nanorom.mem . &&
+ 	  "$sim" "$rom" "$bios" --frames "$frames" --session "$@" > out.txt 2> err.txt )
+ }
+-run a --ddr-lat 12 "$@" &
+-run b --ddr-lat 12 --ddr-jit 40 --ddr-busy 20 --seed 1 --stall 100 1600000 "$@" &
+-run c --ddr-lat 30 --seed 2 --stall 300 1200000 "$@" &
+-run d --ddr-lat 12 --phase 1 --start-delay 1600000 --seed 3 --stall 50 800000 "$@" &
+-run e --ddr-lat 12 --start-delay 16000000 --seed 4 --stall 100 4800000 "$@" &
+-run f --ddr-lat 12 --ddr-jit 40 --ddr-busy 20 --seed 7 --stall 500 800000 "$@" &
++run a --ddr-lat 12 --fill 1 --rtc 08020261114170957 --sd 2000 "$@" &
++run b --ddr-lat 12 --ddr-jit 40 --ddr-busy 20 --seed 1 --stall 100 1600000 --fill 2 --rtc 08020261114170951 --sd 20000 "$@" &
++run c --ddr-lat 30 --seed 2 --stall 300 1200000 --fill 3 --rtc 08040260803092301 --sd 60000 "$@" &
++run d --ddr-lat 12 --phase 1 --start-delay 1600000 --seed 3 --stall 50 800000 --sd 0 "$@" &
++run e --ddr-lat 12 --start-delay 16000000 --seed 4 --stall 100 4800000 --fill 5 --rtc 08070201231235959 --sd 40000 "$@" &
++run f --ddr-lat 12 --ddr-jit 40 --ddr-busy 20 --seed 7 --stall 500 800000 --fill 6 "$@" &
+ wait
+ for n in a b c d e f; do
+ 	grep -q '^RESULT' "$work/$n/out.txt" || { echo "FAIL: run $n did not finish:"; tail -n 3 "$work/$n/out.txt" "$work/$n/err.txt"; exit 1; }
+diff --git a/npsim/neogeo_sim.cpp b/npsim/neogeo_sim.cpp
+index 60a4ae9..925d3fd 100644
+--- a/npsim/neogeo_sim.cpp
++++ b/npsim/neogeo_sim.cpp
+@@ -27,6 +27,13 @@
+ //     --start-delay C the session starts C clocks of 48 MHz after the core is armed
+ //     --stall P M     per mille of the frames whose INPUT comes up to M clocks late
+ //                     (the core holds the machine until it is there)
++//     --fill S        DDR3 and the SDRAM start with garbage (seed S), as on a
++//                     MiSTer that ran another core or game before; default zero
++//     --sd N          a save file is mounted at the end of the load, and the core
++//                     reads it (its backup RAM and memory card, 72 KB), each
++//                     sector answered N clocks after the request (Main_MiSTer
++//                     answers from its main loop); default: no save file
++//     --rtc H         the time Main_MiSTer gives the core (hps_io's RTC word, hex)
+ //     --mvs           System Type: Arcade (default: Console, AES)
+ //     --no-netplay    OSD Netplay: Off (default: Host)
+ //     --bios FILE     system ROM in the bios folder (default uni-bios.rom)
+@@ -84,6 +91,7 @@ static uint64_t clk96_count = 0;
+ // Avalon-MM as the MiSTer framework gives it to a core: 64-bit words, the
+ // address in words from 0 (the core adds 0x30000000 >> 3), a command is taken
+ // on a clock with BUSY low, read data comes back later with DOUT_READY.
++static int sd_lat = -1;
+ static const uint32_t DDR_BASE = 0x30000000, DDR_SIZE = 0x10000000;
+ static uint8_t *ddr;
+ static int ddr_lat = 12, ddr_jit = 0, ddr_busy_pm = 0;
+@@ -528,12 +536,15 @@ static void load_romset(const std::string &rom, const std::string &bios, const c
+ 	set_download(0);
+ 	notify_conf();
+ 	fprintf(stderr, "  loaded after %llu clocks of 96 MHz, config %08x\n", (unsigned long long)clk96_count, config);
++	if (sd_lat >= 0) { top->sd_mount = 1; run48(4); top->sd_mount = 0; run48(100); }   // the save file, as Main mounts it
+ 	run48(phase / 2);
+ 	top->status = top->status & ~1ULL; // release the reset
+ }
+ 
+ int main(int argc, char **argv)
+ {
++	int fill = -1;
++	std::vector<std::string> plus;
+ 	Verilated::commandArgs(argc, argv);
+ 	std::string rom, bios;
+ 	const char *sysrom = "uni-bios.rom";
+@@ -561,6 +572,9 @@ int main(int argc, char **argv)
+ 		else if (a == "--quiet") quiet = true;
+ 		else if (a == "--ztrace") { ztrace_a = num(); ztrace_b = num(); }
+ 		else if (a == "--snap") { if (i + 1 >= argc) return 2; snap_file = argv[++i]; }
++		else if (a == "--sd") { sd_lat = num(); plus.push_back("+sdlat=" + std::to_string(sd_lat)); }
++		else if (a == "--fill") { fill = num(); plus.push_back("+fill=" + std::to_string(fill)); }
++		else if (a == "--rtc") { if (i + 1 >= argc) return 2; plus.push_back(std::string("+rtc=") + argv[++i]); }
+ 		else if (a == "--zlog") { if (i + 1 >= argc) return 2; zlog = fopen(argv[++i], "w"); }
+ 		else if (a[0] == '-') { fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
+ 		else if (rom.empty()) rom = a;
+@@ -573,6 +587,17 @@ int main(int argc, char **argv)
+ 		return 2;
+ 	}
+ 	ddr = (uint8_t *)calloc(DDR_SIZE, 1);
++	if (fill >= 0)
++	{
++		uint64_t x = 0x9E3779B97F4A7C15ULL * (uint64_t)(fill + 11);
++		for (size_t i = 0; i < DDR_SIZE; i += 8) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; memcpy(ddr + i, &x, 8); }
++		memset(ddr + (0x3FC00000 - DDR_BASE), 0, 0x10000);   // the mailbox: the bench's thread trusts the rings (Main_MiSTer checks the frame tags)
++	}
++	{
++		std::vector<const char *> pa;
++		for (auto &p : plus) pa.push_back(p.c_str());
++		if (!pa.empty()) Verilated::commandArgsAdd((int)pa.size(), pa.data());
++	}
+ #if VM_TRACE
+ 	Verilated::traceEverOn(true);
+ #else
+@@ -621,6 +646,13 @@ int main(int argc, char **argv)
+ 		printf("SESSION state=%u error=%u stalls=%u frame=%u ran=%u hold_max=%llu long_holds=%llu\n", (unsigned)(st >> 24) & 7,
+ 		       (unsigned)(st >> 16) & 255, (unsigned)st & 0xFFFF, (unsigned)(st >> 32), (unsigned)(st >> 27) & 1,
+ 		       (unsigned long long)hold_max, (unsigned long long)holds_long);
++		// the module's diagnostics (DBG), as Main_MiSTer logs them on a MiSTer
++		for (int f = 0; f < 128 && f + 1 < frames; f++)
++		{
++			uint64_t w0 = mb_read(0x2800 + 16 * f), w1 = mb_read(0x2808 + 16 * f);
++			printf("D %3d zcrc=%08x ticks=%u zwait=%u late=%u nz80=%u n68=%u\n", f, (unsigned)(w0 >> 32), (unsigned)w0,
++			       (unsigned)(w1 >> 48), (unsigned)(w1 >> 32) & 0xFFFF, (unsigned)(w1 >> 16) & 0xFFFF, (unsigned)w1 & 0xFFFF);
++		}
+ 	}
+ 	printf("RESULT frames=%d s68=%016llx sz80=%016llx time=%016llx ddr_reads=%llu ddr_writes=%llu\n", frames, (unsigned long long)all_s68,
+ 	       (unsigned long long)all_sz80, (unsigned long long)all_time, (unsigned long long)ddr_reads, (unsigned long long)ddr_writes);
+diff --git a/npsim/sdram_chip.sv b/npsim/sdram_chip.sv
+index 123a955..8529937 100644
+--- a/npsim/sdram_chip.sv
++++ b/npsim/sdram_chip.sv
+@@ -23,6 +23,20 @@ module sdram_chip
+ 
+ reg [15:0] mem [0:(1<<26)-1];
+ 
++// +fill=S: the chips start with garbage (seed S), as a real SDRAM does after
++// another core or a power-on; without it they start at zero
++initial begin
++	int unsigned seed;
++	logic [31:0] x;
++	if ($value$plusargs("fill=%d", seed)) begin
++		x = seed * 32'h9E3779B9 + 32'h7F4A7C15;
++		for (int i = 0; i < (1 << 26); i++) begin
++			x = x * 32'd1664525 + 32'd1013904223;
++			mem[i] = x[31:16];
++		end
++	end
++end
++
+ reg [12:0] row [0:7];        // per chip and bank
+ reg [25:0] burst_addr;
+ reg  [2:0] burst_left;
+diff --git a/npsim/sim_top.sv b/npsim/sim_top.sv
+index b296b54..b7a5fd7 100644
+--- a/npsim/sim_top.sv
++++ b/npsim/sim_top.sv
+@@ -18,6 +18,7 @@ module sim_top
+ 
+ 	// hps_io (stubs.sv reads these by name)
+ 	input  [63:0] status,
++	input         sd_mount,       // Main_MiSTer mounts the game's save file (pulse)
+ 	input  [15:0] joystick_0,
+ 	input  [15:0] joystick_1,
+ 	input  [15:0] sdram_sz,
+diff --git a/npsim/stubs.sv b/npsim/stubs.sv
+index 1b6e28f..0c1f9b4 100644
+--- a/npsim/stubs.sv
++++ b/npsim/stubs.sv
+@@ -161,7 +161,10 @@ assign ps2_mouse = 0;
+ assign buttons = 0;
+ assign ps2_key = 0;
+ assign status = sim_top.status;
+-assign RTC = 0;
++// +rtc=H: the time Main_MiSTer gives the core (hps_io's RTC word, hex); default 0
++logic [64:0] rtc_v = 65'd0;
++initial void'($value$plusargs("rtc=%h", rtc_v));
++assign RTC = rtc_v;
+ assign sdram_sz = sim_top.sdram_sz;
+ assign gamma_bus = 0;
+ assign ioctl_wr = sim_top.ioctl_wr;
+@@ -169,13 +172,33 @@ assign ioctl_addr = sim_top.ioctl_addr;
+ assign ioctl_dout = sim_top.ioctl_dout;
+ assign ioctl_download = sim_top.ioctl_download;
+ assign ioctl_index = sim_top.ioctl_index;
+-assign sd_ack = 0;
+-assign sd_buff_addr = 0;
+-assign sd_buff_dout = 0;
+-assign sd_buff_wr = 0;
+-assign img_mounted = 0;
++// The save file (+sdlat=N, neogeo_sim --sd N): Main_MiSTer mounts it at the end
++// of a ROM load and answers each sector the core reads N clocks after the
++// request, as its main loop gets to it; 256 words of zeros (a new save)
++int unsigned sd_lat = 0;
++bit          sd_on = 1'b0;
++initial sd_on = $value$plusargs("sdlat=%d", sd_lat);
++reg          sd_ack_r = 1'b0, sd_wr_r = 1'b0;
++reg    [7:0] sd_addr_r = 8'd0;
++reg    [1:0] sd_ph = 2'd0;
++int unsigned sd_t = 0;
++always @(posedge clk_sys) begin
++	sd_wr_r <= 1'b0;
++	case (sd_ph)
++		2'd0: if (sd_on && sd_rd[0]) begin sd_t <= sd_lat; sd_ph <= 2'd1; end
++		2'd1: if (sd_t != 0) sd_t <= sd_t - 1; else begin sd_ack_r <= 1'b1; sd_addr_r <= 8'd0; sd_ph <= 2'd2; end
++		2'd2: begin sd_wr_r <= 1'b1; sd_ph <= 2'd3; end
++		2'd3: if (sd_addr_r == 8'd255) begin sd_ack_r <= 1'b0; sd_ph <= 2'd0; end
++		      else begin sd_addr_r <= sd_addr_r + 8'd1; sd_ph <= 2'd2; end
++	endcase
++end
++assign sd_ack = {VDNUM{sd_ack_r}} & 1;
++assign sd_buff_addr = sd_addr_r;
++assign sd_buff_dout = 16'd0;
++assign sd_buff_wr = sd_wr_r;
++assign img_mounted = {VDNUM{sd_on & sim_top.sd_mount}} & 1;
+ assign img_readonly = 0;
+-assign img_size = 0;
++assign img_size = sd_on ? 64'h12000 : 64'd0;
+ // the CD's extension bus: nobody talks
+ assign EXT_BUS[34:33] = 2'b00;
+ assign EXT_BUS[31:16] = 16'd0;
+diff --git a/rtl/netplay/neogeo_netplay.sv b/rtl/netplay/neogeo_netplay.sv
+index 831455a..5680776 100644
+--- a/rtl/netplay/neogeo_netplay.sv
++++ b/rtl/netplay/neogeo_netplay.sv
+@@ -12,6 +12,9 @@
+ //   LOCAL  +0x1000  256 entries {f[11:0], sess, joy[11:0]} in both halves
+ //   CRC    +0x1800  256 entries {f[15:0], crc half} in both halves
+ //   INPUT  +0x2000  256 entries {f[11:0], sess, p2 / p1 joy[11:0]}
++//   DBG    +0x2800  frames 0-127 of a session, two words each (diagnostics,
++//                   not part of the protocol): {Z80 write CRC, machine clocks},
++//                   {Z80 wait samples, late ADPCM samples, Z80 writes, 68000 writes}
+ //
+ // Joy words (active high): 3:0 Right Left Down Up, 7:4 A B C D, 8 Start,
+ // 9 Select, 10 Coin, 11 the core's bit 11 (A+B+C).
+@@ -30,8 +33,9 @@
+ // Session start (SPEC.md 14.2). The machine must start a session as it is
+ // after the FPGA was loaded. Main_MiSTer arms netplay (CTRL enable) before it
+ // loads the ROM set, and the module keeps the machine in reset from then
+-// until the session starts (ARMED, PRIME): reset is released in the clock in
+-// which INPUT[0] and INPUT[1] are in hand, and frame 0 starts there. `ran`
++// until the session starts (ARMED, PRIME): reset is released at the first
++// start of a vertical blank with INPUT[0] and INPUT[1] in hand and no load
++// going on (the save file's included), and frame 0 starts there. `ran`
+ // tells Main_MiSTer that the machine has run since the FPGA was loaded: then
+ // it loads the core again first.
+ //
+@@ -59,6 +63,12 @@ module neogeo_netplay #(
+ 	input             st_en,          // a step of the game state: a write of the 68000
+ 	input      [39:0] st,             // {address, data}
+ 	input      [11:0] local_joy,      // this side's player 1 controls, active high
++	// diagnostics (the DBG area): counted per frame of the session
++	input             dbg_tick,       // a clock of the machine (one of its 24 MHz pair)
++	input             dbg_z80_en,     // a write of the Z80 (memory or port)
++	input      [24:0] dbg_z80,        // {port, address, data}
++	input             dbg_zwait,      // a Z80 clock in which it waits for the SDRAM
++	input             dbg_late,       // a YM2610 clock in which its ADPCM data is late
+ 	output reg        rfsh_req,       // toggles: sdram_mux refreshes the SDRAM (only in a hold)
+ 
+ 	output            active,
+@@ -91,6 +101,7 @@ localparam logic [15:0] OFF_CTRL   = 16'h0010;
+ localparam logic [15:0] OFF_LOCAL  = 16'h1000;
+ localparam logic [15:0] OFF_CRC    = 16'h1800;
+ localparam logic [15:0] OFF_INPUT  = 16'h2000;
++localparam logic [15:0] OFF_DBG    = 16'h2800;
+ 
+ localparam logic [63:0] MAGIC      = 64'h3130504E47454F4E; // "NEOGNP01"
+ localparam logic [31:0] CTRL_MAGIC = 32'h4C525443;          // "CTRL"
+@@ -153,7 +164,12 @@ logic  [7:0] post;            // clocks still held after a frame start
+ wire         tick_now = !vbl_prev && vblank;                       // first clock of a vertical blank
+ wire         run_due  = (state == S_RUN) && (tick_now || waiting); // frame k is due now
+ wire         consume  = run_due && have0;                          // frame k starts in this clock
+-wire         start0   = (state == S_PRIME) && have0 && have1 && !downloading;
++// The release waits for the start of a vertical blank: the picture runs
++// through the reset, and the machine leaves it a fixed number of its frames
++// after the release (the reset counter, then the watchdog's 8 frames), so a
++// release elsewhere in the picture starts the machine one frame earlier or
++// later in the session on one MiSTer than on the other
++wire         start0   = (state == S_PRIME) && have0 && have1 && !downloading && tick_now;
+ 
+ // SDRAM refresh in a hold
+ logic  [7:0] hold_age;        // clocks the hold has lasted (saturates)
+@@ -176,6 +192,12 @@ assign error_o = error;
+ 
+ // Pending mailbox work
+ logic        p_magic, p_status, p_local, p_crc;
++// diagnostics: this frame's counts, and the last frame's on their way to DDR3
++logic [31:0] d_zcrc, d_ticks;
++logic [15:0] d_zwait, d_late, d_nz, d_n68;
++logic [63:0] dq0, dq1;
++logic  [6:0] dq_frame;
++logic  [1:0] p_dbg;           // words of the last frame still to write
+ logic [15:0] local_frame;
+ logic [11:0] local_val;
+ logic [15:0] crc_frame;
+@@ -198,6 +220,7 @@ localparam logic [2:0] OP_LOCAL   = 3'd3;
+ localparam logic [2:0] OP_STATUS  = 3'd4;
+ localparam logic [2:0] OP_CTRL    = 3'd5;
+ localparam logic [2:0] OP_INPUT   = 3'd6;
++localparam logic [2:0] OP_DBG     = 3'd7;
+ 
+ logic [2:0]  op;
+ logic [31:0] op_frame;
+@@ -244,6 +267,29 @@ always_ff @(posedge clk) begin
+ 	if (ctrl_cnt == CTRL_INTERVAL[15:0] - 16'd1) begin ctrl_cnt <= 16'd0; ctrl_due <= 1'b1; end
+ 	else ctrl_cnt <= ctrl_cnt + 16'd1;
+ 
++	// -----------------------------------------------------------------------
++	// Diagnostics, frames 0-127 of the session
++	if (state == S_RUN) begin
++		if (dbg_tick) d_ticks <= d_ticks + 32'd1;
++		if (dbg_z80_en) begin d_zcrc <= crc_byte(crc_byte(crc_byte(crc_byte(d_zcrc, {7'd0, dbg_z80[24]}), dbg_z80[23:16]), dbg_z80[15:8]), dbg_z80[7:0]); d_nz <= d_nz + 16'd1; end
++		if (dbg_zwait && d_zwait != 16'hFFFF) d_zwait <= d_zwait + 16'd1;
++		if (dbg_late && d_late != 16'hFFFF) d_late <= d_late + 16'd1;
++		if (st_en && !consume) d_n68 <= d_n68 + 16'd1;
++		if (consume) begin
++			if (frame < 32'd128 && p_dbg == 2'd0) begin
++				dq0      <= {d_zcrc, d_ticks};
++				dq1      <= {d_zwait, d_late, d_nz, d_n68};
++				dq_frame <= frame[6:0];
++				p_dbg    <= 2'd2;
++			end
++			d_zcrc <= CRC_INIT; d_ticks <= 32'd0; d_zwait <= 16'd0; d_late <= 16'd0; d_nz <= 16'd0; d_n68 <= 16'd0;
++		end
++	end
++	if (start0) begin
++		d_zcrc <= CRC_INIT; d_ticks <= 32'd0; d_zwait <= 16'd0; d_late <= 16'd0; d_nz <= 16'd0; d_n68 <= 16'd0;
++		p_dbg <= 2'd0;
++	end
++
+ 	// -----------------------------------------------------------------------
+ 	// Per-frame work in RUN
+ 	if (state == S_RUN) begin
+@@ -325,6 +371,11 @@ always_ff @(posedge clk) begin
+ 		else if (p_status) begin
+ 			op <= OP_STATUS;  ddr_addr <= waddr(OFF_STATUS[15:3]); ddr_din <= status_word; ddr_we <= 1'b1; ddr_req <= ~ddr_req;
+ 		end
++		else if (p_dbg != 2'd0) begin
++			op <= OP_DBG;     ddr_addr <= waddr(OFF_DBG[15:3] + {5'd0, dq_frame, p_dbg == 2'd1});
++			ddr_din <= (p_dbg == 2'd2) ? dq0 : dq1;
++			ddr_we <= 1'b1; ddr_req <= ~ddr_req;
++		end
+ 		else if (ctrl_due) begin
+ 			op <= OP_CTRL;    ddr_addr <= waddr(OFF_CTRL[15:3]);   ddr_we <= 1'b0; ddr_req <= ~ddr_req;
+ 		end
+@@ -341,6 +392,7 @@ always_ff @(posedge clk) begin
+ 			OP_CRC:     p_crc      <= 1'b0;
+ 			OP_LOCAL:   p_local    <= 1'b0;
+ 			OP_STATUS:  p_status   <= 1'b0;
++			OP_DBG:     p_dbg      <= p_dbg - 2'd1;
+ 			OP_INPUT: begin
+ 				poll_due <= 1'b0;
+ 				// A frame starting in this very clock shifts the lookahead: drop
+@@ -425,6 +477,7 @@ always_ff @(posedge clk) begin
+ 		p_status   <= 1'b1;
+ 		p_local    <= 1'b0;
+ 		p_crc      <= 1'b0;
++		p_dbg      <= 2'd0;
+ 		poll_cnt   <= 16'd0;
+ 		ctrl_cnt   <= 16'd0;
+ 		poll_due   <= 1'b0;
+-- 
+2.43.0
+

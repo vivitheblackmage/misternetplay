@@ -1,0 +1,88 @@
+From 8524a44b74b178bb0271ce3ad7898d874eca1496 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sun, 15 Nov 2026 12:58:42 +0100
+Subject: [PATCH] netplay: the OSD's netplay.ini is value 0: the machine waits
+ for a game's program unless Netplay is Off (1); bench: --osd-ini (det run e)
+---
+ neogeo.sv            | 2 +-
+ npsim/det.sh         | 5 +++--
+ npsim/neogeo_sim.cpp | 6 ++++--
+ 3 files changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/neogeo.sv b/neogeo.sv
+index f2e8774..66e1af8 100644
+--- a/neogeo.sv
++++ b/neogeo.sv
+@@ -283,7 +283,7 @@ reg nRESET_CORE;
+ // (a BIOS) when the core starts, if there is one; the machine then ran the
+ // BIOS and whatever game the SDRAM still held until the player picked one, and
+ // the 68000's registers carried that run into the session (DESYNC at frame 10)
+-wire np_osd = |status[46:45] & ~status[2];
++wire np_osd = (status[46:45] != 2'd1) & ~status[2];   // netplay.ini (0), Host, Join: not Off (1)
+ reg  np_got_game = 0;                // a game's program has come (set below the load indexes)
+ always @(posedge CLK_48M) begin
+ 	reg rst_n;
+diff --git a/npsim/det.sh b/npsim/det.sh
+index dbfbd3c..3152532 100755
+--- a/npsim/det.sh
++++ b/npsim/det.sh
+@@ -19,7 +19,8 @@
+ # a and d (--boot-delay: Main's time from the core load to the ROM load).
+ # c and e get a boot ROM at the core's start (Main_MiSTer sends
+ # bootrom/neogeo.rom when there is one), 25 and 12 frames before the ROM set:
+-# the machine must not run on it before the session.
++# the machine must not run on it before the session. e has the OSD's Netplay
++# option on netplay.ini (value 0), the others on Host.
+ # (The bench writes INPUT[k] one frame ahead; input later than that holds the
+ # machine at the frame start.)
+ #
+@@ -53,7 +54,7 @@ run a --ddr-lat 12 --fill 1 --rtc 08020261114170957 --sd 2000 "$@" &
+ run b --ddr-lat 12 --ddr-jit 40 --ddr-busy 20 --seed 1 --stall 100 1600000 --boot-delay 2 --fill 2 --rtc 08020261114170951 --sd 20000 "$@" &
+ run c --ddr-lat 30 --seed 2 --stall 300 1200000 --boot-delay 4 --fill 3 --rtc 08040260803092301 --sd 60000 --bootrom 25 "$@" &
+ run d --ddr-lat 12 --phase 1 --start-delay 1600000 --seed 3 --stall 50 800000 --sd 0 "$@" &
+-run e --ddr-lat 12 --start-delay 16000000 --seed 4 --stall 100 4800000 --boot-delay 6 --fill 5 --rtc 08070201231235959 --sd 40000 --bootrom 12 "$@" &
++run e --ddr-lat 12 --start-delay 16000000 --seed 4 --stall 100 4800000 --boot-delay 6 --fill 5 --rtc 08070201231235959 --sd 40000 --bootrom 12 --osd-ini "$@" &
+ run f --ddr-lat 12 --ddr-jit 40 --ddr-busy 20 --seed 7 --stall 500 800000 --boot-delay 10 --fill 6 "$@" &
+ wait
+ for n in a b c d e f; do
+diff --git a/npsim/neogeo_sim.cpp b/npsim/neogeo_sim.cpp
+index 33b59ed..7a8a6c7 100644
+--- a/npsim/neogeo_sim.cpp
++++ b/npsim/neogeo_sim.cpp
+@@ -42,6 +42,7 @@
+ //                     (the player picks a game). The machine must not run then.
+ //     --mvs           System Type: Arcade (default: Console, AES)
+ //     --no-netplay    OSD Netplay: Off (default: Host)
++//     --osd-ini       OSD Netplay: netplay.ini (value 0, Main reads the mode from the file)
+ //     --bios FILE     system ROM in the bios folder (default uni-bios.rom)
+ //     --ppm N         write frame N's picture to frameN.ppm (may repeat)
+ //     --quiet         only the summary
+@@ -567,7 +568,7 @@ int main(int argc, char **argv)
+ 	std::string rom, bios;
+ 	const char *sysrom = "uni-bios.rom";
+ 	int frames = 60, warm = 0;
+-	bool mvs = false, netplay = true;
++	bool mvs = false, netplay = true, osd_ini = false;
+ 	for (int i = 1; i < argc; i++)
+ 	{
+ 		std::string a = argv[i];
+@@ -581,6 +582,7 @@ int main(int argc, char **argv)
+ 		else if (a == "--bios") { if (i + 1 >= argc) return 2; sysrom = argv[++i]; }
+ 		else if (a == "--mvs") mvs = true;
+ 		else if (a == "--no-netplay") netplay = false;
++		else if (a == "--osd-ini") osd_ini = true;
+ 		else if (a == "--phase") phase = num();
+ 		else if (a == "--warm") warm = num();
+ 		else if (a == "--play") play = true;
+@@ -626,7 +628,7 @@ int main(int argc, char **argv)
+ #endif
+ 	top = new Vsim_top;
+ 	// Console (AES), UniBIOS, NTSC, memory card unplugged, Netplay: Host; a 128 MB SDRAM module
+-	top->status = (mvs ? 2 : 0) | 1 << 4 | (netplay ? 2ULL << 45 : 1ULL << 45);
++	top->status = (mvs ? 2 : 0) | 1 << 4 | (osd_ini ? 0 : netplay ? 2ULL << 45 : 1ULL << 45);
+ 	top->sdram_sz = 0x8003;
+ 	top->reset = 1;
+ 	if (phase & 1) { half = true; step96(); half = false; }   // one 96 MHz clock with 48 MHz still low
+-- 
+2.43.0
+

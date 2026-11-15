@@ -1,0 +1,701 @@
+From e1e99c8c387c4d66b1461d89aef833ab88d4ee22 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 14 Nov 2026 14:18:50 +0100
+Subject: [PATCH 2/3] Netplay determinism (SPEC 14.1): the Z80's ROM in the
+ SDRAM (copied from DDR3 at load), the YM2610 never waits for DDR3 with
+ Netplay on, the YM2610's dividers and slot counter, the LSPC timer, the
+ auto-animation counter and the SDRAM refresh counter start from the reset's
+ end; OSD Netplay O[46:45]; npsim: --snap/snapdiff.py, det.sh starts as a
+ session does
+---
+ neogeo.sv               | 59 ++++++++++++++++++++++++-----------------
+ npsim/.gitignore        |  1 +
+ npsim/Makefile          |  8 +++++-
+ npsim/det.sh            | 23 ++++++++--------
+ npsim/neogeo_sim.cpp    | 43 ++++++++++++++++++++++++++----
+ npsim/snapdiff.py       | 55 ++++++++++++++++++++++++++++++++++++++
+ rtl/jt12/hdl/jt12_div.v | 22 ++++++++++++---
+ rtl/jt12/hdl/jt12_reg.v | 11 +++++++-
+ rtl/mem/sdram_mux.sv    | 46 ++++++++++++++++++++++++++++++--
+ rtl/video/autoanim.v    | 11 +++++---
+ rtl/video/lspc_timer.v  | 20 ++++++++------
+ 11 files changed, 240 insertions(+), 59 deletions(-)
+ create mode 100644 npsim/snapdiff.py
+
+diff --git a/neogeo.sv b/neogeo.sv
+index c237adc..e821e13 100644
+--- a/neogeo.sv
++++ b/neogeo.sv
+@@ -113,7 +113,9 @@ video_freak video_freak
+ // 0         1         2         3          4         5         6   
+ // 01234567890123456789012345678901 23456789012345678901234567890123
+ // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
+-// XXXXXXXXXXXXX XXX XXXXX XXXXXXX  XXXXXXXXXXXXX            XXXXXX 
++// XXXXXXXXXXXXX XXX XXXXX XXXXXXX  XXXXXXXXXXXXXXX          XXXXXX 
++//
++// [46:45] Netplay (netplay SPEC.md 14): 0 netplay.ini, 1 Off, 2 Host, 3 Join
+ 
+ `include "build_id.v"
+ localparam CONF_STR = {
+@@ -167,6 +169,8 @@ localparam CONF_STR = {
+ 	"P1O56,Stereo Mix,none,25%,50%,100%;",
+ 	"P1-;",
+ 	"-;",
++	"oDE,Netplay,netplay.ini,Off,Host,Join;",
++	"-;",
+ 	"RE,Reset & apply;",  // decouple manual reset from system reset 
+ 	"J1,A,B,C,D,Start,Select,Coin,ABC,A+B,C+D;",	// ABC is a special key to press A+B+C at once, useful for keyboards that don't allow more than 2 keypresses at once; A+B/C+D are useful for fighting games (Samurai Shodown, Garou, etc.)
+ 	"jn,A,B,X,Y,Start,Select,L,R,L2,R2;",	// name mapping 
+@@ -329,6 +333,10 @@ wire [15:0] ioctl_dout;
+ wire        ioctl_download;
+ wire  [7:0] ioctl_idx;
+ 
++// Netplay: Host or Join in the OSD. (Step 3: from the netplay module, which
++// also knows netplay.ini's mode.)
++wire np_on = status[46];
++
+ wire SYSTEM_MVS = SYSTEM_TYPE & ~cd_en;
+ wire SYSTEM_CDx = cd_en;
+ wire SYSTEM_CDZ = SYSTEM_CDx & SYSTEM_CD_TYPE;
+@@ -835,6 +843,7 @@ localparam S1ROM_OFFSET   = 27'h0080000; // S1:         $0080000~$00FFFFF
+ localparam P1ROM_A_OFFSET = 27'h0200000; // P1+:        $0200000~...
+ localparam P1ROM_B_OFFSET = 27'h0280000; // P1:         $0280000~$02FFFFF (secondary 512KB)
+ localparam P2ROM_OFFSET   = 27'h0300000; // P2+:        $0300000~...
++localparam M1ROM_OFFSET   = 27'h0100000; // M1:         $0100000~$017FFFF (cart; the CD systems' work RAM is there)
+ 
+ wire [26:0] ioctl_addr_offset =
+ 	(ioctl_index == INDEX_SPROM)   ?	{SPROM_OFFSET[26:19]  , ioctl_addr[18:0]} : // System ROM: $0000000~$007FFFF
+@@ -991,6 +1000,11 @@ sdram_mux SDRAM_MUX(
+ 
+ 	.REFRESH_EN(RFSH),
+ 
++	.Z80_RD(z80_rom_rd),
++	.Z80_ADDR({MA & MROM_MASK[18:11], SDA[10:0]}),
++	.M1_DATA(M1_ROM_DATA),
++	.M1_READY(M1_READY),
++
+ 	.SDRAM_ADDR(sdram_addr),
+ 	.SDRAM_DOUT(sdram_dout),
+ 	.SDRAM_DIN(sdram_din),
+@@ -1616,25 +1630,15 @@ assign SDD_IN = (~nSDZ80R)             ? SDD_RD_C1 :
+ wire Z80_nRESET = SYSTEM_CDx ? nRESET & CD_nRESET_Z80 : nRESET;
+ wire CD_HAS_Z80_BUS = (CD_USE_Z80 & ~(nBUSAK & CD_nRESET_Z80));
+ 
++// The Z80's ROM (M1) is read from the SDRAM (sdram_mux): the core copies it
++// there from DDR3, where Main_MiSTer puts it (the memory copy below). A read
++// from DDR3 took as long as the HPS and the scaler let it, so the Z80 ran
++// differently on two MiSTers and from one run to the next.
+ wire [7:0] M1_ROM_DATA;
+-reg z80rd_req;
+-wire z80rd_ack;
++wire M1_READY;
+ wire z80_rom_rd = ~(nSDMRD | nSDROM | SYSTEM_CDx);
+-always @(posedge DDRAM_CLK) begin
+-	reg old_rd, old_rd1;
+-	
+-	old_rd <= z80_rom_rd;
+-	if(old_rd == z80_rom_rd) old_rd1 <= old_rd;
+-
+-	// nRESET is used here because otherwise z80rd_req is toggled at core boot
+-	// which causes problems with DDRAM. (Z80_nSDRD is probably low for a few DDRAM_CLK
+-	// cycles at core boot).
+-	// If the core is loaded with SignalTap then DDRAM is stuck at waiting for
+-	// DDRAM_DOUT_READY to go high which does not happen.
+-	if(~old_rd1 & old_rd & nRESET) z80rd_req <= ~z80rd_req;
+-end
+ 
+-wire Z80_nWAIT = (z80rd_req == z80rd_ack);
++wire Z80_nWAIT = M1_READY;
+ 
+ cpu_z80 Z80CPU(
+ 	.CLK(CLK_48M),
+@@ -1791,12 +1795,12 @@ ddram DDRAM(
+ 	.rd_req2(ADPCMB_READ_REQ),
+ 	.rd_ack2(ADPCMB_READ_ACK),
+ 
+-	.rdaddr3({7'b10_0000_0,MA & MROM_MASK[18:11],SDA[10:0]}),
+-	.dout3(M1_ROM_DATA),
+-	.rd_req3(z80rd_req),
+-	.rd_ack3(z80rd_ack),
++	.rdaddr3(28'd0),		// was the Z80's ROM
++	.dout3(),
++	.rd_req3(1'b0),
++	.rd_ack3(),
+ 
+-	.cpaddr({1'b1, ddr_cpaddr}),
++	.cpaddr(cp_m1 ? {3'b001, cur_off[24:0]} : {1'b1, ddr_cpaddr}),	// M1 is at $2000000 in DDR3, the rest in the load buffer at $8000000
+ 	.cpdout(ddr_cpdout),
+ 	.cpwr(ddr_cpwr),
+ 	.cpreq(ddr_cpreq),
+@@ -1844,10 +1848,13 @@ wire [26:0] cp_offset =
+ 	(cp_idx == INDEX_P1ROM_A) ? P1ROM_A_OFFSET     :
+ 	(cp_idx == INDEX_P1ROM_B) ? P1ROM_B_OFFSET     :
+ 	(cp_idx == INDEX_P2ROM)   ? P2ROM_OFFSET       :
++	(cp_idx == INDEX_M1ROM)   ? M1ROM_OFFSET       :
+ 	(cp_idx == INDEX_CROM0)   ? {CROM_START, 20'd0}:
+ 	(cp_idx >= INDEX_VROMS)   ? ({cp_idx[7:0]-INDEX_VROMS[7:0], 19'h00000}) :
+ 										 27'd0;
+ 
++wire cp_m1 = (cp_idx == INDEX_M1ROM) & ~SYSTEM_CDx;	// the Z80's ROM: from its place in DDR3 to the SDRAM
++
+ reg memcp_req = 0;
+ reg memcp_ack = 0;
+ wire memcp_wait = (memcp_req != memcp_ack);
+@@ -1863,7 +1870,8 @@ always @(posedge clk_sys) begin
+ 						cp_addr     <= cp_offset;
+ 						cp_end      <= cp_offset + {ioctl_dout[10:0], cp_size[15:0]};
+ 					end
+-				6: if(ioctl_dout && cp_op) memcp_req <= ~memcp_req;
++				// M1 comes without the copy flag (Main_MiSTer leaves it in DDR3): copied all the same
++				6: if((ioctl_dout || cp_m1) && cp_op) memcp_req <= ~memcp_req;
+ 			endcase
+ 
+ 			if(~cp_op) begin
+@@ -1913,7 +1921,10 @@ reg [7:0] adpcma_d, adpcmb_d;
+ always @(posedge CLK_48M) begin
+ 	reg en;
+ 	en <= ADPCMA_DATA_READY & ADPCMB_DATA_READY;
+-	adpcm_en <= en;
++	// The YM2610 stands still while its ADPCM data is late (DDR3). With
++	// netplay it never does: its timers interrupt the Z80, and how late DDR3 is
++	// differs between two MiSTers. A late byte is then the one before it.
++	adpcm_en <= en | np_on;
+ 	
+ 	adpcma_d <= ADPCMA_DATA;
+ 	adpcmb_d <= ADPCMB_DATA;
+diff --git a/npsim/.gitignore b/npsim/.gitignore
+index 057794e..f16bc91 100644
+--- a/npsim/.gitignore
++++ b/npsim/.gitignore
+@@ -1,3 +1,4 @@
+ build/
+ obj/
+ frame*.ppm
++obj_trace/
+diff --git a/npsim/Makefile b/npsim/Makefile
+index 2f72f46..02c06b1 100644
+--- a/npsim/Makefile
++++ b/npsim/Makefile
+@@ -23,6 +23,7 @@ VFLAGS := -O3 --no-timing --no-assert --x-assign 0 --x-initial 0 -Wno-fatal -Wno
+           +incdir+$(abspath $(BUILD)) +incdir+$(CORE) +incdir+$(CORE)/rtl/cpu/FX68K
+ SIMSRC := sim_top.sv stubs.sv sdram_chip.sv
+ GEN    := $(BUILD)/vlog/sdram_sim.sv $(BUILD)/vlog/T80pa.v $(BUILD)/vlog/CEGen.v
++RTL    := $(wildcard ../neogeo.sv ../rtl/*.v ../rtl/*/*.v ../rtl/*/*.sv ../rtl/*/*/*.v ../rtl/*/*/*.sv ../rtl/*/*/*/*.v)
+ 
+ all: obj/neogeo_sim
+ 
+@@ -39,10 +40,15 @@ $(BUILD)/vlog/CEGen.v: $(BUILD)/vlog/T80pa.v
+ lint: $(BUILD)/files.f $(GEN) $(SIMSRC)
+ 	verilator --lint-only $(VFLAGS) $(SIMSRC) $(GEN) $(CORE)/sys/video_cleaner.sv -f $(BUILD)/files.f
+ 
+-obj/neogeo_sim: $(BUILD)/files.f $(GEN) $(SIMSRC) neogeo_sim.cpp Makefile
++obj/neogeo_sim: $(BUILD)/files.f $(GEN) $(SIMSRC) $(RTL) neogeo_sim.cpp Makefile
+ 	verilator --cc --exe --build -j 0 $(VFLAGS) -CFLAGS "-O2 -std=c++17" -Mdir obj -o neogeo_sim \
+ 	  $(SIMSRC) $(GEN) $(CORE)/sys/video_cleaner.sv -f $(BUILD)/files.f neogeo_sim.cpp
+ 
++# with every signal traceable, for --snap (slower)
++obj_trace/neogeo_sim: $(BUILD)/files.f $(GEN) $(SIMSRC) $(RTL) neogeo_sim.cpp Makefile
++	verilator --cc --exe --build -j 0 $(VFLAGS) --trace --trace-max-array 8 -CFLAGS "-O2 -std=c++17" -Mdir obj_trace -o neogeo_sim \
++	  $(SIMSRC) $(GEN) $(CORE)/sys/video_cleaner.sv -f $(BUILD)/files.f neogeo_sim.cpp
++
+ FRAMES ?= 200
+ det: obj/neogeo_sim
+ 	./det.sh $(ROM) $(BIOS) $(FRAMES)
+diff --git a/npsim/det.sh b/npsim/det.sh
+index 5bf730f..2c2fa06 100755
+--- a/npsim/det.sh
++++ b/npsim/det.sh
+@@ -7,15 +7,16 @@
+ #   c  DDR3 answers after 30 clocks
+ #   d  the 48 MHz clock starts one 96 MHz clock later (decided when the PLL
+ #      locks), and the reset is released 500,000 clocks of 48 MHz later
+-#   e  the reset is released 215,617 clocks of 48 MHz later
+-#   f  the core played before (WARM frames), then got the OSD's reset
++#   e  the reset is released 3 frames later
++#   f  the reset is released 20 frames later, DDR3 as in b with another seed
+ #
+-# In a lockstep session every frame's checksums of the 68000's and the Z80's
+-# writes (s68, sz80) must be the same on all of them, counted from the first
+-# frame in which the 68000 runs.
++# All start as a netplay session must (netplay SPEC.md 14): on a core that has
++# not run since it was loaded, with OSD Netplay on Host. In a lockstep session
++# every frame's checksums of the 68000's and the Z80's writes (s68, sz80) must
++# then be the same on all of them, counted from the first frame in which the
++# 68000 runs.
+ #
+ #   det.sh <romset folder> <bios folder> [frames] [extra neogeo_sim options]
+-#   WARM=120 (frames played before the reset in run f)
+ #
+ # PASS: s68 and sz80 equal to run a's in every frame of every run. Also says
+ # where the timing and the picture first differ.
+@@ -40,8 +41,8 @@ run a --ddr-lat 12 "$@" &
+ run b --ddr-lat 12 --ddr-jit 40 --ddr-busy 20 --seed 1 "$@" &
+ run c --ddr-lat 30 "$@" &
+ run d --ddr-lat 12 --phase 1000001 "$@" &
+-run e --ddr-lat 12 --phase 431234 "$@" &
+-run f --ddr-lat 12 --warm "${WARM:-120}" "$@" &
++run e --ddr-lat 12 --phase 5000000 "$@" &
++run f --ddr-lat 12 --ddr-jit 40 --ddr-busy 20 --seed 7 --phase 32440321 "$@" &
+ wait
+ for n in a b c d e f; do
+ 	grep -q '^RESULT' "$work/$n/out.txt" || { echo "FAIL: run $n did not finish:"; tail -3 "$work/$n/out.txt" "$work/$n/err.txt"; exit 1; }
+@@ -49,7 +50,7 @@ done
+ python3 -I - "$work" <<'PY'
+ import sys, re
+ work = sys.argv[1]
+-what = {"b": "DDR3 jitter", "c": "DDR3 slower", "d": "other clock phase", "e": "reset later", "f": "played before"}
++what = {"b": "DDR3 jitter", "c": "DDR3 slower", "d": "other clock phase", "e": "reset 3 frames later", "f": "20 frames later, jitter"}
+ runs = {}
+ for n in "abcdef":
+     r = [dict(re.findall(r"(\w+)=(\w+)", l)) for l in open(f"{work}/{n}/out.txt") if l.startswith("F ")]
+@@ -57,7 +58,7 @@ for n in "abcdef":
+     runs[n] = r[live:]          # from the first frame in which the 68000 runs
+ a = runs["a"]
+ print(f"{len(a)} frames from the 68000's first bus cycle; first frame that differs from run a:")
+-print(f"  {'run':22s} {'68000':>6s} {'Z80':>6s} {'timing':>6s} {'picture':>7s}")
++print(f"  {'run':26s} {'68000':>6s} {'Z80':>6s} {'timing':>6s} {'picture':>7s}")
+ bad = False
+ for n in "bcdef":
+     r = runs[n]
+@@ -66,7 +67,7 @@ for n in "bcdef":
+         return next((str(i) for i in range(m) if a[i][key] != r[i][key]), "-")
+     s, z = first("s68"), first("sz80")
+     bad |= s != "-" or z != "-"
+-    print(f"  {n + ' ' + what[n]:22s} {s:>6s} {z:>6s} {first('time'):>6s} {first('pic'):>7s}")
++    print(f"  {n + ' ' + what[n]:26s} {s:>6s} {z:>6s} {first('time'):>6s} {first('pic'):>7s}")
+ if bad:
+     print("FAIL det: the CPUs' writes are not the same on every MiSTer")
+     sys.exit(1)
+diff --git a/npsim/neogeo_sim.cpp b/npsim/neogeo_sim.cpp
+index c236740..e67edbe 100644
+--- a/npsim/neogeo_sim.cpp
++++ b/npsim/neogeo_sim.cpp
+@@ -19,11 +19,17 @@
+ //     --play          press buttons (P1 Start, A, Right; P2 Start, A) on fixed
+ //                     frames, the same in every run
+ //     --mvs           System Type: Arcade (default: Console, AES)
++//     --no-netplay    OSD Netplay: Off (default: Host)
+ //     --bios FILE     system ROM in the bios folder (default uni-bios.rom)
+ //     --ppm N         write frame N's picture to frameN.ppm (may repeat)
+ //     --quiet         only the summary
+ //     --zlog FILE     every write of the Z80 (frame, clock in the frame, port or
+ //                     memory, address, data), to compare two runs' streams
++//     --snap FILE     (trace build, make obj_trace/neogeo_sim) write every signal's
++//                     value 64 clocks after the core's reset ends (the reset
++//                     pulse nRESETP that follows it has passed by then), as a
++//                     VCD with one time step: two runs' files show which
++//                     registers the reset leaves as they were (snapdiff.py)
+ //     --ztrace A B    print the Z80's bus cycles, its NMI and interrupt lines
+ //                     and the 68000's accesses to the sound latch ($320000) in
+ //                     frames A to B (stderr)
+@@ -56,6 +62,9 @@
+ #include <deque>
+ #include "Vsim_top.h"
+ #include "verilated.h"
++#if VM_TRACE
++#include "verilated_vcd_c.h"
++#endif
+ 
+ static Vsim_top *top;
+ static uint64_t clk96_count = 0;
+@@ -145,6 +154,8 @@ static int frame_no = -1;        // -1: before the first vertical blanking after
+ static bool quiet = false, play = false;
+ static int ztrace_a = -1, ztrace_b = -1;
+ static FILE *zlog = nullptr;
++static const char *snap_file = nullptr;
++static bool prev_rst_n = true, snap_armed = true;   // with --warm: armed after that session's reset
+ static int total_frames = 0;
+ static uint64_t all_s68 = 14695981039346656037ULL, all_sz80 = 14695981039346656037ULL, all_time = 14695981039346656037ULL;
+ 
+@@ -227,6 +238,21 @@ static void ztrace()
+ static void monitor()
+ {
+ 	fr.clocks++;
++#if VM_TRACE
++	static int snap_in = -1;
++	if (snap_file && snap_armed && top->core_reset_n && !prev_rst_n) snap_in = 64;
++	if (snap_in >= 0 && snap_in-- == 0)
++	{
++		VerilatedVcdC vcd;
++		top->trace(&vcd, 99);
++		vcd.open(snap_file);
++		vcd.dump((uint64_t)0);
++		vcd.close();
++		fprintf(stderr, "  snapshot at the end of the reset: frame %d, clock %u\n", frame_no, fr.clocks);
++		snap_file = nullptr;
++	}
++#endif
++	prev_rst_n = top->core_reset_n;
+ 	if (!top->z80_wait_n) fr.zwait++;
+ 	if (!top->ym_cen_ok) fr.ymwait++;
+ 	if (!top->core_reset_n) fr.rst++;
+@@ -409,7 +435,7 @@ int main(int argc, char **argv)
+ 	std::string rom, bios;
+ 	const char *sysrom = "uni-bios.rom";
+ 	int frames = 60, warm = 0;
+-	bool mvs = false;
++	bool mvs = false, netplay = true;
+ 	for (int i = 1; i < argc; i++)
+ 	{
+ 		std::string a = argv[i];
+@@ -422,11 +448,13 @@ int main(int argc, char **argv)
+ 		else if (a == "--ppm") ppm_frames.push_back(num());
+ 		else if (a == "--bios") { if (i + 1 >= argc) return 2; sysrom = argv[++i]; }
+ 		else if (a == "--mvs") mvs = true;
++		else if (a == "--no-netplay") netplay = false;
+ 		else if (a == "--phase") phase = num();
+ 		else if (a == "--warm") warm = num();
+ 		else if (a == "--play") play = true;
+ 		else if (a == "--quiet") quiet = true;
+ 		else if (a == "--ztrace") { ztrace_a = num(); ztrace_b = num(); }
++		else if (a == "--snap") { if (i + 1 >= argc) return 2; snap_file = argv[++i]; }
+ 		else if (a == "--zlog") { if (i + 1 >= argc) return 2; zlog = fopen(argv[++i], "w"); }
+ 		else if (a[0] == '-') { fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
+ 		else if (rom.empty()) rom = a;
+@@ -439,9 +467,14 @@ int main(int argc, char **argv)
+ 		return 2;
+ 	}
+ 	ddr = (uint8_t *)calloc(DDR_SIZE, 1);
++#if VM_TRACE
++	Verilated::traceEverOn(true);
++#else
++	if (snap_file) { fprintf(stderr, "--snap needs the trace build (obj_trace/neogeo_sim)\n"); return 2; }
++#endif
+ 	top = new Vsim_top;
+-	// Console (AES), UniBIOS, NTSC, memory card unplugged; a 128 MB SDRAM module
+-	top->status = (mvs ? 2 : 0) | 1 << 4;
++	// Console (AES), UniBIOS, NTSC, memory card unplugged, Netplay: Host; a 128 MB SDRAM module
++	top->status = (mvs ? 2 : 0) | 1 << 4 | (netplay ? 2ULL << 45 : 1ULL << 45);
+ 	top->sdram_sz = 0x8003;
+ 	top->reset = 1;
+ 	if (phase & 1) { half = true; step96(); half = false; }   // one 96 MHz clock with 48 MHz still low
+@@ -457,7 +490,7 @@ int main(int argc, char **argv)
+ 	{
+ 		// a session before this one: play, then the OSD's reset (status bit 14)
+ 		bool q = quiet, pl = play;
+-		quiet = true; play = true;
++		quiet = true; play = true; snap_armed = false;
+ 		for (uint64_t n = 0; frame_no < warm && n < (uint64_t)(warm + 3) * 900000; n++) clk48_cycle();
+ 		fprintf(stderr, "  warmed up %d frames, reset\n", frame_no);
+ 		watching = false;
+@@ -465,7 +498,7 @@ int main(int argc, char **argv)
+ 		top->status = top->status | 1ULL << 14;
+ 		run48(5000 + phase / 2);
+ 		top->status = top->status & ~(1ULL << 14);
+-		quiet = q; play = pl;
++		quiet = q; play = pl; snap_armed = true;
+ 		frame_no = -1; total_frames = 0; fr = Frame(); rows.clear(); row.clear();
+ 		prev_w68 = prev_wz80 = prev_as = false; prev_vbl = top->vid_vblank;
+ 		all_s68 = all_sz80 = all_time = 14695981039346656037ULL;
+diff --git a/npsim/snapdiff.py b/npsim/snapdiff.py
+new file mode 100644
+index 0000000..e6ba019
+--- /dev/null
++++ b/npsim/snapdiff.py
+@@ -0,0 +1,55 @@
++#!/usr/bin/env python3
++"""Compares two snapshots of neogeo_sim --snap (the trace build): every signal
++whose value differs at the clock on which the core's reset ends.
++
++  snapdiff.py a.vcd b.vcd [-v]
++
++Prints the registers per module (how many differ, and their names); -v adds
++the values. What differs is state the reset leaves as it was: a counter that
++runs on through the reset, or a register nothing initialises. Wires are left
++out when a register in the same module already differs (they follow from it);
++memories are not in the snapshot.
++"""
++import sys, re
++
++
++def load(path):
++    names, vals, scope = {}, {}, []
++    with open(path, encoding="latin-1") as f:
++        for line in f:
++            t = line.split()
++            if not t:
++                continue
++            if t[0] == "$scope":
++                scope.append(t[2])
++            elif t[0] == "$upscope":
++                scope.pop()
++            elif t[0] == "$var":
++                names.setdefault(t[3], (".".join(scope), t[4], t[1], int(t[2])))
++            elif t[0][0] == "b":
++                vals[t[1]] = t[0][1:].lstrip("0") or "0"
++            elif t[0][0] in "01xz" and len(t) == 1:
++                vals[t[0][1:]] = t[0][0]
++    return names, vals
++
++
++a_names, a = load(sys.argv[1])
++b_names, b = load(sys.argv[2])
++verbose = "-v" in sys.argv
++skip = re.compile(r"^sim_top$|hps_io|\.chip_model")       # the bench's own signals
++# not the emulated machine: the SDRAM controller's start-up counter (unused once
++# it has started) and the framework's OSD button timer
++allow = {("TOP.sim_top.emu.ram1", "refresh_count"), ("TOP.sim_top.emu.unnamedblk3", "timeout")}
++mods = {}
++for i, (scope, name, kind, width) in a_names.items():
++    if skip.search(scope) or (scope, name) in allow or a.get(i) == b.get(i):
++        continue
++    mods.setdefault(scope, []).append((name, kind, a.get(i), b.get(i)))
++total = 0
++for scope in sorted(mods):
++    regs = [x for x in mods[scope] if x[1] == "reg"] or mods[scope]
++    total += len(regs)
++    print(f"{scope}: {len(regs)}")
++    for name, kind, x, y in sorted(regs):
++        print(f"    {name}" + (f"  {x} | {y}" if verbose else ""))
++print(f"{total} signals differ in {len(mods)} modules")
+diff --git a/rtl/jt12/hdl/jt12_div.v b/rtl/jt12/hdl/jt12_div.v
+index 4b58315..b82aba5 100644
+--- a/rtl/jt12/hdl/jt12_div.v
++++ b/rtl/jt12/hdl/jt12_div.v
+@@ -103,15 +103,23 @@ always @(negedge clk) begin
+     `endif
+ end
+ 
++// The dividers stand at zero during a reset (every cen is then an enable, so
++// the chip's pipelines still clear) and start from there when it ends: the
++// timers' and the ADPCM's phase follows from the end of the reset, not from
++// how long the chip has had its clock (MiSTer netplay: both sides must start
++// alike).
++
+ // Div/2
+ always @(posedge clk)
+-    if( cen ) begin
++    if( rst ) div2 <= 2'b00;
++    else if( cen ) begin
+         div2 <= div2==2'b10 ? 2'b00 : (div2+2'b01);
+     end
+ 
+ // OPN
+ always @(posedge clk)
+-    if( cen ) begin
++    if( rst ) opn_cnt <= 4'd0;
++    else if( cen ) begin
+         if( opn_cnt == opn_pres ) begin
+             opn_cnt <= 4'd0;  
+         end
+@@ -120,7 +128,8 @@ always @(posedge clk)
+ 
+ // SSG
+ always @(posedge clk)
+-    if( cen ) begin
++    if( rst ) ssg_cnt <= 3'd0;
++    else if( cen ) begin
+         if( ssg_cnt == ssg_pres ) begin
+             ssg_cnt <= 3'd0;            
+         end
+@@ -129,7 +138,12 @@ always @(posedge clk)
+ 
+ // ADPCM-A
+ always @(posedge clk)
+-    if( cen ) begin
++    if( rst ) begin
++        adpcm_cnt666 <= 5'd0;
++        adpcm_cnt111 <= 3'd0;
++        adpcm_cnt55  <= 3'd0;
++    end
++    else if( cen ) begin
+         adpcm_cnt666 <= adpcm_cnt666==5'd11 ? 5'd0 : adpcm_cnt666 + 5'd1;
+         if( adpcm_cnt666==5'd0 ) begin
+             adpcm_cnt111 <= adpcm_cnt111==3'd5 ? 3'd0 : adpcm_cnt111+3'd1;
+diff --git a/rtl/jt12/hdl/jt12_reg.v b/rtl/jt12/hdl/jt12_reg.v
+index 0b1b4e2..40c8784 100644
+--- a/rtl/jt12/hdl/jt12_reg.v
++++ b/rtl/jt12/hdl/jt12_reg.v
+@@ -196,8 +196,17 @@ always @(*) begin
+     end
+ end
+ 
++// The counter runs during a reset (the registers clear slot by slot), and
++// starts from slot 0 on the clock the reset ends: its phase, and the timers'
++// with it, follows from the end of the reset (MiSTer netplay).
++reg rst_l;
+ always @(posedge clk) begin : up_counter
+-    if( clk_en ) begin
++    rst_l <= rst;
++    if( rst_l && !rst ) begin
++        { cur_op, cur_ch }  <= 5'd0;
++        zero    <= 1'b1;
++    end
++    else if( clk_en ) begin
+         { cur_op, cur_ch }  <= { next_op, next_ch };
+         zero    <= next == 5'd0;
+     end
+diff --git a/rtl/mem/sdram_mux.sv b/rtl/mem/sdram_mux.sv
+index b74246f..3443d03 100644
+--- a/rtl/mem/sdram_mux.sv
++++ b/rtl/mem/sdram_mux.sv
+@@ -53,6 +53,15 @@ module sdram_mux(
+ 	
+ 	input             REFRESH_EN,
+ 
++	// The Z80's program ROM (M1), cartridge systems. It is in the SDRAM and
++	// not in DDR3: DDR3 answers when the HPS and the scaler let it, which
++	// differs between two MiSTers, and then so does the Z80's time. Here a
++	// read takes a number of clocks that follows from the core's own state.
++	input             Z80_RD,       // the Z80 reads its ROM (level)
++	input      [18:0] Z80_ADDR,
++	output reg  [7:0] M1_DATA,
++	output reg        M1_READY,
++
+ 	output reg        SDRAM_WR,
+ 	output reg        SDRAM_RD,
+ 	output reg [26:1] SDRAM_ADDR,
+@@ -85,8 +94,12 @@ module sdram_mux(
+ );
+ 
+ 	localparam P2ROM_OFFSET = 27'h0300000;
++	localparam M1ROM_OFFSET = 27'h0100000;	// M1: $0100000~$017FFFF (the CD systems' work RAM, free on cartridge systems)
+ 
+-	reg M68K_RD_RUN, SFIX_RD_RUN, CROM_RD_RUN, CD_TR_RUN;
++	reg M68K_RD_RUN, SFIX_RD_RUN, CROM_RD_RUN, CD_TR_RUN, Z80_RD_RUN;
++	reg Z80_SIG_SR, Z80_A0, REFRESH_EN_SR;
++	wire REQ_Z80_RD = ~Z80_SIG_SR & Z80_RD & ~SYSTEM_CDx;
++	initial M1_READY = 1;
+ 
+ 	reg SDRAM_M68K_SIG_SR;
+ 	reg SDRAM_CROM_SIG_SR;
+@@ -127,7 +140,7 @@ module sdram_mux(
+ 	end
+ 	
+ 	always @(posedge CLK) begin
+-		reg M68K_RD_REQ, SROM_RD_REQ, CROM_RD_REQ, CD_WR_REQ, RFSH_REQ;
++		reg M68K_RD_REQ, SROM_RD_REQ, CROM_RD_REQ, CD_WR_REQ, RFSH_REQ, Z80_RD_REQ;
+ 		reg nAS_PREV;
+ 		reg old_ready;
+ 		reg [8:0] refresh_cnt;
+@@ -159,14 +172,23 @@ module sdram_mux(
+ 		SDRAM_M68K_SIG_SR <= SDRAM_M68K_SIG;
+ 		SDRAM_CROM_SIG_SR <= PCK1;
+ 		SDRAM_SROM_SIG_SR <= PCK2;
++		Z80_SIG_SR <= Z80_RD;
+ 		
+ 		refresh_cnt <= refresh_cnt + 1'd1;
++		// started again once a frame: when the refreshes of a reset come follows
++		// from the picture, as the reset's end does, so the first read after a
++		// reset waits for a refresh on both MiSTers or on neither (netplay)
++		REFRESH_EN_SR <= REFRESH_EN;
++		if (~REFRESH_EN_SR & REFRESH_EN) refresh_cnt <= 0;
+ 
+ 		if (!nRESET) begin
+ 			CROM_RD_REQ <= 0;
+ 			SROM_RD_REQ <= 0;
+ 			M68K_RD_REQ <= 0;
+ 			CD_WR_REQ   <= 0;
++			Z80_RD_REQ  <= 0;
++			Z80_RD_RUN  <= 0;
++			M1_READY    <= 1;
+ 
+ 			CROM_RD_RUN <= 0;
+ 			SFIX_RD_RUN <= 0;
+@@ -207,6 +229,12 @@ module sdram_mux(
+ 
+ 			if (REQ_RFSH) RFSH_REQ <= 1;
+ 
++			// Detect the Z80's ROM reads: the Z80 waits (M1_READY) until the byte is there
++			if (REQ_Z80_RD) begin
++				Z80_RD_REQ <= 1;
++				M1_READY   <= 0;
++			end
++
+ 			if (SDRAM_READY & ~SDRAM_RD & ~SDRAM_WR) begin
+ 
+ 				// Terminate running access, if needed
+@@ -232,6 +260,11 @@ module sdram_mux(
+ 					CROM_RD_RUN    <= 0;
+ 					cr_shift       <= 2;
+ 				end
++				if (Z80_RD_RUN) begin
++					M1_DATA        <= Z80_A0 ? SDRAM_DOUT[15:8] : SDRAM_DOUT[7:0];
++					M1_READY       <= 1;
++					Z80_RD_RUN     <= 0;
++				end
+ 
+ 				// Start requested access, if needed
+ 				if (M68K_RD_REQ | REQ_M68K_RD) begin
+@@ -289,6 +322,15 @@ module sdram_mux(
+ 					SDRAM_DIN      <= DMA_RUNNING ? (CD_LDS_ONLY_WR ? {DMA_DATA_OUT[7:0],DMA_DATA_OUT[7:0]} : DMA_DATA_OUT) :
+ 															  (CD_LDS_ONLY_WR ? {M68K_DATA[7:0],   M68K_DATA[7:0]}    : M68K_DATA);
+ 				end
++				// The Z80 comes after the 68000 and the graphics: it has a whole
++				// 4 MHz cycle for a read, they do not
++				else if (Z80_RD_REQ | REQ_Z80_RD) begin
++					Z80_RD_REQ     <= 0;
++					Z80_RD_RUN     <= 1;
++					SDRAM_RD       <= 1;
++					SDRAM_ADDR     <= {M1ROM_OFFSET[26:20], 1'b0, Z80_ADDR[18:1]};
++					Z80_A0         <= Z80_ADDR[0];
++				end
+ 				else if(REQ_RFSH & RFSH_REQ) begin
+ 					RFSH_REQ       <= 0;
+ 					SDRAM_RFSH     <= ~SDRAM_RFSH;
+diff --git a/rtl/video/autoanim.v b/rtl/video/autoanim.v
+index 0a7b8be..180efc2 100644
+--- a/rtl/video/autoanim.v
++++ b/rtl/video/autoanim.v
+@@ -53,11 +53,16 @@ module autoanim_sync(
+ 			else
+ 				TIMER_CNT <= TIMER_CNT + 1'd1;
+ 
+-			if (!RESETP)
+-				AA_CNT_FULL <= 0;
+-			else if (&TIMER_CNT)
++			if (&TIMER_CNT)
+ 				AA_CNT_FULL <= AA_CNT_FULL + 1'd1;
+ 		end
++		// RESETP is one 24 MHz cycle long: it never met the RASTER8 edge above.
++		// The speed counter has no reset on the real chip; it gets one here so
++		// that two MiSTers show the same animation frame after a reset (netplay).
++		if (!RESETP) begin
++			TIMER_CNT <= 0;
++			AA_CNT_FULL <= 0;
++		end
+ 	end
+ 
+ 	assign AA_COUNT = AA_CNT_FULL[2:0];
+diff --git a/rtl/video/lspc_timer.v b/rtl/video/lspc_timer.v
+index 28c9066..18601b5 100644
+--- a/rtl/video/lspc_timer.v
++++ b/rtl/video/lspc_timer.v
+@@ -64,11 +64,15 @@ module lspc_timer_sync(
+ 	
+ 	*/
+ 	reg [15:0] TIMER_LOW;
++	// nRESETP is one 24 MHz cycle long and seldom falls on a 6 MHz enable, so
++	// the timer ran on through a reset from wherever it was (netplay: two
++	// MiSTers then start with different timers). The real counters (C43) have
++	// nRESETP on their asynchronous clear.
+ 	always @(posedge CLK)
+-		if (LSPC_EN_6M_N) begin
+-			if (!nRESETP)
+-				TIMER_LOW <= 0;
+-			else if (!nRELOAD)
++		if (!nRESETP)
++			TIMER_LOW <= 0;
++		else if (LSPC_EN_6M_N) begin
++			if (!nRELOAD)
+ 				TIMER_LOW <= ~REG_TIMERLOW;
+ 			else if (nTIMER_EN)
+ 				TIMER_LOW <= TIMER_LOW + 1'd1;
+@@ -96,10 +100,10 @@ module lspc_timer_sync(
+ 	*/
+ 	reg [15:0] TIMER_HIGH;
+ 	always @(posedge CLK)
+-		if (LSPC_EN_6M_N) begin
+-			if (!nRESETP)
+-				TIMER_HIGH <= 0;
+-			else if (!nRELOAD)
++		if (!nRESETP)
++			TIMER_HIGH <= 0;
++		else if (LSPC_EN_6M_N) begin
++			if (!nRELOAD)
+ 				TIMER_HIGH <= ~REG_TIMERHIGH;
+ 			else if (nTIMER_EN & &TIMER_LOW)
+ 				TIMER_HIGH <= TIMER_HIGH + 1'd1;
+-- 
+2.43.0
+

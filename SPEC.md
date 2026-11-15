@@ -1178,3 +1178,229 @@ the adapter: "communication error").
 
 Wireless multiboot; playing against RetroArch gpSP (its own netpacket protocol);
 more than 2 players tested on hardware.
+
+## 14. Neo Geo (v6, released in v0.6: verified in simulation (T2n, T3n) and on hardware, two MiSTers through the lobby server)
+
+The MiSTer Neo Geo core (`NeoGeo_MiSTer`, MiSTer-devel) with lockstep netplay,
+as sections 7 to 12: only the controllers cross the network, and both MiSTers
+run the same frames. First version: cartridge systems in Console (AES) mode, two
+players, joysticks, memory card unplugged. Not with netplay: Neo Geo CD,
+multitap, spinner and mouse.
+
+### 14.1 Determinism (normative)
+
+**Requirement:** started as in 14.2, two MiSTers make the same writes with both
+CPUs (68000 and Z80: address, data and order per CPU) in every frame, from the
+first frame in which the 68000 runs, whatever the DDR3's timing, the phase the
+PLL locked in, and the time between the core's load and the reset's end.
+
+The upstream core does not meet it. What the netplay core changes:
+
+- **The Z80's ROM (M1) is in the SDRAM**, not in DDR3. DDR3 is shared with the
+  HPS and the scaler and answers when they let it; the Z80 waited 3 to 6 % of
+  every frame for it, a different time on every MiSTer, and an interrupt then
+  met another instruction. The core copies M1 from where Main_MiSTer puts it
+  (DDR3 `$32000000`, load index 9) to SDRAM `$0100000` (the megabyte only the
+  CD systems use) with its memory copy, so Main's loader is unchanged, and
+  `sdram_mux` serves the Z80 after the 68000 and the graphics. The SDRAM is the
+  core's own and synchronous to it: a read takes a number of clocks that
+  follows from the core's state. The Z80 waits (`nWAIT`) until its byte is
+  there, normally not at all (a read is done in 8 to 9 clocks of 96 MHz, the
+  Z80 has 24).
+- **The YM2610 never stands still for DDR3** while Netplay is Host or Join
+  (`np_on`). Upstream stops its clock enable when an ADPCM byte is late; its
+  timers interrupt the Z80. A late byte is then the byte before it (sound only:
+  what the CPUs read of the ADPCM channels counts addresses, not data).
+- **Timing constraints that hold on the hardware.** A path that the timing
+  constraints allow two clocks may arrive in the first or the second, on one
+  MiSTer or run otherwise than on another; simulation always takes the first.
+  Upstream gave every path from the Z80 two clocks (`NeoGeo.sdc`); its bus is
+  looked at on every clock (the SDRAM's M1 reads at 96 MHz, the port and NMI
+  edge detectors), so only the Z80's own paths keep two clocks. Seen on
+  hardware with the per-frame diagnostics (14.3): a replay on the same MiSTer
+  parted from its recording at frame 10, the Z80 having waited for the SDRAM
+  188 times less in frame 9, the simulation equal to the replay.
+- **Counters start from the end of the reset.** The reset ends on a fixed
+  raster position of the free-running picture, so what is tied to the picture
+  is the same on both MiSTers; what is not must not run through the reset:
+  the YM2610's clock dividers stand at zero during it and its slot counter
+  starts at slot 0 when it ends (`jt12_div`, `jt12_reg`); the LSPC's timer and
+  the auto-animation counters take the reset pulse `nRESETP` on any clock (it is
+  one 24 MHz cycle long and missed their enables); the SDRAM's refresh counter
+  of the reset phase starts again once a frame (`sdram_mux`). The LSPC's divide-by-3
+  (8 MHz) and the Z80's 4 MHz (`lspc2_clk.v`) start with the reset as the
+  picture does: free-running, their phase to the picture was whatever the
+  FPGA's start and the time before the session left, and two MiSTers ran the
+  Z80 up to 4 clocks of 24 MHz apart (seen on hardware with the trace: host
+  and join apart from the Z80's first event, the join equal to the bench; the
+  bench with the divider started in another state gives the host's numbers).
+
+### 14.2 Session start
+
+- A session starts on **a core that has not run since it was loaded** (FPGA
+  configuration): the reset clears neither the RAMs nor the CPUs' registers nor
+  most of the LSPC's, and a game that ran before leaves them behind (in
+  simulation: 361 signals in 56 modules differ after 30 frames and a reset,
+  and the 68000's first frame with them).
+- So Main_MiSTer arms netplay (CTRL enable, 14.3) **before** it loads the ROM
+  set, and the core's module keeps the machine in reset from then on (ARMED,
+  PRIME). The reset is released at the first start of a vertical blank with
+  INPUT[0] and INPUT[1] in hand and no load going on; frame 0 starts there.
+  The picture runs through the reset and the machine leaves it a fixed number
+  of its frames after the release (the reset counter, then the watchdog's 8
+  frames): released anywhere else in the picture, one MiSTer's machine would
+  start a frame earlier in the session than the other's (T2n: frame 0 of
+  different lengths, the 68000's first writes in frame 7 or 8). When the machine has left reset since the FPGA
+  was loaded (STATUS bit `ran`; Main_MiSTer keeps the same fact itself: a ROM set
+  was loaded since the core was), Main_MiSTer loads the core (RBF) and the ROM
+  set again before a session (14.4).
+- The machine starts the same way however long it waited: everything is reset
+  until the release (14.1, `--start-delay` in T2n).
+- **Not on a boot ROM.** When the core starts, Main_MiSTer sends
+  `bootrom/neogeo.rom` if the SD card has one (any core: `bootrom/<name>.rom`,
+  ioctl index 0). The core normally leaves reset on the first load of any kind,
+  so the machine ran that BIOS, with whatever game the SDRAM still held from
+  before, until the player picked a game, and the 68000's registers kept that
+  run into the session (seen on hardware: `movem` in frame 10 stored A1/A2 =
+  `$C1471C`, left by the BIOS's cartridge check; 15.5 s run before the session;
+  a fixed CRC per MiSTer, DESYNC at frame 10). With the OSD's Netplay option on
+  (`[46:45]` not Off = 1; netplay.ini is 0) and a cartridge system, the machine therefore stays in
+  reset until a game's program arrives (P1/P2, straight or as the loader's copy
+  command); with Netplay Off the core behaves as before. T2n `--bootrom F`.
+  The trace's first event (14.3) tells how long the machine ran before a
+  session.
+- **Not before the save file is in.** At the end of a load the core reads the
+  game's save file (backup RAM and memory card, 72 KB) through Main_MiSTer, one
+  sector at a time as Main's main loop gets to it, and holds the machine in
+  reset while it does (`bk_loading`). The module counts that as a load: the
+  release waits for its end. Otherwise one MiSTer's machine leaves reset later
+  (the reset restarts the 8-frame watchdog reset), and the session parts where
+  the machines start (seen on hardware: DESYNC at frame 8 and 11, also when
+  one MiSTer replayed its own recording; T2n `--sd`). The memory card stays
+  unplugged during a session, so what the file holds is never read.
+- OSD: `oDE,Netplay,netplay.ini,Off,Host,Join` (status `[46:45]`), read by
+  Main_MiSTer only.
+- While a session is active: the session's input for both players (the host
+  is player 1), memory card unplugged, no multitap, spinner or mouse, the OSD's
+  Reset and the user button do nothing, the YM2610 never waits for DDR3.
+
+### 14.3 The core's netplay module (`rtl/netplay/neogeo_netplay.sv`)
+
+- While ARMED the module takes the session's id from every CTRL it reads: Main
+  arms with session 0 before the ROM set loads, before the players agree on one.
+
+The arcade module (12.3) without jtframe, with these differences:
+
+- **Mailbox** at `0x3FC00000` (the Neo Geo loader stages sprites up to
+  `0x3E000000`), the NES/arcade layout, `MAGIC` = `0x3130504E47454F4E`
+  ("NEOGNP01"), on its own 64-bit channel of the core's `ddram.sv` (after the
+  ADPCM reads, before the load-time copy). STATUS `{frame, 4'b0, ran, state,
+  error, stalls}`. Input entries as arcade: 12 bits per player, `3:0` Right
+  Left Down Up, `7:4` A B C D, `8` Start, `9` Select, `10` Coin, `11` the core's
+  bit 11; the core's combination buttons (A+B, C+D) are folded into A–D on the
+  sending side.
+- **Diagnostics** (not the protocol): `DBG` at `+0x2800`, frames 0–127 of a
+  session, two words each: `{Z80 write CRC, machine clocks}` and `{Z80 SDRAM
+  wait samples, machine clocks the 68000 waits for the SDRAM, Z80 writes,
+  68000 writes}` (Main's file still calls the second column `late`). Main_MiSTer
+  clears it when a session starts and writes it with the CRCs to
+  `netplay/neogeo-dbg-<mode>.txt` after frame 130 or when the session ends;
+  `neogeo_sim --session` prints the same (`D` lines), so a MiSTer's run can be
+  set against the bench's and two MiSTers' runs against each other. `TRACE` at
+  `+0x3000`: the first 512 events of a session, 64 bits each as the core
+  makes them, kind in bits 31:28, in the same file (`T` lines: bits 63:32,
+  kind, 23:16, 15:0) and from the bench. `NP_TRACE68` in `neogeo.sv` picks
+  the source. The Z80: `{machine clocks since the release, kind, data,
+  address}` (kinds: 1 Z80 port write, 2 port read with the value read, 3
+  interrupt acknowledge, 4 NMI, 5 YM2610 IRQ line, 6 the 68000's sound
+  command). The 68000 (the default since the Z80 matched): 7 a write whose
+  data or strobes differ from the last one traced in its part of the map
+  (eight parts), with the machine clock in the frame in units of 8, its
+  address (bit 16 left out) and data; 8 the start of each frame; 9 an
+  interrupt acknowledge; 10 a read outside the BIOS ROM and the LSPC, as 7;
+  11, the first event, made at the release: the machine clocks it ran before
+  the session (since the FPGA was loaded), times armed, times dropped to IDLE
+  (all, and for a dead heartbeat). `npsim/trace68.py` decodes one file or
+  compares two.
+  Seen with it on hardware: a recording equal to the bench event for event
+  and clock for clock; one replay of it with a single bit different in a
+  value the Z80 had read from memory (01/09, event 173), another replay equal
+  throughout (8279 frames).
+- **Heartbeat:** CTRL `{"CTRL", heartbeat[15:0], session, 4'b0, join, run,
+  enable}`. Main_MiSTer changes the heartbeat all the time (at least every
+  0.1 s). IDLE arms only when the heartbeat moved between two reads, so a CTRL
+  word left in DDR3 by an earlier session never arms netplay (DDR3 is not
+  cleared when cores change); a heartbeat that stands still for 2^24 clocks
+  (0.35 s) ends the session (RUN: error CTRL_DROP).
+- **Frame tick:** the start of the machine's vertical blank (`BNKB` falling).
+- **Freezing (`hold`):** every clock enable of the machine comes from the core's
+  24 MHz pair (`CLK_EN_24M_N/P`); `hold` stops it, so no pulse is lost or caught
+  up. `hold` is a register: the freeze starts in the clock after the tick, the
+  same clock of the machine on both MiSTers. Every frame start is held at least
+  `HOLD_MIN` = 64 clocks, longer while INPUT[k] is missing: an SDRAM read in
+  flight at the tick ends inside the hold on every MiSTer, so a hold's length
+  never reaches the machine. Unlike SNES (10.1) clock enables are enough here:
+  the requirement is shown in simulation (T2n: different hold lengths give
+  identical writes and timing in the machine's own clocks).
+- **SDRAM refresh in a hold:** the machine's refresh comes with its picture and
+  stops in a hold. A hold older than `HOLD_MIN` asks `sdram_mux` for a refresh
+  (`NP_RFSH`, a toggle) every 340 clocks (7.1 µs; the SDRAM needs one per
+  7.8 µs) and lasts until 16 clocks after the last one, so the machine never
+  meets one. The module decides both, so a hold cannot end while a refresh it
+  asked for runs. (Refresh is not modelled in the simulation: the chip model
+  keeps its data.)
+- **CRC:** over the game state, not the picture: each frame's INPUT, then every
+  write of the 68000 in its first clock (address bits 23:1, UDS, data), CRC-32.
+  The sprites and the fix layer wait for the SDRAM; the picture is no evidence
+  of a desync.
+- Picture: the held pixel enable stops the scaler's input, so HDMI repeats the
+  newest frame; `HDMI_FREEZE` is not used (arcade, 12.3).
+
+### 14.4 Main_MiSTer (`support/netplay/netplay.cpp`, `SYS_NEOGEO`)
+
+- **The core:** name `NEOGEO` and the OSD option `...,Netplay,netplay.ini,...`
+  in its configuration string (the MiSTer-devel core has none: not armed).
+  OSD bits `[46:45]`. The room's core is `NEOGEO`; the server hands out no
+  Neo Geo games (ROM sets are folders and zips), and there is no room folder:
+  Join takes the oldest waiting room with this ROM set (`*`).
+- **Protocol:** version 4 (the arcade encoding) with system byte 5. HELLO
+  carries `rom_md5` = the ROM set, `boot_md5` = the BIOS files, `settings` =
+  `{DIP [9:7], BIOS [22], Video Mode [3], System Type [1]}`, `sav_md5` zeros
+  (the card is unplugged). Different: `REJ_ROM` "Different ROM set", `REJ_BIOS`
+  "Different BIOS files", `REJ_SETTINGS`; a CD is `REJ_SYSTEM`.
+- **ROM set md5:** the program (P ROMs) and M1 as the loader sends them to the
+  core (`netplay_neogeo_data()` from `load_rom_to_mem`), in the order of their
+  place in the core (P1 `$200000`, P1 second half `$280000`, P2 `$300000`, then
+  M1), and the cart's configuration word (protection chips, wait states). So
+  the same game matches from a Darksoft folder, a MAME zip or a `.neo` file
+  (seen on hardware: two packs of the same game did not match by file). The
+  sprites and the ADPCM samples decide no game timing and are left out.
+- **BIOS md5:** the system ROM the loader sends (`uni-bios.rom` unless the OSD
+  says Original or it is missing, else `neo-epo.sp1` for AES and `sp-s2.sp1`
+  for MVS), `sfix.sfix` and `000-lo.lo`, from the folder that holds
+  `000-lo.lo` (the ROM set's, or up to two above it).
+- **Loading (two calls in `neogeo_romset_tx`):** before the load, with Netplay
+  on (OSD Host or Join, or `netplay.ini`), `netplay_neogeo_before()`:
+  - the first ROM set since the core was loaded: the thread writes CTRL
+    (enable, session 0) with a heartbeat on every loop until the core says
+    ARMED (at most 1 s, else "the core did not respond" and no session); the
+    load then goes into a machine held in reset;
+  - a later one: the machine has run, so Main writes the ROM set's path into
+    DDR3 behind the mailbox's rings (`0x3000`: "NNPPEND1", the time, the path)
+    and loads the core (RBF) again, which restarts Main; `netplay_start()` takes
+    the path if it is less than 30 s old and `netplay_poll()` loads it.
+  After the load `netplay_neogeo_loaded()` starts the session as a game load
+  does on the other cores.
+- **Session:** the engine's as arcade, except: in WAIT_CORE the core must be
+  ARMED (not IDLE: "load the game again"); CTRL carries a new heartbeat on every
+  step while enabled (`ctrl_word(..., heartbeat)`); the "reload" is nothing (the
+  machine waits in reset since before the load). A pre-arm without a session
+  ends after 120 s (a load that never finished).
+
+### 14.5 Tests (Neo Geo)
+
+| Test | What | Pass |
+| --- | --- | --- |
+| T2n | `make -C NeoGeo_MiSTer/npsim det ROM=<romset folder> BIOS=<bios folder>`: the whole core (`emu`) in Verilator, the SDRAM controller its own with an exact chip model; the bench is Main_MiSTer (the loader, and the netplay thread: arms before the load, starts the session, writes INPUT[k] from a fixed script, with a heartbeat) and the DDR3 with adjustable timing. Six sessions: DDR3 with jitter and pauses, DDR3 slower, the other clock phase, the session started 2 and 20 frames later, and input late on 2 to 50 % of the frames by up to 6 frames (holds of different lengths, long ones with SDRAM refreshes); DDR3 and the SDRAM start with different garbage (`--fill`), Main gives different times (`--rtc`), and the save file is read after the load with Main answering each sector after 0 to 60,000 clocks (`--sd`, still going on when the session starts in some runs), and two runs get a boot ROM at the core's start 12 and 25 frames before the ROM set (`--bootrom`; the bench heartbeats only once it has armed, as Main) | per frame of the session both CPUs' writes, their timing in the machine's own clocks (held clocks do not count) and the CRC in the mailbox equal to the reference run's (upstream: the Z80's writes differ from its first frame) |
+| T3n | `make -C Main_MiSTer/support/netplay/test`: `test_netplay` (heartbeat word, settings, `ran`, a session on a core not armed is refused, a pre-armed one runs and the core takes the session's id, a heartbeat that stops ends it, a left-over CTRL word never arms); `NP_SYSTEM=neogeo` UDP runs with a fake core that keeps the module's rules: direct, through the server, the host played the game first (core reload: Main's restart with the path in DDR3), the join has the program in two files (same game, other pack), a different ROM set and a different BIOS refused | `PASS` |
+| T2n-s | `obj_trace/neogeo_sim --snap` and `snapdiff.py`: every signal of the core 64 clocks after the reset's end, in runs as above | no signal differs (not counted: the SDRAM controller's start-up counter and the framework's OSD button timer) |

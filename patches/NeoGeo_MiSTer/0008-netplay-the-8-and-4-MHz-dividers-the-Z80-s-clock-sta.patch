@@ -1,0 +1,107 @@
+From 1b4f30dfbf1577b31c662a03ad672b6cc4a0346e Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 14 Nov 2026 23:52:26 +0100
+Subject: [PATCH] netplay: the 8 and 4 MHz dividers (the Z80's clock) start
+ with the machine's reset (their phase to the picture differed between
+ MiSTers: DESYNC at frame 10); bench: --boot-delay
+---
+ npsim/det.sh          | 10 ++++++----
+ npsim/neogeo_sim.cpp  |  5 +++++
+ rtl/video/lspc2_clk.v |  8 +++++++-
+ 3 files changed, 18 insertions(+), 5 deletions(-)
+
+diff --git a/npsim/det.sh b/npsim/det.sh
+index e87c441..a6d8bad 100755
+--- a/npsim/det.sh
++++ b/npsim/det.sh
+@@ -15,6 +15,8 @@
+ # get other times from Main (--rtc), d and f none. All but f have a save file
+ # that the core reads after the load (--sd), Main answering each sector after
+ # another time (so it is still going on when the session starts, or not).
++# b, c, e, f start the load 2 to 10 clocks later after the core's start than
++# a and d (--boot-delay: Main's time from the core load to the ROM load).
+ # (The bench writes INPUT[k] one frame ahead; input later than that holds the
+ # machine at the frame start.)
+ #
+@@ -45,11 +47,11 @@ run() {   # name, options...
+ 	  "$sim" "$rom" "$bios" --frames "$frames" --session "$@" > out.txt 2> err.txt )
+ }
+ run a --ddr-lat 12 --fill 1 --rtc 08020261114170957 --sd 2000 "$@" &
+-run b --ddr-lat 12 --ddr-jit 40 --ddr-busy 20 --seed 1 --stall 100 1600000 --fill 2 --rtc 08020261114170951 --sd 20000 "$@" &
+-run c --ddr-lat 30 --seed 2 --stall 300 1200000 --fill 3 --rtc 08040260803092301 --sd 60000 "$@" &
++run b --ddr-lat 12 --ddr-jit 40 --ddr-busy 20 --seed 1 --stall 100 1600000 --boot-delay 2 --fill 2 --rtc 08020261114170951 --sd 20000 "$@" &
++run c --ddr-lat 30 --seed 2 --stall 300 1200000 --boot-delay 4 --fill 3 --rtc 08040260803092301 --sd 60000 "$@" &
+ run d --ddr-lat 12 --phase 1 --start-delay 1600000 --seed 3 --stall 50 800000 --sd 0 "$@" &
+-run e --ddr-lat 12 --start-delay 16000000 --seed 4 --stall 100 4800000 --fill 5 --rtc 08070201231235959 --sd 40000 "$@" &
+-run f --ddr-lat 12 --ddr-jit 40 --ddr-busy 20 --seed 7 --stall 500 800000 --fill 6 "$@" &
++run e --ddr-lat 12 --start-delay 16000000 --seed 4 --stall 100 4800000 --boot-delay 6 --fill 5 --rtc 08070201231235959 --sd 40000 "$@" &
++run f --ddr-lat 12 --ddr-jit 40 --ddr-busy 20 --seed 7 --stall 500 800000 --boot-delay 10 --fill 6 "$@" &
+ wait
+ for n in a b c d e f; do
+ 	grep -q '^RESULT' "$work/$n/out.txt" || { echo "FAIL: run $n did not finish:"; tail -n 3 "$work/$n/out.txt" "$work/$n/err.txt"; exit 1; }
+diff --git a/npsim/neogeo_sim.cpp b/npsim/neogeo_sim.cpp
+index 2be7748..bc16252 100644
+--- a/npsim/neogeo_sim.cpp
++++ b/npsim/neogeo_sim.cpp
+@@ -29,6 +29,8 @@
+ //                     (the core holds the machine until it is there)
+ //     --fill S        DDR3 and the SDRAM start with garbage (seed S), as on a
+ //                     MiSTer that ran another core or game before; default zero
++//     --boot-delay C  C more clocks of 48 MHz between the core's start and the
++//                     ROM load (Main_MiSTer's time differs from one load to the next)
+ //     --sd N          a save file is mounted at the end of the load, and the core
+ //                     reads it (its backup RAM and memory card, 72 KB), each
+ //                     sector answered N clocks after the request (Main_MiSTer
+@@ -92,6 +94,7 @@ static uint64_t clk96_count = 0;
+ // address in words from 0 (the core adds 0x30000000 >> 3), a command is taken
+ // on a clock with BUSY low, read data comes back later with DOUT_READY.
+ static int sd_lat = -1;
++static int boot_delay = 0;
+ static const uint32_t DDR_BASE = 0x30000000, DDR_SIZE = 0x10000000;
+ static uint8_t *ddr;
+ static int ddr_lat = 12, ddr_jit = 0, ddr_busy_pm = 0;
+@@ -572,6 +575,7 @@ int main(int argc, char **argv)
+ 		else if (a == "--quiet") quiet = true;
+ 		else if (a == "--ztrace") { ztrace_a = num(); ztrace_b = num(); }
+ 		else if (a == "--snap") { if (i + 1 >= argc) return 2; snap_file = argv[++i]; }
++		else if (a == "--boot-delay") boot_delay = num();
+ 		else if (a == "--sd") { sd_lat = num(); plus.push_back("+sdlat=" + std::to_string(sd_lat)); }
+ 		else if (a == "--fill") { fill = num(); plus.push_back("+fill=" + std::to_string(fill)); }
+ 		else if (a == "--rtc") { if (i + 1 >= argc) return 2; plus.push_back(std::string("+rtc=") + argv[++i]); }
+@@ -612,6 +616,7 @@ int main(int argc, char **argv)
+ 	run48(200);
+ 	top->reset = 0;
+ 	run48(8000);                       // the SDRAM's start-up
++	run48(boot_delay);                 // Main_MiSTer takes its time before it loads the ROM set
+ 
+ 	if (session) { ctrl_write(); run48(20000); }   // Main arms netplay before it loads the ROM set
+ 	fprintf(stderr, "loading %s\n", rom.c_str());
+diff --git a/rtl/video/lspc2_clk.v b/rtl/video/lspc2_clk.v
+index 50094ea..5f960e9 100644
+--- a/rtl/video/lspc2_clk.v
++++ b/rtl/video/lspc2_clk.v
+@@ -55,6 +55,11 @@ always @(posedge CLK) begin
+ 		CLK_24M <= 0;
+ 		if (!nRESETP) begin
+ 			DIV_CNT <= 4'b0010;
++			// netplay: the 8 and 4 MHz (the Z80's clock) start with the
++			// reset too, as the picture does: free-running, their phase to the
++			// picture was the time since the FPGA was loaded, and the Z80 ran
++			// up to 4 clocks of 24 MHz apart on two MiSTers (seen on hardware)
++			DIV_CNT3 <= 2'd0;
+ 		end else begin
+ 			DIV_CNT <= DIV_CNT + 1'd1;
+ 			DIV_CNT3 <= DIV_CNT3 + 1'd1;
+@@ -79,7 +84,8 @@ wire      CLK8_FALL = CLK_EN_24M_P & DIV_CNT3 == 2;
+ wire      CLK8_RISE = CLK_EN_24M_N & DIV_CNT3 == 0;
+ always @(posedge CLK) if (CLK8_FALL) LSPC_8M <= 0; else if (CLK8_RISE) LSPC_8M <= 1;
+ 
+-always @(posedge CLK) if (CLK8_FALL) LSPC_4M <= ~LSPC_4M;
++// the reset pulse is one 24 MHz cycle long: taken on any clock
++always @(posedge CLK) if (!nRESETP) LSPC_4M <= 1'b0; else if (CLK8_FALL) LSPC_4M <= ~LSPC_4M;
+ assign    LSPC_EN_4M_P = ~LSPC_4M & CLK8_FALL;
+ assign    LSPC_EN_4M_N =  LSPC_4M & CLK8_FALL;
+ 
+-- 
+2.43.0
+

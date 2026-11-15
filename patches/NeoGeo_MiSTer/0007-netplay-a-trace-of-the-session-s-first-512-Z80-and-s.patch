@@ -1,0 +1,199 @@
+From 270998d6e5de2b1a5a12fb60b8368f6f7861a7fd Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 14 Nov 2026 22:49:42 +0100
+Subject: [PATCH] netplay: a trace of the session's first 512 Z80 and
+ sound-command events with machine clocks (TRACE, diagnostics)
+---
+ neogeo.sv                     | 33 +++++++++++++++++++++++++
+ npsim/neogeo_sim.cpp          |  7 ++++++
+ rtl/netplay/neogeo_netplay.sv | 46 +++++++++++++++++++++++++++++++++--
+ 3 files changed, 84 insertions(+), 2 deletions(-)
+
+diff --git a/neogeo.sv b/neogeo.sv
+index 3e986d1..dc0f206 100644
+--- a/neogeo.sv
++++ b/neogeo.sv
+@@ -537,6 +537,37 @@ always @(posedge CLK_48M) np_w68 <= np_w68_now;
+ // the SDRAM, the YM2610's ADPCM data late (assigned where those are)
+ wire np_dbg_zwait, np_dbg_late;
+ wire np_bk_loading;                   // the core reads the save file (assigned below)
++
++// diagnostics: the trace's events (TRACE in neogeo_netplay.sv), one per clock:
++// 1 Z80 port write, 2 Z80 port read (at its end, with what the Z80 read),
++// 3 Z80 interrupt acknowledge, 4 NMI to the Z80, 5 the YM2610's IRQ line
++// changes (data: its new level), 6 the 68000 writes the sound command
++reg        np_ev;
++reg [31:0] np_ev_w;
++reg        ev_iow, ev_ior, ev_ack, ev_nmi, ev_int, ev_cmd;
++reg [15:0] ev_ra;
++reg  [7:0] ev_rd;
++always @(posedge CLK_48M) begin
++	reg iow_now, ior_now, ack_now;
++	iow_now = ~nIORQ & ~nSDWR;
++	ior_now = ~nIORQ & ~nSDRD;
++	ack_now = ~nIORQ & nSDRD & nSDWR;
++	ev_iow <= iow_now;
++	ev_ior <= ior_now;
++	ev_ack <= ack_now;
++	ev_nmi <= Z80_nNMI;
++	ev_int <= Z80_nINT;
++	ev_cmd <= nSDW;
++	if (ior_now) begin ev_ra <= SDA; ev_rd <= SDD_IN; end
++	np_ev <= 1'b1;
++	if (iow_now & ~ev_iow)          np_ev_w <= {4'd1, 4'd0, SDD_OUT, SDA};
++	else if (~ior_now & ev_ior)     np_ev_w <= {4'd2, 4'd0, ev_rd, ev_ra};
++	else if (ack_now & ~ev_ack)     np_ev_w <= {4'd3, 4'd0, SDD_IN, SDA};
++	else if (~Z80_nNMI & ev_nmi)    np_ev_w <= {4'd4, 4'd0, 8'd0, SDA};
++	else if (Z80_nINT != ev_int)    np_ev_w <= {4'd5, 4'd0, 7'd0, Z80_nINT, SDA};
++	else if (~nSDW & ev_cmd)        np_ev_w <= {4'd6, 4'd0, M68K_DATA[15:8], M68K_ADDR[16:1]};
++	else                            np_ev <= 1'b0;
++end
+ reg  np_wz80;
+ wire np_wz80_now = ~nSDWR & (~nMREQ | ~nIORQ);
+ always @(posedge CLK_48M) np_wz80 <= np_wz80_now;
+@@ -559,6 +590,8 @@ neogeo_netplay NETPLAY
+ 	.dbg_z80({~nIORQ, SDA, SDD_OUT}),
+ 	.dbg_zwait(np_dbg_zwait),
+ 	.dbg_late(np_dbg_late),
++	.dbg_ev(np_ev),
++	.dbg_ev_w(np_ev_w),
+ 	.rfsh_req(np_rfsh),
+ 	.active(np_active),
+ 	.hold_reset(np_hold_reset),
+diff --git a/npsim/neogeo_sim.cpp b/npsim/neogeo_sim.cpp
+index 925d3fd..2be7748 100644
+--- a/npsim/neogeo_sim.cpp
++++ b/npsim/neogeo_sim.cpp
+@@ -653,6 +653,13 @@ int main(int argc, char **argv)
+ 			printf("D %3d zcrc=%08x ticks=%u zwait=%u late=%u nz80=%u n68=%u\n", f, (unsigned)(w0 >> 32), (unsigned)w0,
+ 			       (unsigned)(w1 >> 48), (unsigned)(w1 >> 32) & 0xFFFF, (unsigned)(w1 >> 16) & 0xFFFF, (unsigned)w1 & 0xFFFF);
+ 		}
++		// the trace (TRACE): machine clock, kind, data, address
++		for (int i = 0; i < 512; i++)
++		{
++			uint64_t t = mb_read(0x3000 + 8 * i);
++			if (!t) break;
++			printf("T %3d %10u %u %02x %04x\n", i, (unsigned)(t >> 32), (unsigned)(t >> 28) & 15, (unsigned)(t >> 16) & 255, (unsigned)t & 0xFFFF);
++		}
+ 	}
+ 	printf("RESULT frames=%d s68=%016llx sz80=%016llx time=%016llx ddr_reads=%llu ddr_writes=%llu\n", frames, (unsigned long long)all_s68,
+ 	       (unsigned long long)all_sz80, (unsigned long long)all_time, (unsigned long long)ddr_reads, (unsigned long long)ddr_writes);
+diff --git a/rtl/netplay/neogeo_netplay.sv b/rtl/netplay/neogeo_netplay.sv
+index 5680776..6f3ff16 100644
+--- a/rtl/netplay/neogeo_netplay.sv
++++ b/rtl/netplay/neogeo_netplay.sv
+@@ -15,6 +15,8 @@
+ //   DBG    +0x2800  frames 0-127 of a session, two words each (diagnostics,
+ //                   not part of the protocol): {Z80 write CRC, machine clocks},
+ //                   {Z80 wait samples, late ADPCM samples, Z80 writes, 68000 writes}
++//   TRACE  +0x3000  the first 512 events of a session (diagnostics): {machine
++//                   clocks since the release, kind, data, address} (dbg_ev)
+ //
+ // Joy words (active high): 3:0 Right Left Down Up, 7:4 A B C D, 8 Start,
+ // 9 Select, 10 Coin, 11 the core's bit 11 (A+B+C).
+@@ -69,6 +71,8 @@ module neogeo_netplay #(
+ 	input      [24:0] dbg_z80,        // {port, address, data}
+ 	input             dbg_zwait,      // a Z80 clock in which it waits for the SDRAM
+ 	input             dbg_late,       // a YM2610 clock in which its ADPCM data is late
++	input             dbg_ev,         // an event for the trace (TRACE)
++	input      [31:0] dbg_ev_w,       // {kind[3:0], 4'b0, data[7:0], address[15:0]}
+ 	output reg        rfsh_req,       // toggles: sdram_mux refreshes the SDRAM (only in a hold)
+ 
+ 	output            active,
+@@ -102,6 +106,7 @@ localparam logic [15:0] OFF_LOCAL  = 16'h1000;
+ localparam logic [15:0] OFF_CRC    = 16'h1800;
+ localparam logic [15:0] OFF_INPUT  = 16'h2000;
+ localparam logic [15:0] OFF_DBG    = 16'h2800;
++localparam logic [15:0] OFF_TRACE  = 16'h3000;
+ 
+ localparam logic [63:0] MAGIC      = 64'h3130504E47454F4E; // "NEOGNP01"
+ localparam logic [31:0] CTRL_MAGIC = 32'h4C525443;          // "CTRL"
+@@ -198,6 +203,14 @@ logic [15:0] d_zwait, d_late, d_nz, d_n68;
+ logic [63:0] dq0, dq1;
+ logic  [6:0] dq_frame;
+ logic  [1:0] p_dbg;           // words of the last frame still to write
++// the trace: events on their way to DDR3 (a queue of 16), and where they go
++logic [31:0] t_clk;           // machine clocks since the release
++logic [63:0] tq [16];
++logic  [3:0] tq_w, tq_r;
++logic  [9:0] t_in, t_out;     // events taken, written (512: the trace is full)
++logic  [9:0] t_push;          // events in the queue so far (t_in stops at 512 when it overflows)
++wire   [9:0] tq_cnt = t_push - t_out;
++wire   [4:0] tq_n   = tq_cnt[4:0];
+ logic [15:0] local_frame;
+ logic [11:0] local_val;
+ logic [15:0] crc_frame;
+@@ -221,6 +234,7 @@ localparam logic [2:0] OP_STATUS  = 3'd4;
+ localparam logic [2:0] OP_CTRL    = 3'd5;
+ localparam logic [2:0] OP_INPUT   = 3'd6;
+ localparam logic [2:0] OP_DBG     = 3'd7;
++logic        op_trace;        // OP_DBG writes a trace event
+ 
+ logic [2:0]  op;
+ logic [31:0] op_frame;
+@@ -290,6 +304,21 @@ always_ff @(posedge clk) begin
+ 		p_dbg <= 2'd0;
+ 	end
+ 
++	// the trace: events from the release on, the first 512 (a full queue ends it)
++	if (state == S_RUN) begin
++		if (dbg_tick) t_clk <= t_clk + 32'd1;
++		if (dbg_ev && t_in != 10'd512) begin
++			if (tq_n == 5'd16) t_in <= 10'd512;
++			else begin
++				tq[tq_w] <= {t_clk, dbg_ev_w};
++				tq_w     <= tq_w + 4'd1;
++				t_in     <= t_in + 10'd1;
++				t_push   <= t_push + 10'd1;
++			end
++		end
++	end
++	if (start0) begin t_clk <= 32'd0; t_in <= 10'd0; t_out <= 10'd0; t_push <= 10'd0; tq_w <= 4'd0; tq_r <= 4'd0; end
++
+ 	// -----------------------------------------------------------------------
+ 	// Per-frame work in RUN
+ 	if (state == S_RUN) begin
+@@ -372,10 +401,16 @@ always_ff @(posedge clk) begin
+ 			op <= OP_STATUS;  ddr_addr <= waddr(OFF_STATUS[15:3]); ddr_din <= status_word; ddr_we <= 1'b1; ddr_req <= ~ddr_req;
+ 		end
+ 		else if (p_dbg != 2'd0) begin
+-			op <= OP_DBG;     ddr_addr <= waddr(OFF_DBG[15:3] + {5'd0, dq_frame, p_dbg == 2'd1});
++			op <= OP_DBG;     op_trace <= 1'b0; ddr_addr <= waddr(OFF_DBG[15:3] + {5'd0, dq_frame, p_dbg == 2'd1});
+ 			ddr_din <= (p_dbg == 2'd2) ? dq0 : dq1;
+ 			ddr_we <= 1'b1; ddr_req <= ~ddr_req;
+ 		end
++		else if (tq_n != 5'd0) begin
++			op <= OP_DBG;     op_trace <= 1'b1;
++			ddr_addr <= waddr(OFF_TRACE[15:3] + {4'd0, t_out[8:0]});
++			ddr_din  <= tq[tq_r];
++			ddr_we <= 1'b1; ddr_req <= ~ddr_req;
++		end
+ 		else if (ctrl_due) begin
+ 			op <= OP_CTRL;    ddr_addr <= waddr(OFF_CTRL[15:3]);   ddr_we <= 1'b0; ddr_req <= ~ddr_req;
+ 		end
+@@ -392,7 +427,8 @@ always_ff @(posedge clk) begin
+ 			OP_CRC:     p_crc      <= 1'b0;
+ 			OP_LOCAL:   p_local    <= 1'b0;
+ 			OP_STATUS:  p_status   <= 1'b0;
+-			OP_DBG:     p_dbg      <= p_dbg - 2'd1;
++			OP_DBG:     if (op_trace) begin tq_r <= tq_r + 4'd1; t_out <= t_out + 10'd1; end
++			            else p_dbg <= p_dbg - 2'd1;
+ 			OP_INPUT: begin
+ 				poll_due <= 1'b0;
+ 				// A frame starting in this very clock shifts the lookahead: drop
+@@ -478,6 +514,12 @@ always_ff @(posedge clk) begin
+ 		p_local    <= 1'b0;
+ 		p_crc      <= 1'b0;
+ 		p_dbg      <= 2'd0;
++		t_in       <= 10'd512;
++		t_out      <= 10'd0;
++		t_push     <= 10'd0;
++		tq_w       <= 4'd0;
++		tq_r       <= 4'd0;
++		op_trace   <= 1'b0;
+ 		poll_cnt   <= 16'd0;
+ 		ctrl_cnt   <= 16'd0;
+ 		poll_due   <= 1'b0;
+-- 
+2.43.0
+

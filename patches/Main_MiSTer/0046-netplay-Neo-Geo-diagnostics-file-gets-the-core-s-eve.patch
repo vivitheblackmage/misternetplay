@@ -1,0 +1,50 @@
+From c65e45a3d1de52cb565d315b14d05366f199ba1c Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 14 Nov 2026 22:49:42 +0100
+Subject: [PATCH 46/46] netplay: Neo Geo diagnostics file gets the core's event
+ trace
+---
+ support/netplay/netplay.cpp | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 8c73d88..19716c2 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -601,7 +601,7 @@ static bool save_recording(const char *path, const Recording &r, const uint8_t *
+ // Neo Geo diagnostics (neogeo_netplay.sv, DBG): per frame of the first 128,
+ // the Z80's writes, the machine's clocks, waits, and the CRC, to compare two
+ // runs of the same session (netplay/neogeo-dbg-<mode>.txt, the last one per mode)
+-constexpr uint32_t NEO_DBG = 0x2800;
++constexpr uint32_t NEO_DBG = 0x2800, NEO_TRACE = 0x3000;
+ static void neo_dbg_dump(const Mailbox &mb, Mode mode, uint32_t frames)
+ {
+ 	static const char *names[] = { "off", "host", "join", "record", "replay" };
+@@ -617,6 +617,15 @@ static void neo_dbg_dump(const Mailbox &mb, Mode mode, uint32_t frames)
+ 		        (unsigned)(w1 >> 32) & 0xFFFF, (unsigned)(w1 >> 16) & 0xFFFF, (unsigned)w1 & 0xFFFF,
+ 		        (unsigned)(c >> 32) & 0xFFFF, (unsigned)c & 0xFFFF);
+ 	}
++	// the trace: the first 512 events of the session (kind 1 Z80 port write,
++	// 2 port read, 3 interrupt acknowledge, 4 NMI, 5 YM2610 IRQ line, 6 sound command)
++	fprintf(f, "# trace: index clock kind data address\n");
++	for (uint32_t i = 0; i < 512; i++)
++	{
++		uint64_t t = mb.rd(NEO_TRACE + 8 * i);
++		if (!t) break;
++		fprintf(f, "T %3u %10u %u %02x %04x\n", i, (unsigned)(t >> 32), (unsigned)(t >> 28) & 15, (unsigned)(t >> 16) & 255, (unsigned)t & 0xFFFF);
++	}
+ 	fclose(f);
+ }
+ 
+@@ -902,7 +911,7 @@ static void *netplay_thread(void *)
+ 				uint8_t seed = (uint8_t)((now ^ (now >> 8) ^ getpid()) | 1);
+ 				s = new Session(mode, cfg.delay, mb, udp, &rec, seed);
+ 				s->set_local(li);
+-				if (core_sys == SYS_NEOGEO) for (uint32_t o = NEO_DBG; o < NEO_DBG + 0x800; o += 8) mb.wr(o, 0);
++				if (core_sys == SYS_NEOGEO) for (uint32_t o = NEO_DBG; o < NEO_TRACE + 0x1000; o += 8) mb.wr(o, 0);
+ 				dbg_dumped = false;
+ 			}
+ 			neo_prearm = false;              // the session's CTRL from now on (none: the machine goes)
+-- 
+2.43.0
+

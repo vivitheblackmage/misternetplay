@@ -1,0 +1,87 @@
+From 9421f93feb92a54abb48587c0674ca0c75629fa8 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 14 Nov 2026 21:05:46 +0100
+Subject: [PATCH 45/46] netplay: Neo Geo recordings can be replayed (the reader
+ refused the system); the core's per-frame diagnostics (DBG) to
+ netplay/neogeo-dbg-<mode>.txt
+---
+ support/netplay/netplay.cpp | 35 ++++++++++++++++++++++++++++++++++-
+ 1 file changed, 34 insertions(+), 1 deletion(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 92eee01..8c73d88 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -598,6 +598,28 @@ static bool save_recording(const char *path, const Recording &r, const uint8_t *
+ 	return ok;
+ }
+ 
++// Neo Geo diagnostics (neogeo_netplay.sv, DBG): per frame of the first 128,
++// the Z80's writes, the machine's clocks, waits, and the CRC, to compare two
++// runs of the same session (netplay/neogeo-dbg-<mode>.txt, the last one per mode)
++constexpr uint32_t NEO_DBG = 0x2800;
++static void neo_dbg_dump(const Mailbox &mb, Mode mode, uint32_t frames)
++{
++	static const char *names[] = { "off", "host", "join", "record", "replay" };
++	char rel[64];
++	snprintf(rel, sizeof(rel), "netplay/neogeo-dbg-%s.txt", names[mode < 5 ? mode : 0]);
++	FILE *f = fopen(getFullPath(rel), "w");
++	if (!f) return;
++	fprintf(f, "# frame zcrc ticks zwait late nz80 n68 crc (frames run: %u)\n", frames);
++	for (uint32_t k = 0; k < 128 && k + 1 < frames; k++)
++	{
++		uint64_t w0 = mb.rd(NEO_DBG + 16 * k), w1 = mb.rd(NEO_DBG + 16 * k + 8), c = mb.rd(MB_CRC + 8 * (k & 255));
++		fprintf(f, "%3u %08x %u %u %u %u %u %04x%04x\n", k, (unsigned)(w0 >> 32), (unsigned)w0, (unsigned)(w1 >> 48),
++		        (unsigned)(w1 >> 32) & 0xFFFF, (unsigned)(w1 >> 16) & 0xFFFF, (unsigned)w1 & 0xFFFF,
++		        (unsigned)(c >> 32) & 0xFFFF, (unsigned)c & 0xFFFF);
++	}
++	fclose(f);
++}
++
+ static bool load_recording(const char *path, Recording *r, uint8_t *md5, uint8_t *md5b)
+ {
+ 	FILE *f = fopen(path, "rb");
+@@ -609,7 +631,7 @@ static bool load_recording(const char *path, Recording *r, uint8_t *md5, uint8_t
+ 	bool wide = ok && magic[3] == '3';
+ 	ok = ok && fread(md5, 16, 1, f) == 1
+ 	       && fread(&r->delay, 1, 1, f) == 1 && r->delay >= 2 && r->delay <= 15
+-	       && (!wide || (fread(&sys, 1, 1, f) == 1 && (sys == SYS_SNES || sys == SYS_GB2P || sys == SYS_ARCADE)))
++	       && (!wide || (fread(&sys, 1, 1, f) == 1 && (sys == SYS_SNES || sys == SYS_GB2P || sys == SYS_ARCADE || sys == SYS_NEOGEO)))
+ 	       && (sys != SYS_GB2P || (fread(md5b, 16, 1, f) == 1 && fread(&r->rtc_time, 4, 1, f) == 1))
+ 	       && (sys != SYS_ARCADE || fread(&r->dip, 8, 1, f) == 1)
+ 	       && fread(&n, 4, 1, f) == 1 && n < 10000000;
+@@ -774,6 +796,7 @@ static void *netplay_thread(void *)
+ 	Mode      mode = M_OFF;         // this session's mode
+ 	uint32_t  seen_rom = 0, seen_msg = 0;
+ 	bool      saved = false, left = false;
++	bool      dbg_dumped = true;    // Neo Geo: this session's diagnostics are in their file
+ 
+ 	while (!quit)
+ 	{
+@@ -879,6 +902,8 @@ static void *netplay_thread(void *)
+ 				uint8_t seed = (uint8_t)((now ^ (now >> 8) ^ getpid()) | 1);
+ 				s = new Session(mode, cfg.delay, mb, udp, &rec, seed);
+ 				s->set_local(li);
++				if (core_sys == SYS_NEOGEO) for (uint32_t o = NEO_DBG; o < NEO_DBG + 0x800; o += 8) mb.wr(o, 0);
++				dbg_dumped = false;
+ 			}
+ 			neo_prearm = false;              // the session's CTRL from now on (none: the machine goes)
+ 		}
+@@ -941,6 +966,14 @@ static void *netplay_thread(void *)
+ 				lobby_unpin(seen_rom);
+ 			}
+ 
++			// Neo Geo: the core's diagnostics of the first frames (once frame 130
++			// is past, or the session ended in them)
++			if (core_sys == SYS_NEOGEO && !dbg_dumped && s->frames() > 0 && (s->frames() >= 130 || s->phase() == PH_DONE))
++			{
++				dbg_dumped = true;
++				neo_dbg_dump(mb, mode, s->frames());
++			}
++
+ 			// Only a recording that has frames: a session refused at the start
+ 			// would overwrite the last good file, and hide the reason on the OSD.
+ 			if (mode == M_RECORD && s->phase() == PH_DONE && !saved)
+-- 
+2.43.0
+

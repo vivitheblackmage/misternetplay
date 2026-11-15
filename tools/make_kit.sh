@@ -54,6 +54,11 @@ gbarbf="$root/GBA_MiSTer/output_files/GBA.rbf"
 if [ -f "$gbarbf" ]; then
   cp "$gbarbf" "$kit/_Console/GBA_netplay.rbf"
 fi
+# Neo Geo (SPEC.md 14), when it is built: next to the normal NeoGeo core
+neorbf="$root/NeoGeo_MiSTer/output_files/NeoGeo.rbf"
+if [ -f "$neorbf" ]; then
+  cp "$neorbf" "$kit/_Console/NeoGeo_netplay.rbf"
+fi
 # arcade (SPEC.md 12): next to Jotego's jtbubl.rbf, never over it
 arbf="$root/jtcores/release/mister/jtbubl.rbf"
 if [ -f "$arbf" ]; then
@@ -63,8 +68,8 @@ if [ -f "$arbf" ]; then
 fi
 
 cat > "$kit/$ini" <<EOF
-; NES, SNES and Game Boy 2P netplay. The OSD option "Netplay" of NES_netplay, SNES_netplay and
-; GAMEBOY2P_netplay picks Off/Host/Join;
+; NES, SNES, Game Boy 2P, GBA, Neo Geo and arcade netplay. The OSD option "Netplay" of the
+; *_netplay cores picks Off/Host/Join;
 ; this file gives the address, port and delay.
 
 [netplay]
@@ -79,11 +84,12 @@ file=               ; record/replay: empty = one file per game
 EOF
 
 cat > "$kit/README-netplay.txt" <<'EOF'
-NES, SNES, GAME BOY 2P AND ARCADE NETPLAY - GETTING STARTED
+NES, SNES, GAME BOY 2P, GBA, NEO GEO AND ARCADE NETPLAY - GETTING STARTED
 
 1. Unzip everything into the root of the SD card (where the _Console folder is).
    None of your own files is overwritten: the cores are NES_netplay.rbf,
-   SNES_netplay.rbf and GAMEBOY2P_netplay.rbf, the binary MiSTer_online,
+   SNES_netplay.rbf, GAMEBOY2P_netplay.rbf, GBA_netplay.rbf and
+   NeoGeo_netplay.rbf, the binary MiSTer_online,
    NetPong goes to games/NES/NetPong/.
    If you already have a netplay.ini, keep yours and change peer= or server= in it.
    (A kit made with --keep-ini has netplay.ini.example instead: rename it to
@@ -112,6 +118,21 @@ GAME BOY 2P: start GAMEBOY2P_netplay (under Console). It runs two Game Boys
    same, or opens the room in _Netplay/Rooms (both files are in it).
    Needs the SDRAM board. Not supported: MegaDuck (.bin).
 
+NEO GEO (NeoGeo_netplay): the MiSTer Neo Geo core with netplay, cartridge
+   games in Console (AES) mode. It goes next to the normal NeoGeo core, which
+   is not changed. Both MiSTers need the same BIOS files in games/NeoGeo
+   (uni-bios.rom or neo-epo.sp1, sfix.sfix, 000-lo.lo) and the same game. A
+   game matches by its program, so a Darksoft folder, a MAME zip and a .neo
+   file of the same game find each other.
+   Start NeoGeo_netplay on both with the same System Type (Console), BIOS and
+   Video Mode settings. OSD Netplay -> Host on one MiSTer, Join on the other,
+   then both load the game. With a server, Join takes the open room with that
+   game; without one, peer= as below. If a game was played in the core before,
+   the core loads itself again first and the game follows by itself. With
+   Netplay on, the BIOS screen shows only once a game is loaded.
+   The memory card, multitap, spinner and mouse are off during a session.
+   Not supported: Neo Geo CD.
+
 ARCADE (Bubble Bobble): needs Bubble Bobble from the MiSTer updater
    (update_all), i.e. games/mame/bublbobl.zip; both players need the same zip.
    The netplay core is _Arcade/cores/jtbubl-netplay.rbf, next to the normal
@@ -135,7 +156,8 @@ GBA WIRELESS ADAPTER (GBA_netplay): games that use Nintendo's GBA Wireless
    akouzoukos: download it from https://akouzoukos.com/apotris/downloads and
    put Apotris.gba in games/GBA (2 player battle -> wireless).
 
-SWITCHING CORES: to go from NES_netplay to SNES_netplay (or back), reboot from
+SWITCHING CORES: to go from one netplay core to another (NES_netplay to
+   SNES_netplay, say), reboot from
    the MiSTer's menu first and then start the other core. Jumping straight from
    one core to the other can leave netplay without the ROM reload at the start.
 
@@ -175,8 +197,10 @@ OSD errors:
   "Different core settings"  set the same OSD options on both MiSTers
   "Set RAM Clear to $00..."  step 3 (NES)
   "Game chip not supported"  SNES: MSU-1, BS-X or a game with a clock
-  "...runs another console"  you are in different cores (NES, SNES, Game Boy 2P, arcade)
+  "...runs another console"  you are in different cores (NES, SNES, Game Boy 2P, Neo Geo, arcade)
   "Different ROM set (MRA or zip)"  arcade: not the same zip or MRA
+  "Different ROM set"        Neo Geo: not the same game (program)
+  "Different BIOS files"     Neo Geo: not the same uni-bios.rom/sp1, sfix.sfix, 000-lo.lo
   "Different core version (update both)"  arcade: different jtbubl-netplay.rbf
   no connection              the host's router must forward UDP 7845
 EOF

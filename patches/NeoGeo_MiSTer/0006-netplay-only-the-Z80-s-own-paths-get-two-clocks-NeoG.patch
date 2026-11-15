@@ -1,0 +1,34 @@
+From 1d84e8a72fb3b4ad2b510e71e344f7bd031cbaf8 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Sat, 14 Nov 2026 21:56:17 +0100
+Subject: [PATCH] netplay: only the Z80's own paths get two clocks
+ (NeoGeo.sdc); its bus is looked at on every clock (the SDRAM's M1 reads, the
+ port and NMI edges)
+---
+ NeoGeo.sdc | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/NeoGeo.sdc b/NeoGeo.sdc
+index cde91cb..279c242 100644
+--- a/NeoGeo.sdc
++++ b/NeoGeo.sdc
+@@ -3,8 +3,14 @@ derive_clock_uncertainty
+ 
+ set_false_path -from {emu|cfg[*]}
+ 
+-set_multicycle_path -from {emu|Z80CPU|*} -setup 2
+-set_multicycle_path -from {emu|Z80CPU|*} -hold 1
++# The Z80 runs on a 4 MHz enable: its own paths get two clocks. Only its own:
++# what leaves it (its bus) is looked at on every clock, by the SDRAM's M1 reads
++# at 96 MHz and by the edge detectors of the ports and the NMI, and a path
++# allowed two clocks there can be seen a clock earlier on one MiSTer, or in one
++# run, than in another (netplay: a replay of a recording parted at frame 10,
++# the Z80 having waited for the SDRAM 188 times less in frame 9).
++set_multicycle_path -from {emu|Z80CPU|*} -to {emu|Z80CPU|*} -setup 2
++set_multicycle_path -from {emu|Z80CPU|*} -to {emu|Z80CPU|*} -hold 1
+ 
+ # Netplay mailbox (rtl/mem/ddram.sv, 96 MHz -> rtl/netplay/neogeo_netplay.sv,
+ # 48 MHz): np_dout is written together with np_ack, and the module reads it only
+-- 
+2.43.0
+

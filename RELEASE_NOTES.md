@@ -1,5 +1,65 @@
 # Release notes
 
+## v0.6: Neo Geo
+
+### New: Neo Geo netplay
+
+- **`NeoGeo_netplay.rbf`**: the MiSTer Neo Geo core with lockstep netplay, for
+  cartridge games in Console (AES) mode, two players. Both MiSTers run the
+  same frames, and only the controllers cross the network. It goes in
+  `_Console` next to the normal NeoGeo core, which is not changed.
+- In the OSD: **Netplay → Host** on one MiSTer and **Join** on the other, then
+  both load the same game. With a server, Join takes the open room with that
+  game; without one, `peer=` in `netplay.ini` as on the other cores.
+- Both need the same BIOS files in `games/NeoGeo` (`uni-bios.rom`, or
+  `neo-epo.sp1` with BIOS Original; `sfix.sfix`, `000-lo.lo`) and the same
+  System Type, BIOS and Video Mode settings. All of this is checked.
+- A game matches by its program, its sound CPU ROM and its cartridge
+  configuration, not by its files: the same game from a Darksoft folder, a
+  MAME zip or a `.neo` file finds the other player's room. The server never
+  hands out Neo Geo games.
+- A session needs a freshly started machine. If a game was played in the core
+  before, the core loads itself again first, and the game follows by itself.
+- With Netplay on, the core starts only once a game is loaded: there is no
+  BIOS screen before that, even when the SD card has `bootrom/neogeo.rom`.
+- The memory card, multitap, spinner and mouse are off during a session; the
+  OSD's Reset and the user button do nothing.
+
+What was changed in the core so that two MiSTers run it exactly alike (details
+in SPEC.md section 14):
+
+- The sound CPU's ROM (M1) is read from the SDRAM instead of DDR3. DDR3 is
+  shared with the ARM and the scaler, and the Z80 waited a different time for
+  it on every MiSTer.
+- The YM2610 no longer stops when a sample byte from DDR3 is late (sound
+  only: the late byte is the one before it).
+- The machine leaves reset at a fixed point of the picture, after the game's
+  save file has been read. The sound chip's and the video chip's counters and
+  the Z80's clock start with the reset instead of running free.
+- Timing constraints that hold on the hardware for the paths the Z80's bus
+  feeds on every clock.
+
+Built on the MiSTer-devel Neo Geo core (github.com/MiSTer-devel/NeoGeo_MiSTer),
+the work of its contributors credited in its README.
+
+Tested on hardware: two MiSTers over the internet through the lobby server,
+nine sessions with different games and no desync, among them Over Top, Double
+Dragon, Pulstar, Art of Fighting, Shock Troopers 2nd Squad and Aero Fighters 3.
+A recorded Neo Turf Masters session replayed with identical results over 9,000
+frames. In simulation (Verilator): the whole core makes the same writes with
+both CPUs, at the same clocks, in every frame, with the DDR3's timing, the clock
+phase, the session's start, the save file's read and the input's arrival all
+varied, and with a boot ROM at the core's start.
+
+### Known limits
+
+- Neo Geo CD is not supported, and nor are the memory card, multitap, spinner
+  and mouse during a session. Arcade (MVS) mode has not been tested.
+- Neo Geo has no room folder: with a server, Join takes the oldest open room
+  with the game you load.
+- Update both MiSTers: the core and `MiSTer_online` must come from this
+  release on both.
+
 ## v0.5: GBA Wireless Adapter
 
 ### New: GBA wireless games
