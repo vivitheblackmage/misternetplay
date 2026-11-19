@@ -1,0 +1,333 @@
+From aae6b871d2d603eb500bf59b477b85f128daf08b Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Wed, 18 Nov 2026 17:32:28 +0100
+Subject: [PATCH 51/52] netplay: ao486 rooms of up to eight through the server
+ (the server as the switch): the switch answer, the room's names, the host
+ keeps its room, a join alone looks again; T3e-u with three players and a core
+ reload
+---
+ support/netplay/netplay.cpp          | 46 +++++++++++++++++++++-
+ support/netplay/test/Makefile        |  4 +-
+ support/netplay/test/run_udp_test.sh | 37 ++++++++++++------
+ support/netplay/test/udp_harness.cpp | 57 +++++++++++++++++++++-------
+ 4 files changed, 115 insertions(+), 29 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index ae87b3b..5b09a83 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -389,6 +389,9 @@ public:
+ 	const char *peer_name() const { return peer_name_; }
+ 	bool direct() const { return direct_ok_; }
+ 	bool via_server() const { return server_; }
++	bool room_switch() const { return switch_; }
++	// an ao486 room with nobody else in it for ten seconds
++	bool alone(uint64_t now) const { return switch_ && room_count_ == 1 && now - t_alone_ > 10000; }
+ 	const char *room() const { return room_; }
+ 
+ 	void send(const uint8_t *buf, size_t len) override
+@@ -488,10 +491,35 @@ private:
+ 				snprintf(room_, sizeof(room_), "%s", f[3].c_str());
+ 				build_reg();       // keep asking for this room, not "*" (another room with the game)
+ 			}
++			// an ao486 room (SPEC.md 15.6): the server is the switch and the other
++			// side of the link; no PEER, no hole punching
++			if (k >= 3 && f[2] == "switch" && !switch_)
++			{
++				switch_ = true;
++				snprintf(peer_name_, sizeof(peer_name_), "the room");
++			}
+ 			if (registered_) return;
+ 			registered_ = true;
+ 			if (host_) notice("Netplay: room open on the server");
+ 		}
++		else if (k >= 3 && f[0] == "ROOM" && switch_)
++		{
++			// who is in the ao486 room: "ROOM count names" (names from the server, cleaned)
++			int count = atoi(f[1].c_str());
++			char names[64];
++			size_t j = 0;
++			for (size_t i = 0; i < f[2].size() && j + 1 < sizeof(names); i++)
++			{
++				char c = f[2][i];
++				if (c >= 0x20 && c < 0x7f) names[j++] = c;
++			}
++			names[j] = 0;
++			if (count < 1 || count > 8) return;
++			if (count == 1 && room_count_ != 1) t_alone_ = now_ms();
++			room_count_ = count;
++			snprintf(text, sizeof(text), "Netplay: %d in the room: %s", count, names);
++			notice(text);
++		}
+ 		else if (k >= 2 && f[0] == "ERR")
+ 		{
+ 			registered_ = false;
+@@ -564,6 +592,9 @@ private:
+ 	sockaddr_in cand_[2] {}, direct_ {};
+ 	int ncand_ = 0;
+ 	char token_[17] = {}, peer_name_[17] = {};
++	bool switch_ = false;                  // an ao486 room: the server is the switch
++	int room_count_ = 0;                   // members of the ao486 room (its last ROOM)
++	uint64_t t_alone_ = 0;
+ 	uint64_t t_punch_ = 0, t_punch_start_ = 0, t_direct_rx_ = 0;
+ 
+ 	char notice_[96] = {};
+@@ -1337,6 +1368,7 @@ static void *lan_thread(void *)
+ 	bool linked = false, lost_told = false, repair = false;
+ 	const char *told = nullptr;
+ 	uint64_t last_stats = 0;
++	char host_room[9] = {};      // the host keeps its room while the core runs (ao486 rooms hold up to 8, SPEC.md 15.6)
+ 
+ 	while (!quit)
+ 	{
+@@ -1373,7 +1405,8 @@ static void *lan_thread(void *)
+ 			{
+ 				ServerReg r {};
+ 				r.host = mode == M_HOST;
+-				if (r.host) random_id(r.room, sizeof(r.room));
++				if (r.host && !host_room[0]) random_id(host_room, sizeof(host_room));
++				if (r.host) snprintf(r.room, sizeof(r.room), "%s", host_room);
+ 				else snprintf(r.room, sizeof(r.room), "*");    // the open AO486 room (no game to match)
+ 				snprintf(r.core, sizeof(r.core), "%s", srv_core.c_str());
+ 				snprintf(r.game, sizeof(r.game), "LAN");
+@@ -1397,7 +1430,9 @@ static void *lan_thread(void *)
+ 			if (ok)
+ 			{
+ 				link = new EthLink(udp, random32());
+-				if (!lost_told) post_message(mode == M_HOST ? "Netplay: waiting for player 2 (network card)" : "Netplay: connecting (network card)");
++				if (!lost_told)
++					post_message(mode == M_HOST ? (cfg.server[0] ? "Netplay: waiting for players (network card)" : "Netplay: waiting for player 2 (network card)")
++					                            : "Netplay: connecting (network card)");
+ 			}
+ 			else
+ 			{
+@@ -1447,6 +1482,13 @@ static void *lan_thread(void *)
+ 				lost_told = true;
+ 				repair = true;
+ 			}
++			// a join alone in an ao486 room (the host came back with another
++			// room after loading the core again): look for the open room again
++			if (mode == M_JOIN && udp->alone(now))
++			{
++				post_message("Netplay: alone in the room, looking again");
++				repair = true;
++			}
+ 			if (now - last_stats >= 10000)
+ 			{
+ 				last_stats = now;
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index e688910..7b248a9 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -61,7 +61,9 @@ test: test_netplay test_rfu test_rfu_link test_ne2000 test_eth_link udp_harness
+ 	  NP_SYSTEM=ao486 NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
+ 	  NP_SYSTEM=ao486 NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_DIRECT=no ./run_udp_test.sh && \
+ 	  NP_SYSTEM=ao486 NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_OSD=1 NP_AO486_REPAIR=host ./run_udp_test.sh && \
+-	  NP_SYSTEM=ao486 NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_OSD=1 NP_AO486_REPAIR=join ./run_udp_test.sh; \
++	  NP_SYSTEM=ao486 NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_OSD=1 NP_AO486_REPAIR=join ./run_udp_test.sh && \
++	  NP_SYSTEM=ao486 NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_AO486_PLAYERS=3 ./run_udp_test.sh && \
++	  NP_SYSTEM=ao486 NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_OSD=1 NP_AO486_REPAIR=host NP_AO486_RELOAD=1 ./run_udp_test.sh; \
+ 	else echo "SKIP udp (server): build it with server/build.sh"; fi
+ 
+ test_eth_link: test_eth_link.cpp ../eth_link.cpp ../eth_link.h ../netplay_session.h
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+index d70b8b8..45594b4 100755
+--- a/support/netplay/test/run_udp_test.sh
++++ b/support/netplay/test/run_udp_test.sh
+@@ -42,17 +42,28 @@ fi
+ sleep 0.3
+ ${NP_NEO_SPLIT_JOIN:+env NP_NEO_SPLIT=1} "$bin" join "$tmp/join" "$frames" > "$tmp/join.log" 2>&1 &
+ jp=$!
++# NP_AO486_PLAYERS=3: a third MiSTer joins the ao486 room (through the server, SPEC.md 15.6)
++tp=
++if [ "${NP_AO486_PLAYERS:-2}" -ge 3 ]; then
++	mkdir -p "$tmp/third"
++	sleep 0.3
++	NP_NAME=Third NP_AO486_TAG=CC "$bin" join "$tmp/third" "$frames" > "$tmp/third.log" 2>&1 &
++	tp=$!
++fi
+ wait $hp; hr=$?
+ wait $jp; jr=$?
++tr=0
++[ -n "$tp" ] && { wait $tp; tr=$?; }
+ [ -n "$dp" ] && kill $dp 2>/dev/null
+ 
+ h=$(grep RESULT "$tmp/host.log"); j=$(grep RESULT "$tmp/join.log")
+ echo "host: $h"
+ echo "join: $j"
+ hd=${h##*digest=}; jd=${j##*digest=}
+-label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_TWO:+ (two games)}${NP_NEO_RAN:+ (host played first: core reload)}${NP_NEO_SPLIT_JOIN:+ (the join has the program in two files)}${NP_OSD:+ (OSD mode${NP_OSD_STEPS:+, stepping})}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_INCORE:+, Join room in the core}${NP_DECOY:+, two rooms}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}${NP_GBA_RELOAD:+ ($NP_GBA_RELOAD loads the game again)}${NP_AO486_REPAIR:+ ($NP_AO486_REPAIR turns Netplay off and on)}"
++repair_what="turns Netplay off and on"; [ -n "${NP_AO486_RELOAD:-}" ] && repair_what="loads the core again"
++label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_AO486_PLAYERS:+ ($NP_AO486_PLAYERS players)}${NP_TWO:+ (two games)}${NP_NEO_RAN:+ (host played first: core reload)}${NP_NEO_SPLIT_JOIN:+ (the join has the program in two files)}${NP_OSD:+ (OSD mode${NP_OSD_STEPS:+, stepping})}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_INCORE:+, Join room in the core}${NP_DECOY:+, two rooms}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}${NP_GBA_RELOAD:+ ($NP_GBA_RELOAD loads the game again)}${NP_AO486_REPAIR:+ ($NP_AO486_REPAIR $repair_what)}"
+ ok=0
+-[ $hr -eq 0 ] && [ $jr -eq 0 ] && [ -n "$hd" ] && [ "$hd" = "$jd" ] && ok=1
++[ $hr -eq 0 ] && [ $jr -eq 0 ] && [ $tr -eq 0 ] && [ -n "$hd" ] && [ "$hd" = "$jd" ] && ok=1
+ # GBA wireless adapter: both linked (and through the server: with the other's name)
+ if [ $ok -eq 1 ] && [ "${NP_SYSTEM:-}" = gba ]; then
+ 	for side in host join; do
+@@ -63,22 +74,24 @@ if [ $ok -eq 1 ] && [ "${NP_SYSTEM:-}" = gba ]; then
+ 		grep -q "linked with Par..Host" "$tmp/join.log" || { echo "join: name of host missing"; ok=0; }
+ 	fi
+ fi
+-# ao486's network card: both linked; through the server with the other's name and the right path
++# ao486's network card: all linked; through the server the room is a switch
++# (SPEC.md 15.6): linked with the room, never direct, the room's names
+ if [ $ok -eq 1 ] && [ "${NP_SYSTEM:-}" = ao486 ]; then
+-	for side in host join; do
++	sides="host join"; [ -n "$tp" ] && sides="host join third"
++	for side in $sides; do
+ 		grep -q "network linked" "$tmp/$side.log" || { echo "$side: not linked"; ok=0; }
+ 		grep "\[harness\] ao486" "$tmp/$side.log"
+ 		if [ -n "${NP_SERVER_BIN:-}" ]; then
+-			if [ "${NP_DIRECT:-yes}" = no ]; then
+-				grep -q "network linked with .*through the server" "$tmp/$side.log" || { echo "$side: not through the server"; ok=0; }
+-			else
+-				grep -q "direct connection to" "$tmp/$side.log" || { echo "$side: no direct path"; ok=0; }
+-			fi
++			grep -q "network linked with the room (through the server)" "$tmp/$side.log" || { echo "$side: not linked with the room"; ok=0; }
++			grep -q "direct connection" "$tmp/$side.log" && { echo "$side: went direct in a switch room"; ok=0; }
+ 		fi
+ 	done
+ 	if [ -n "${NP_SERVER_BIN:-}" ]; then
+-		grep -q "linked with Joinor" "$tmp/host.log" || { echo "host: name of join missing"; ok=0; }
+-		grep -q "linked with Par..Host" "$tmp/join.log" || { echo "join: name of host missing"; ok=0; }
++		grep -q "in the room: .*Joinor" "$tmp/host.log" || { echo "host: name of join missing"; ok=0; }
++		grep -q "in the room: Par..Host" "$tmp/join.log" || { echo "join: name of host missing"; ok=0; }
++		if [ -n "$tp" ]; then
++			grep -q "3 in the room: Par..Host, Joinor, Third" "$tmp/host.log" || { echo "host: the third player not in the room's names"; ok=0; }
++		fi
+ 	fi
+ fi
+ # through a server: the path the session took, and the names
+@@ -124,5 +137,5 @@ if [ $ok -eq 1 ]; then
+ 	exit 0
+ fi
+ echo "FAIL $label (logs in $tmp)"
+-tail -n 20 "$tmp/host.log" "$tmp/join.log" ${NP_SERVER_BIN:+"$tmp/server.log"}
++tail -n 20 "$tmp/host.log" "$tmp/join.log" ${tp:+"$tmp/third.log"} ${NP_SERVER_BIN:+"$tmp/server.log"}
+ exit 1
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index f80e9d4..6831032 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -631,16 +631,25 @@ static int run_gba(bool host)
+ // and goes on receiving for 6 s more (through the server one side is linked a
+ // few seconds after the other); the other side must get most of them, whole,
+ // and nothing of its own.
+-static std::vector<uint8_t> card_frame(bool host, uint16_t n)
++// NP_AO486_TAG (hex): this side's mark in its frames (host AA, join BB; a
++// third player CC, SPEC.md 15.6); NP_AO486_PLAYERS: how many are in the room.
++static std::vector<uint8_t> card_frame(uint8_t tag, uint16_t n)
+ {
+ 	std::vector<uint8_t> f(64 + n % 1400);
+-	for (size_t i = 0; i < f.size(); i++) f[i] = (uint8_t)(n * 13 + i * (host ? 3 : 5));
+-	f[0] = host ? 0xAA : 0xBB;
++	for (size_t i = 0; i < f.size(); i++) f[i] = (uint8_t)(n * 13 + i * (tag % 7 + 2));
++	f[0] = tag;
+ 	f[1] = (uint8_t)(n >> 8); f[2] = (uint8_t)n;
+ 	return f;
+ }
++static bool card_frame_ok(const std::vector<uint8_t> &f)
++{
++	return f.size() >= 3 && f == card_frame(f[0], (uint16_t)(f[1] << 8 | f[2]));
++}
+ static int run_ao486(bool host)
+ {
++	uint8_t tag = getenv("NP_AO486_TAG") ? (uint8_t)strtoul(getenv("NP_AO486_TAG"), nullptr, 16) : host ? 0xAA : 0xBB;
++	int players = getenv("NP_AO486_PLAYERS") ? atoi(getenv("NP_AO486_PLAYERS")) : 2;
++	int from_tag[256] = {};
+ 	netplay_start();
+ 	bool linked = false;
+ 	uint64_t t0 = now_ms();
+@@ -659,15 +668,15 @@ static int run_ao486(bool host)
+ 		{
+ 			next = now_ms() + 20;
+ 			std::lock_guard<std::mutex> g(card_mtx);
+-			card_out.push_back(card_frame(host, (uint16_t)sent++));
++			card_out.push_back(card_frame(tag, (uint16_t)sent++));
+ 		}
+ 		std::lock_guard<std::mutex> g(card_mtx);
+ 		while (!card_in.empty())
+ 		{
+ 			std::vector<uint8_t> &f = card_in.front();
+-			if (f.size() >= 3 && f[0] == (host ? 0xAA : 0xBB)) mine++;
+-			else if (f.size() < 3 || f != card_frame(!host, (uint16_t)(f[1] << 8 | f[2]))) bad++;
+-			else { got++; per_s[(now_ms() - t_start) / 2000 < 5 ? (now_ms() - t_start) / 2000 : 5]++; }
++			if (f.size() >= 3 && f[0] == tag) mine++;
++			else if (!card_frame_ok(f)) bad++;
++			else { got++; from_tag[f[0]]++; per_s[(now_ms() - t_start) / 2000 < 5 ? (now_ms() - t_start) / 2000 : 5]++; }
+ 			card_in.pop_front();
+ 		}
+ 	}
+@@ -682,17 +691,32 @@ static int run_ao486(bool host)
+ 		uint32_t back = osd_netplay;
+ 		size_t links0 = 0;
+ 		for (size_t p = 0; (p = osd_log.find("network linked", p)) != std::string::npos; p++) links0++;
+-		if (me)
++		if (me && getenv("NP_AO486_RELOAD"))
++		{
++			// the core loaded again: Main's netplay starts over, the host with a
++			// new room; the join, alone in the old one, must find it (SPEC.md 15.6)
++			netplay_stop();
++			for (uint64_t t = now_ms(); now_ms() - t < 500; usleep(1000)) ;
++			netplay_start();
++		}
++		else if (me)
+ 		{
+ 			osd_netplay = 1;                              // Off
+ 			for (uint64_t t = now_ms(); now_ms() - t < 1000; usleep(1000)) netplay_poll();
+ 			osd_netplay = back;
+ 		}
+-		relinked = false;
++		// through the server the room stays: the side that did not turn its
++		// option off keeps its link, the frames show it is together again
++		relinked = !me && getenv("NP_SERVER") != nullptr;
+ 		int n2 = 0;
+ 		uint64_t t0 = now_ms(), next = 0, until = t0 + 45000;
+-		while (now_ms() < until)
++		// (in a switch room "linked" means linked with the server: the others
++		// may come later, so wait for their frames too, up to 45 s)
++		uint64_t t_enough = 0;   // keep sending a while after: the other side may have come later
++		for (;;)
+ 		{
++			if (!t_enough && got2 >= 40) t_enough = now_ms();
++			if (!(now_ms() < until || (got2 < 40 && now_ms() < t0 + 45000) || (t_enough && now_ms() < t_enough + 8000))) break;
+ 			netplay_poll();
+ 			usleep(1000);
+ 			size_t links = 0;
+@@ -702,14 +726,14 @@ static int run_ao486(bool host)
+ 			{
+ 				next = now_ms() + 50;
+ 				std::lock_guard<std::mutex> g(card_mtx);
+-				card_out.push_back(card_frame(host, (uint16_t)(10000 + n2++)));
++				card_out.push_back(card_frame(tag, (uint16_t)(10000 + n2++)));
+ 			}
+ 			std::lock_guard<std::mutex> g(card_mtx);
+ 			while (!card_in.empty())
+ 			{
+ 				std::vector<uint8_t> &f = card_in.front();
+ 				uint16_t n = f.size() >= 3 ? (uint16_t)(f[1] << 8 | f[2]) : 0;
+-				if (f.size() >= 3 && f[0] != (host ? 0xAA : 0xBB) && n >= 10000 && f == card_frame(!host, n)) got2++;
++				if (f.size() >= 3 && f[0] != tag && n >= 10000 && card_frame_ok(f)) got2++;
+ 				card_in.pop_front();
+ 			}
+ 		}
+@@ -717,8 +741,13 @@ static int run_ao486(bool host)
+ 	}
+ 	for (uint64_t t = now_ms(); now_ms() - t < 500; usleep(1000)) netplay_poll();
+ 	netplay_stop();
+-	bool ok = linked && got >= 150 && bad == 0 && mine == 0 && relinked && (!getenv("NP_AO486_REPAIR") || got2 >= 40);
+-	printf("[harness] ao486: linked %d, sent %d, got %d, damaged %d, own %d (per 2 s %d %d %d %d %d)\n", linked, sent, got, bad, mine, per_s[0], per_s[1], per_s[2], per_s[3], per_s[4]);
++	bool each = true;   // most of each other player's frames
++	int senders = 0;
++	for (int t = 0; t < 256; t++)
++		if (from_tag[t]) { senders++; if (from_tag[t] < 150) each = false; }
++	bool ok = linked && got >= 150 * (players - 1) && senders == players - 1 && each && bad == 0 && mine == 0 && relinked
++	          && (!getenv("NP_AO486_REPAIR") || got2 >= 40);
++	printf("[harness] ao486: linked %d, sent %d, got %d from %d players, damaged %d, own %d (per 2 s %d %d %d %d %d)\n", linked, sent, got, senders, bad, mine, per_s[0], per_s[1], per_s[2], per_s[3], per_s[4]);
+ 	printf("RESULT frames=0 stalls=0 reloads=0 dip=0 digest=%s\n", ok ? "ao486-ok" : "ao486-fail");
+ 	return ok ? 0 : 1;
+ }
+-- 
+2.43.0
+

@@ -107,13 +107,16 @@ aside h3{margin:2px 6px 12px;font:700 11px ui-monospace,Consolas,monospace;lette
 .tab.SNES .ico{background:linear-gradient(180deg,#b38bff,#6a3ae0);box-shadow:0 0 10px rgba(155,107,255,.55)}
 .tab.GB2P .ico{background:linear-gradient(180deg,#9be36b,#3f9a2a);box-shadow:0 0 10px rgba(120,220,90,.55)}
 .tab.ARC .ico{background:linear-gradient(180deg,#ffc24d,#d9761a);box-shadow:0 0 10px rgba(255,170,60,.55)}
+.tab.GBA .ico{background:linear-gradient(180deg,#6aa8ff,#2a4fd0);box-shadow:0 0 10px rgba(80,140,255,.55)}
+.tab.NEO .ico{background:linear-gradient(180deg,#ff8a4d,#c9341a);box-shadow:0 0 10px rgba(255,110,60,.55)}
+.tab.PC .ico{background:linear-gradient(180deg,#d9d9e8,#7d7d9a);box-shadow:0 0 10px rgba(210,210,235,.45);color:#1a1030}
 .tab.BYO .ico{background:linear-gradient(180deg,#7ff3ff,#139bbf);box-shadow:0 0 10px rgba(62,232,255,.5)}
 .sel{position:absolute;opacity:0;pointer-events:none}
-#t-NES:checked~.wrap .tab.NES,#t-SNES:checked~.wrap .tab.SNES,#t-GB2P:checked~.wrap .tab.GB2P,#t-ARC:checked~.wrap .tab.ARC,#t-BYO:checked~.wrap .tab.BYO{background:var(--panel2);border-color:rgba(255,63,164,.55);box-shadow:0 0 16px rgba(255,63,164,.25) inset,0 0 14px rgba(214,60,255,.25)}
-#t-NES:checked~.wrap .tab.NES .cnt,#t-SNES:checked~.wrap .tab.SNES .cnt,#t-GB2P:checked~.wrap .tab.GB2P .cnt,#t-ARC:checked~.wrap .tab.ARC .cnt,#t-BYO:checked~.wrap .tab.BYO .cnt{color:#fff;text-shadow:0 0 8px var(--pink)}
-#t-NES:focus-visible~.wrap .tab.NES,#t-SNES:focus-visible~.wrap .tab.SNES,#t-GB2P:focus-visible~.wrap .tab.GB2P,#t-ARC:focus-visible~.wrap .tab.ARC,#t-BYO:focus-visible~.wrap .tab.BYO{outline:2px solid var(--cyan);outline-offset:2px}
+#t-NES:checked~.wrap .tab.NES,#t-SNES:checked~.wrap .tab.SNES,#t-GB2P:checked~.wrap .tab.GB2P,#t-ARC:checked~.wrap .tab.ARC,#t-GBA:checked~.wrap .tab.GBA,#t-NEO:checked~.wrap .tab.NEO,#t-PC:checked~.wrap .tab.PC,#t-BYO:checked~.wrap .tab.BYO{background:var(--panel2);border-color:rgba(255,63,164,.55);box-shadow:0 0 16px rgba(255,63,164,.25) inset,0 0 14px rgba(214,60,255,.25)}
+#t-NES:checked~.wrap .tab.NES .cnt,#t-SNES:checked~.wrap .tab.SNES .cnt,#t-GB2P:checked~.wrap .tab.GB2P .cnt,#t-ARC:checked~.wrap .tab.ARC .cnt,#t-GBA:checked~.wrap .tab.GBA .cnt,#t-NEO:checked~.wrap .tab.NEO .cnt,#t-PC:checked~.wrap .tab.PC .cnt,#t-BYO:checked~.wrap .tab.BYO .cnt{color:#fff;text-shadow:0 0 8px var(--pink)}
+#t-NES:focus-visible~.wrap .tab.NES,#t-SNES:focus-visible~.wrap .tab.SNES,#t-GB2P:focus-visible~.wrap .tab.GB2P,#t-ARC:focus-visible~.wrap .tab.ARC,#t-GBA:focus-visible~.wrap .tab.GBA,#t-NEO:focus-visible~.wrap .tab.NEO,#t-PC:focus-visible~.wrap .tab.PC,#t-BYO:focus-visible~.wrap .tab.BYO{outline:2px solid var(--cyan);outline-offset:2px}
 .lib{display:none}
-#t-NES:checked~.wrap .lib.NES,#t-SNES:checked~.wrap .lib.SNES,#t-GB2P:checked~.wrap .lib.GB2P,#t-ARC:checked~.wrap .lib.ARC,#t-BYO:checked~.wrap .lib.BYO{display:block}
+#t-NES:checked~.wrap .lib.NES,#t-SNES:checked~.wrap .lib.SNES,#t-GB2P:checked~.wrap .lib.GB2P,#t-ARC:checked~.wrap .lib.ARC,#t-GBA:checked~.wrap .lib.GBA,#t-NEO:checked~.wrap .lib.NEO,#t-PC:checked~.wrap .lib.PC,#t-BYO:checked~.wrap .lib.BYO{display:block}
 .side-foot{margin:14px 6px 0;padding-top:12px;border-top:1px solid var(--line);color:var(--dim);font-size:12px}
 main section+section{margin-top:34px}
 .rooms{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px}
@@ -139,6 +142,9 @@ aside.panel{animation-duration:8s,11s;animation-delay:-1s,-4s}
 .core.NES{background:linear-gradient(180deg,#ff6b85,#c81f4a);box-shadow:0 0 10px rgba(255,77,109,.55)}
 .core.SNES{background:linear-gradient(180deg,#b38bff,#6a3ae0);box-shadow:0 0 10px rgba(155,107,255,.55)}
 .core.GB2P{background:linear-gradient(180deg,#9be36b,#3f9a2a);box-shadow:0 0 10px rgba(120,220,90,.55)}
+.core.GBA{background:linear-gradient(180deg,#6aa8ff,#2a4fd0);box-shadow:0 0 10px rgba(80,140,255,.55)}
+.core.NEO{background:linear-gradient(180deg,#ff8a4d,#c9341a);box-shadow:0 0 10px rgba(255,110,60,.55)}
+.core.PC{background:linear-gradient(180deg,#d9d9e8,#7d7d9a);box-shadow:0 0 10px rgba(210,210,235,.45);color:#1a1030}
 .core.ARC{background:linear-gradient(180deg,#ffc24d,#d9761a);box-shadow:0 0 10px rgba(255,170,60,.55)}
 .state{display:inline-flex;align-items:center;gap:7px;font:700 11px ui-monospace,Consolas,monospace;letter-spacing:.12em;text-transform:uppercase}
 .state::before{content:"";width:8px;height:8px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor}
@@ -177,7 +183,7 @@ background:linear-gradient(115deg,transparent 35%,rgba(62,240,176,.16) 45%,rgba(
 @keyframes flicker{0%,93%,97%,100%{opacity:1}94%,96%{opacity:.55}95%{opacity:.9}}
 .tab:hover{transform:translateX(3px)}
 .tab{transition:background .15s,border-color .15s,box-shadow .15s,transform .15s}
-#t-NES:checked~.wrap .tab.NES,#t-SNES:checked~.wrap .tab.SNES,#t-GB2P:checked~.wrap .tab.GB2P,#t-ARC:checked~.wrap .tab.ARC,#t-BYO:checked~.wrap .tab.BYO{animation:tabglow 2.2s ease-in-out infinite alternate}
+#t-NES:checked~.wrap .tab.NES,#t-SNES:checked~.wrap .tab.SNES,#t-GB2P:checked~.wrap .tab.GB2P,#t-ARC:checked~.wrap .tab.ARC,#t-GBA:checked~.wrap .tab.GBA,#t-NEO:checked~.wrap .tab.NEO,#t-PC:checked~.wrap .tab.PC,#t-BYO:checked~.wrap .tab.BYO{animation:tabglow 2.2s ease-in-out infinite alternate}
 @keyframes tabglow{from{box-shadow:0 0 12px rgba(255,63,164,.18) inset,0 0 10px rgba(214,60,255,.2)}to{box-shadow:0 0 20px rgba(255,63,164,.35) inset,0 0 22px rgba(214,60,255,.45)}}
 tr:hover td{background:rgba(255,63,164,.08)}
 tr:hover td:first-child{box-shadow:3px 0 0 var(--pink) inset}
@@ -219,15 +225,35 @@ ids.forEach(function(id){var a=document.getElementById(id),b=d.getElementById(id
 
 const pageLogo = `<img src="/logo.png" alt="MiSTer FPGA">`
 
+// coreCat: the page's category of a room's core. Arcade rooms carry the core's
+// own name (JTBUBL, ...), so anything not known is arcade (SPEC 12.5).
+func coreCat(core string) string {
+	switch c := strings.ToUpper(core); c {
+	case "NES", "SNES", "GB2P", "GBA":
+		return c
+	case "NEOGEO":
+		return "NEO"
+	case "AO486":
+		return "PC"
+	}
+	return "ARC"
+}
+
+// roomCats: the categories whose games are never sent by the server, shown as
+// their open rooms instead of a library
+var roomCats = []struct{ id, ico, label, title, hint, none string }{
+	{"GBA", "GBA", "GBA wireless", "GBA wireless adapter", "Each player runs their own game (FireRed and LeafGreen talk). OSD Hardware: Link Port &rarr; Wireless Adapter. Host: Netplay &rarr; Host and load a game. Join: Netplay &rarr; Join and load any GBA game.", "No GBA rooms open."},
+	{"NEO", "NEO", "Neo Geo", "Neo Geo", "Neo Geo games are not sent: each player uses their own ROM set, and the program must be the same (a Darksoft folder, a MAME zip and a .neo of one game match). Host: OSD Netplay &rarr; Host, load the game. Join: Netplay &rarr; Join, load the same game.", "No Neo Geo rooms open."},
+	{"PC", "486", "ao486 (PC)", "ao486 network card", "A LAN of up to eight ao486 MiSTers with the network card, the server as its switch: IPX games such as Doom, Duke Nukem 3D and Warcraft II. OSD Hardware: Network &rarr; On. Host: Netplay &rarr; Host. Join: Netplay &rarr; Join (as many as eight). Then the game's own network setup (Doom: IPXSETUP -nodes 3).", "No ao486 rooms open."},
+	{"ARC", "ARC", "Arcade", "Arcade", "Arcade games are not sent: each player uses their own MRA and zip, and the ROM check makes sure both are the same. Host: the netplay MRA, OSD Netplay &rarr; Host. Join: the room in <b>_Arcade/_Netplay</b>, or OSD Netplay &rarr; Join.", "No arcade rooms open."},
+}
+
 func coreBadge(core string) string {
 	c := strings.ToUpper(core)
-	cls := ""
-	if c == "NES" || c == "SNES" || c == "GB2P" {
-		cls = " " + c
-	} else if c != "" {
-		cls = " ARC" // arcade: the core's own name (JTBUBL), SPEC 12.5
+	if c == "" {
+		return `<span class="core"></span>`
 	}
-	return fmt.Sprintf(`<span class="core%s">%s</span>`, cls, htmlEscape(c))
+	return fmt.Sprintf(`<span class="core %s">%s</span>`, coreCat(c), htmlEscape(c))
 }
 
 // gameName shows the name without its extension, the extension dimmed.
@@ -249,13 +275,10 @@ func writePage(w http.ResponseWriter, l *library, catalog string, r *relay) {
 	cat := readCatalog(catalog)
 	waiting, playing := 0, 0
 	roomsBy := map[string]int{}
-	var arcRooms []roomInfo
+	byCat := map[string][]roomInfo{}
 	for _, ri := range rooms {
-		c := strings.ToUpper(ri.core)
-		if c != "NES" && c != "SNES" && c != "GB2P" && c != "GBA" {
-			c = "ARC" // arcade: any other core (JTBUBL, ...), SPEC 12.5
-			arcRooms = append(arcRooms, ri)
-		}
+		c := coreCat(ri.core)
+		byCat[c] = append(byCat[c], ri)
 		roomsBy[c]++
 		if ri.join != "" {
 			playing++
@@ -269,8 +292,8 @@ func writePage(w http.ResponseWriter, l *library, catalog string, r *relay) {
 <meta name="viewport" content="width=device-width,initial-scale=1"><meta name="referrer" content="no-referrer">
 <noscript><meta http-equiv="refresh" content="10"></noscript><title>Netplay lobby</title><style>%s</style></head><body>
 <div class="sky" aria-hidden="true"><div class="nebula"></div><div class="stars s1"></div><div class="stars s2"></div><div class="stars s3"></div><div class="stars s4"></div><div class="stars s5"></div><div class="glow"></div><div class="sunwrap"><div class="sun"></div></div><div class="floor"><div class="lines"></div></div></div>
-<input class="sel" type="radio" name="lib" id="t-NES" value="NES" checked><input class="sel" type="radio" name="lib" id="t-SNES" value="SNES"><input class="sel" type="radio" name="lib" id="t-GB2P" value="GB2P"><input class="sel" type="radio" name="lib" id="t-ARC" value="ARC"><input class="sel" type="radio" name="lib" id="t-BYO" value="BYO">
-<div class="wrap"><header>%s<div class="title"><div class="brand">NETPLAY</div><div class="tag">Lobby &amp; relay &middot; NES &middot; SNES &middot; Game Boy 2P &middot; Arcade</div></div>
+<input class="sel" type="radio" name="lib" id="t-NES" value="NES" checked><input class="sel" type="radio" name="lib" id="t-SNES" value="SNES"><input class="sel" type="radio" name="lib" id="t-GB2P" value="GB2P"><input class="sel" type="radio" name="lib" id="t-GBA" value="GBA"><input class="sel" type="radio" name="lib" id="t-NEO" value="NEO"><input class="sel" type="radio" name="lib" id="t-PC" value="PC"><input class="sel" type="radio" name="lib" id="t-ARC" value="ARC"><input class="sel" type="radio" name="lib" id="t-BYO" value="BYO">
+<div class="wrap"><header>%s<div class="title"><div class="brand">NETPLAY</div><div class="tag">Lobby &amp; relay &middot; NES &middot; SNES &middot; Game Boy 2P &middot; GBA &middot; Neo Geo &middot; ao486 &middot; Arcade</div></div>
 <div class="stats" id="stats"><div class="stat wait"><b>%d</b><span>waiting</span></div><div class="stat play"><b>%d</b><span>playing</span></div><div class="stat games"><b>%d</b><span>games</span></div></div></header>
 <div class="neon"></div><div class="layout">`,
 		pageCSS, pageLogo, waiting, playing, len(games["NES"])+len(games["SNES"])+len(games["GB2P"]))
@@ -287,13 +310,25 @@ func writePage(w http.ResponseWriter, l *library, catalog string, r *relay) {
 		return fmt.Sprintf("%d rooms open", roomsBy[c])
 	}
 	b.WriteString(`<aside class="panel"><h3>Library</h3><div id="side">`)
-	for _, t := range []struct{ id, ico, label, sub string; n int }{
+	tabs := []struct {
+		id, ico, label, sub string
+		n                   int
+	}{
 		{"NES", "NES", "NES", roomsText("NES"), len(games["NES"])},
 		{"SNES", "SNES", "Super NES", roomsText("SNES"), len(games["SNES"])},
 		{"GB2P", "GB", "Game Boy 2P", roomsText("GB2P"), len(games["GB2P"])},
-		{"ARC", "ARC", "Arcade", roomsText("ARC"), len(arcRooms)},
-		{"BYO", "MD5", "Bring your own", "catalog by MD5", len(cat)},
-	} {
+	}
+	for _, rc := range roomCats {
+		tabs = append(tabs, struct {
+			id, ico, label, sub string
+			n                   int
+		}{rc.id, rc.ico, rc.label, roomsText(rc.id), len(byCat[rc.id])})
+	}
+	tabs = append(tabs, struct {
+		id, ico, label, sub string
+		n                   int
+	}{"BYO", "MD5", "Bring your own", "catalog by MD5", len(cat)})
+	for _, t := range tabs {
 		fmt.Fprintf(&b, `<label class="tab %s" for="t-%s"><span class="ico">%s</span><span class="lbl"><b>%s</b><small>%s</small></span><span class="cnt">%d</span></label>`,
 			t.id, t.id, t.ico, t.label, t.sub, t.n)
 	}
@@ -334,19 +369,26 @@ func writePage(w http.ResponseWriter, l *library, catalog string, r *relay) {
 		}
 		b.WriteString(`</table></div></div>`)
 	}
-	// Arcade: no games from the server (each player's own MRA and zip), so the
-	// rooms with their games instead of a library
-	fmt.Fprintf(&b, `<div class="lib ARC"><h2>Arcade <span class="n">%d</span></h2><p class="hint">Arcade games are not sent: each player uses their own MRA and zip, and the ROM check makes sure both are the same. Host: the netplay MRA, OSD Netplay &rarr; Host. Join: the room in <b>_Arcade/_Netplay</b>, or OSD Netplay &rarr; Join.</p><div class="panel"><table>`, len(arcRooms))
-	if len(arcRooms) == 0 {
-		b.WriteString(`<tr><td class="empty">No arcade rooms open.</td></tr>`)
-	} else {
-		b.WriteString(`<tr><th>Game</th><th class="hide-sm">Core</th><th>Host</th></tr>`)
-		for _, ri := range arcRooms {
-			fmt.Fprintf(&b, `<tr><td>%s</td><td class="mono hide-sm">%s</td><td>%s</td></tr>`,
-				htmlEscape(ri.game), htmlEscape(strings.ToUpper(ri.core)), htmlEscape(ri.host))
+	// GBA, Neo Geo, ao486 and arcade: no games from the server, so their open
+	// rooms instead of a library
+	for _, rc := range roomCats {
+		list := byCat[rc.id]
+		fmt.Fprintf(&b, `<div class="lib %s"><h2>%s <span class="n">%d</span></h2><p class="hint">%s</p><div class="panel"><table>`, rc.id, rc.title, len(list), rc.hint)
+		if len(list) == 0 {
+			fmt.Fprintf(&b, `<tr><td class="empty">%s</td></tr>`, rc.none)
+		} else {
+			b.WriteString(`<tr><th>Game</th><th class="hide-sm">Core</th><th>Host</th><th class="hide-sm">State</th></tr>`)
+			for _, ri := range list {
+				state := "waiting"
+				if ri.join != "" {
+					state = "playing with " + ri.join
+				}
+				fmt.Fprintf(&b, `<tr><td>%s</td><td class="mono hide-sm">%s</td><td>%s</td><td class="hide-sm">%s</td></tr>`,
+					htmlEscape(ri.game), htmlEscape(strings.ToUpper(ri.core)), htmlEscape(ri.host), htmlEscape(state))
+			}
 		}
+		b.WriteString(`</table></div></div>`)
 	}
-	b.WriteString(`</table></div></div>`)
 	fmt.Fprintf(&b, `<div class="lib BYO"><h2>Bring your own <span class="n">%d</span></h2><p class="hint">Versions everyone brings themselves: your file must have exactly this MD5.</p><div class="panel"><table>`, len(cat))
 	if len(cat) == 0 {
 		b.WriteString(`<tr><td class="empty">The catalog is empty.</td></tr>`)

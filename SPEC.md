@@ -26,6 +26,37 @@ controller data is sent.
 - Sending the ROM or the `.sav` from one player to the other (both must have
   the same file locally; a server may hand out games it is allowed to share).
 
+### 1.1 Where the files go on the MiSTer (since v0.7)
+
+- The netplay cores are in their own folder, `_Netplay` (the main menu shows
+  it as "Netplay"), named `<CORE>_netplay_<build date>.rbf` like MiSTer's own
+  (`NES_netplay_20261118.rbf`); the arcade core is
+  `_Arcade/cores/jtbubl-netplay_<date>.rbf`. Never in `_Console` or
+  `_Computer`: a game shortcut (MGL, MiSTer_SAM) names a core without its
+  date (`_Console/NES`), and Main takes the file whose name sorts last among
+  `NES.*` and `NES_*` (`support/arcade/mra_loader.cpp`, `get_rbf`), which was
+  `NES_netplay.rbf` up to v0.6. Netplay finds its system by the core's name
+  in its configuration string and its build by the `V,` entry, never by the
+  file name or folder; a core reload uses the loaded file's own path.
+- `Scripts/netplay_on.sh` removes the netplay cores older releases left in
+  `_Console`/`_Computer` (only when a copy is in `_Netplay`), older dated
+  versions in `_Netplay`, and `_Arcade/cores/jtbubl-netplay.rbf`.
+- `MiSTer_offline` is the user's normal Main binary (a netplay binary has the
+  string `netplay.ini` in it, the normal one does not). netplay_on before v0.5
+  saved the active netplay binary there on an update, and update_all does not
+  bring it back (downloader trusts its own list of installed files). When
+  `MiSTer_offline` is missing or a netplay binary, netplay_on (if the netplay
+  binary is active) and netplay_off run `Scripts/.config/netplay/normal_main.py`:
+  it fetches `MiSTer` from the distribution database (the `db_url` of
+  `[distribution_mister]` in `downloader.ini`, or MiSTer-devel's) and installs
+  it only when its MD5 matches the database; offline it takes downloader's
+  `.MiSTer.old` if that is a normal binary. netplay_on switches anyway when it
+  cannot; netplay_off then stops without changing anything (T3e-o).
+- `ao486_netplay_install.sh` (15.5) copies the menu's game shortcuts that
+  start `_computer/ao486` with a disk that has the netplay menu to
+  `_Netplay/_DOS Games`, with the core `_Netplay/ao486_netplay`; the
+  originals keep the normal core. The uninstall removes only those copies.
+
 ## 2. Architecture
 
 ```
@@ -566,7 +597,7 @@ with the same lockstep as NES and SNES. Base: the split-screen core
 Gameboy2PUW_MiSTer by pomstazlesa (branch `Gameboy2P`, `83e167f`, 2025-10-05,
 GPL like the MiSTer-devel Game Boy core it forks), a new upstream
 `Gameboy2P_MiSTer/` on branch `netplay` with its commits in
-`patches/Gameboy2P_MiSTer/`. Release file `GAMEBOY2P_netplay.rbf`; the
+`patches/Gameboy2P_MiSTer/`. Release file `_Netplay/GAMEBOY2P_netplay_<date>.rbf` (section 1.1); the
 core's name stays `GAMEBOY2P` (games and saves in `GAMEBOY2P/`). Needs the
 SDRAM board, as the original.
 
@@ -823,7 +854,7 @@ sent. Both sides check instead that they assembled exactly the same ROM.
   into those, in their common framework **jtframe**, so the same work serves
   the other jtframe cores later.
 - **The netplay core sits next to Jotego's, it never replaces it:** file
-  `_Arcade/cores/jtbubl-netplay.rbf`, loaded by its own MRA, a copy of the
+  `_Arcade/cores/jtbubl-netplay_<date>.rbf`, loaded by its own MRA, a copy of the
   player's *Bubble Bobble (US, Ver 5.1)* MRA (English; set `bublboblr`, from
   `bublbobl.zip`) with `<rbf>jtbubl-netplay</rbf>` and ` [netplay]` in its name (`tools/deploy.sh <ip> arcade`). Main picks the core for
   `<rbf>jtbubl</rbf>` as the last file named `jtbubl` + `.` or `_`, so the `-`
@@ -1404,3 +1435,302 @@ The arcade module (12.3) without jtframe, with these differences:
 | T2n | `make -C NeoGeo_MiSTer/npsim det ROM=<romset folder> BIOS=<bios folder>`: the whole core (`emu`) in Verilator, the SDRAM controller its own with an exact chip model; the bench is Main_MiSTer (the loader, and the netplay thread: arms before the load, starts the session, writes INPUT[k] from a fixed script, with a heartbeat) and the DDR3 with adjustable timing. Six sessions: DDR3 with jitter and pauses, DDR3 slower, the other clock phase, the session started 2 and 20 frames later, and input late on 2 to 50 % of the frames by up to 6 frames (holds of different lengths, long ones with SDRAM refreshes); DDR3 and the SDRAM start with different garbage (`--fill`), Main gives different times (`--rtc`), and the save file is read after the load with Main answering each sector after 0 to 60,000 clocks (`--sd`, still going on when the session starts in some runs), and two runs get a boot ROM at the core's start 12 and 25 frames before the ROM set (`--bootrom`; the bench heartbeats only once it has armed, as Main) | per frame of the session both CPUs' writes, their timing in the machine's own clocks (held clocks do not count) and the CRC in the mailbox equal to the reference run's (upstream: the Z80's writes differ from its first frame) |
 | T3n | `make -C Main_MiSTer/support/netplay/test`: `test_netplay` (heartbeat word, settings, `ran`, a session on a core not armed is refused, a pre-armed one runs and the core takes the session's id, a heartbeat that stops ends it, a left-over CTRL word never arms); `NP_SYSTEM=neogeo` UDP runs with a fake core that keeps the module's rules: direct, through the server, the host played the game first (core reload: Main's restart with the path in DDR3), the join has the program in two files (same game, other pack), a different ROM set and a different BIOS refused | `PASS` |
 | T2n-s | `obj_trace/neogeo_sim --snap` and `snapdiff.py`: every signal of the core 64 clocks after the reset's end, in runs as above | no signal differs (not counted: the SDRAM controller's start-up counter and the framework's OSD button timer) |
+
+## 15. ao486 network card (v0.7: the card (T2e, T4e), Main's wire to the home network (T3e), the rooms (15.4, 15.6: T3e-l, T3e-u), the DOS kit with our IPX and the all-disks install (15.5: T3e-m, T3e-i); on hardware (T5e, T5e-r): DHCP and ping from DOS, Doom and the menu between two MiSTers through the server)
+
+The MiSTer ao486 core with an NE2000 network card, so that DOS and Windows 95
+programs can talk to other machines. Not lockstep: each MiSTer runs its own PC,
+and only Ethernet frames cross the network, as the GBA adapter's packets do
+(section 13). First the card and its wire to the MiSTer's own network; then a
+virtual LAN per room through the lobby server (IPX games such as Doom, Duke
+Nukem 3D, Warcraft II, more than two players), then Windows 95 with its own
+NE2000 driver.
+
+### 15.1 The core (`ao486_MiSTer`, branch `netplay`)
+
+- **The card** is upstream ao486 PR #238 (georgemog, not merged), put on
+  master `628ddbc`: an NE2000/RTL8019AS (`rtl/soc/ne2000/`, the device model of
+  Minimig-AGA's Ethernet_shmem2 branch) at an ISA I/O base with a selectable
+  IRQ, wired into `rtl/system.v`. Frames go through a 64 KB window in DDR3 at
+  ARM physical `0x1FF00000` (Avalon word base `0x03FE0000`, the window the
+  A2065 and NeXT cores use), on the core's own DDR3 port, shared with the CPU's
+  memory by a fixed-priority arbiter (memory first). `sys/` is not touched.
+- **OSD** (`P2`): `O[66]` Network Off/On, `O[68:67]` IRQ 11/10/5/3,
+  `O[65:64]` the mode, Shared (eth0) / eth1 / MACVLAN / Bridge (tap0), read by
+  Main only. The PR put Network and IRQ on `oS`/`oTU` (status 60–62); 60 is
+  Low-Res (`P1oS`, since 2020), so Network On changed the video mode. They are
+  at 66–68, and the core's `status` wire is 128 bits (it connected 64).
+  `O[70:69]` Netplay netplay.ini / Off / Host / Join (15.4), read by Main only.
+- **The window's contract** (the core's `ETH_SHM_*`, the PR's
+  `sw/nettest/ne2000d.py`): 16-bit values little-endian, a 32-bit value
+  `{word+2, word}`.
+
+| Offset | What | Written by |
+| --- | --- | --- |
+| `0x1000` | FLAGS; low byte bit 2 RX_AVAIL (a hint) | Main sets |
+| `0x104C` | the card's MAC, 6 bytes | Main, before the core leaves reset |
+| `0x1052` | STATUS, bit 12 COMM_OK (signature and a moving heartbeat seen) | core |
+| `0x1088` | heartbeat, 32 bits, changed every pass | Main |
+| `0x108C` | signature `0xCAFEBABE`, written last; 0 when Main lets go | Main |
+| `0x2C08` | TX request sequence S (1..65535, then 1: 0 is never used), written after frame S is staged | core |
+| `0x2C0A` | TX done: the last sequence Main has sent | Main |
+| `0x2C40` | TX lengths, 8 × u16, by slot | core |
+| `0x3000` | TX slots, 8 × 1536 bytes; frame S in slot S % 8 | core |
+| `0x2C04`, `0x2C06` | RX ring head (core), tail (Main), 16 slots | |
+| `0x2C20` | RX lengths, 16 × u16 | Main |
+| `0x9000` | RX slots, 16 × 1536 bytes | Main |
+
+- The single TX buffer at `0x2000` with its length at `0x2C02`, which the PR's
+  `ne2000d.py` reads, is the core's old contract and stays empty (seen on
+  hardware: the sequence advanced, the length stayed 0, no frame left).
+  The core does not wait for Main: the guest's transmit completes once the
+  frame is staged.
+- The core fetches the MAC from the window after a reset (the system's or the
+  card's own, `base+0x18`) and adopts it only if it is unicast and locally
+  administered. It keeps the last adopted one (`station_mac`) through both
+  resets: the card's reset puts it, not the built-in `52:54:05:04:03:02`, into
+  PAR and the PROM. A DOS driver reads the PROM right after resetting the card,
+  before the fetch is done; with the built-in address there, both MiSTers of a
+  room would use it (seen on hardware). Only power-up gives the built-in one.
+
+### 15.2 Main_MiSTer (`support/netplay/ne2000.cpp`)
+
+- Called from `netplay_start/stop/poll` (no new hooks in `user_io.cpp`); only
+  for ao486 (`is_x86()`), not the PC XT or 286 cores.
+- **Start** (the core was loaded, before `x86_init` releases its reset): clear
+  the window, the MAC `52:54:05:xx:yy:zz` (the last three bytes of eth0's
+  address, which exists also on WiFi, so two MiSTers on one LAN or in one room
+  differ), heartbeat 0, then the signature. **Stop** (another core): the link closed, the signature 0.
+- **Every pass:** the heartbeat; the mode from the OSD (Network Off, or a mode
+  the MiSTer lacks: no link); every sequence after the last sent up to the
+  request is sent from its slot, in order, then TX done is written (no link,
+  or a length under 14 or over 1536: that frame goes nowhere, as on a card with
+  no cable); more than 8 behind, only the 8 newest are still there; received frames go into the ring while it has room (length
+  before tail), the rest are dropped (the socket is drained every pass: a
+  card that falls behind loses frames, it does not get old ones later); the
+  card's own frames echoed by the socket and frames under 14 bytes are dropped.
+- **The card's address** is the source address of the guest's frames: the
+  eth0 filter and the echo check follow it. The core fetches Main's address
+  from DDR3 in the background after the card's reset, and a DOS driver reads
+  the PROM right after resetting the card, so it may get the built-in
+  `52:54:05:04:03:02` and program the card with that (seen on hardware: DHCP
+  went out from it and the replies were filtered away). Group addresses are
+  never taken. Since the core keeps the adopted address through its reset
+  (15.1), the driver normally gets Main's.
+- The host side (AF_PACKET, the MAC filter for eth0, macvlan, tap) is the
+  A2065 module's (`support/minimig/minimig_a2065_ethernet.cpp`).
+
+### 15.3 Tests (ao486 network card)
+
+| Test | What | Pass |
+| --- | --- | --- |
+| T2e | `sim/iverilog/ne2000/run_regression.sh` in `ao486_MiSTer` (Icarus Verilog 12): the PR's 36 benches (the device model through its host port and the ISA bus, TX/RX rings, the mailbox and the arbiter, the station MAC) and `tb_ne2000_mac_reset` (the adopted MAC through the card's reset with DDR3 busy, a new MAC after the system reset, a zeroed window keeps the last) | 36 pass, 1 expected failure (`ethernet_tb`, BF-1 in the imported model) |
+| T3e | `make -C Main_MiSTer/support/netplay/test`: `test_ne2000`, the window in memory with a fake core and a fake Ethernet: published over garbage, the MAC's form, the heartbeat moves, Network Off opens nothing, TX from the slot ring: one, several between two passes in order, a bad length skipped, lapped (only the 8 newest), the sequence passing 0xFFFF → 1, without a link nothing sent, RX order and lengths, own echo and runts dropped, a full ring drops, wraps after the core consumes, a missing mode closes, MACVLAN, Off closes, stop withdraws the signature; the room: the MiSTer's link closed, TX to the queue and not the wire, RX from the queue into the ring and the rest waiting, a bounded queue, out of the room the link back | `PASS` |
+| T3e-l | `test_eth_link`: two links over a clean and a bad network (20 % loss, 10 % duplicates, reordering): connected, frames whole both ways (also 1514 bytes), runts and oversize not sent, lost after 10 s and back; a restart (new id) followed, a frame of the old pairing refused, lost when the other side goes quiet after starting over, an oversize datagram refused; a lockstep player, another version, junk refused | `PASS` |
+| T3e-u | `NP_SYSTEM=ao486` runs of `run_udp_test.sh` (two `netplay.cpp` over UDP, the card as two queues): direct (netplay.ini and OSD) and through a real server with `NP_AUTOJOIN` (hole punching, and `direct=no`); each side's card sends 199 frames; `NP_AO486_REPAIR=host|join`: that side turns Netplay off and on (direct, and through the server for both sides), then both send again; `NP_AO486_NET_OFF=1`: both start with Network Off and only choose Host/Join | all 199 frames arrive whole on each side, none of its own; linked with the other's name; the direct path, or through the server with `direct=no`; after the toggle linked again within 45 s and at least 40 new frames each way; with Network Off at the start both turn it on and link | 
+| T5e | hardware, one MiSTer with Ethernet, Network On, Shared, IRQ 11: in DOS `NE2KTEST` from the PR's `sw/nettest`, Crynwr `NE2000 0x60 11 0x300`, mTCP `DHCP` and `PING` | NE2KTEST passes; DHCP gets an address from the home router; ping answers from the router and from the internet |
+| T5e-r | hardware, two MiSTers in a room through the server (15.4), Doom 1.9 IPXSETUP with NE2000.COM and NPIPX (15.5) | both find each other and play (2026-11-17; with PDIPX instead neither ever finds the other) |
+| T3e-m | `tools/ao486/dos/netplay/qemu_test.sh <DOS disk> <work dir>`: the DOS kit in QEMU (15.5) | `ALL PASS` |
+| T3e-o | `python3 -I tools/mister-scripts/test_netplay_onoff.py`: netplay_on, netplay_off and normal_main.py on a fake `/media/fat` with a local database: a netplay `MiSTer_offline` (or none) gets the official binary (zipped or plain database, its own `url` or `base_files_url`, the URL from `downloader.ini`), an MD5 mismatch installs nothing, offline takes `.MiSTer.old` or changes nothing; a normal `MiSTer_offline` is kept and nothing is fetched; netplay_off swaps back after the fix and changes nothing when it fails; netplay_on fixes on an update and when already active, and still switches offline. The scripts before this fail 5 of the 22 | `ALL PASS` |
+| T3e-i | `tools/mister-scripts/test_ao486_install.sh <NETPLAY.IMG> <DOS disk> <work dir>`: the all-disks scripts on images in a privileged container (loop mounts): dry run changes nothing; install (the kit from the floppy, NP.BAT, the hook before the game start, `:NPEND` last, CRLF, the backup, a disk without AUTOEXEC.BAT, fsck clean); Windows 95, no-DOS and CD images untouched; again = updated; uninstall byte for byte, a later line stays; refused while ao486 runs; shortcuts: only the MGLs of disks with the menu, to `_Netplay/_DOS Games` with `_Netplay/ao486_netplay`, a user's file there and the originals untouched, the uninstall removes only ours. The installed copy boots in QEMU to the question and `1` gives the menu | `ALL PASS` |
+| T4e | `CORE=ao486 tools/quartus_build.sh`, compared with upstream master built the same way (upstream does not meet its own constraints: `TIMING FAILED` is expected) | worst setup slack and TNS on the CPU clock no worse than about upstream's (2026-11-16: upstream −6.218 ns / TNS −20 260, ALMs 82 %, RAM blocks 79 %; netplay −5.748 ns / −21 378, 90 %, 82 %; with 0003 on 2026-11-17: −6.143 ns, 89 %, 82 %, and the HDMI clock −0.192 ns, positive in the other builds); the core boots on hardware |
+
+### 15.4 The room (Netplay Host/Join)
+
+- **Two MiSTers** with `peer=` pair directly as the other cores do (section 7).
+  **Through the server** (`server=`) the room is a LAN of up to eight with the
+  server as its switch (15.6). OSD Netplay Host or Join (or `mode=` in
+  netplay.ini with the option on netplay.ini). The server's room is core
+  `AO486`, game `LAN`; Join takes the open AO486 room with a place. No room
+  folder and no way to pick a room: with two or more AO486 rooms open on one
+  server, Join gets "N rooms with this game: pick one" and waits.
+- **When:** Main's main thread watches the OSD: Netplay Host or Join and
+  Network On put the card in the room (`ne2000_room(true)`: the MiSTer's own
+  link is closed), anything else takes it out. A change of Netplay counts once
+  the OSD is closed, or after it has stood 1.5 s with the OSD open (as arcade:
+  stepping from Off to Join passes Host); a change of Network counts at once.
+  Either reaches the netplay thread (`lan_thread`) as a new pairing (with the
+  server the host opens a new room).
+- **One setting:** when a Host or Join choice counts (also `mode=` from
+  netplay.ini, at the core load) and Network is Off, Main turns Network On
+  (`user_io_status_set("[66]", 1)`) and says "Netplay: network card on. Reset
+  the PC (OSD Reset) so DOS finds it." Only at that moment: Network turned Off
+  by hand afterwards stays off, and the room with it. The thread
+  starts from Off at every core load. There is no game load and no core reload.
+- **Pairing again:** ten seconds without a packet from the other side
+  ("connection lost"), both sides pair from the start: a new socket, the join
+  asks for the open room again. So two MiSTers find each other again after
+  either turned its option off and on, or loaded the core again. Through the
+  server the host keeps its room id while the core runs (15.6).
+- **Frames:** the card's frames cross in two queues of 64 between the main
+  thread (which alone touches the window) and the netplay thread (the oldest
+  goes when one is full); from the room into the card while its RX ring has
+  room, the rest wait in the queue.
+- **The link** (`eth_link.cpp`), not reliable and not ordered, as Ethernet is
+  not (IPX games and TCP resend by themselves): packet `NPE1` type version (1)
+  from32 to32 (big-endian), then the frame (14 to 1536 bytes; a longer datagram
+  is refused, not cut); type 0 HELLO, 1 FRAME. `from` and `to` are random ids,
+  one per pairing. HELLO every 500 ms until the other
+  side has answered with our id, then every second; a side that becomes
+  connected answers at once. A HELLO with a new id from the other side (its core
+  loaded again) starts over. Frames are taken only from the paired side and
+  for this pairing, and sent only while connected (before that they are
+  dropped, as on a card with no cable). Ten seconds without a packet: lost.
+  Another magic before connecting (a lockstep player, the GBA adapter):
+  "the other player is not using the network card"; another version: "different
+  netplay version". A frame with its header is at most 1550 bytes of UDP: over
+  the internet that is fragmented; the server reads 2048.
+- **OSD:** "waiting for player 2 (network card)" / "connecting (network card)",
+  "network linked with X (direct|through the server)" (again after the other
+  side started over), "the other player started over", "connection lost";
+  `netplay.log` every 10 s: frames sent, received, dropped, foreign, the path.
+
+### 15.5 The DOS side: drivers, IPX and the game menu (`tools/ao486/dos/netplay`)
+
+Everything the PC needs, on one install floppy (`NETPLAY.IMG`, built by
+`build.sh` with Open Watcom 2.0 in Docker; the compiler is a pinned monthly
+build checked by SHA-256). Nothing on the MiSTer side changes.
+
+- **IPX: `NPIPX.COM`** (ours, GPL 2+). Intel PDIPX with the Crynwr NE2000
+  packet driver passes no received IPX packet on to the programs (seen on
+  hardware with two MiSTers and in QEMU with two NE2000 cards: the packet
+  driver hands the frames to PDIPX's handle, a listening ECB never fills), so
+  Doom's IPXSETUP never finds the other player. NPIPX is a TSR on the packet
+  driver with the Novell IPX interface games use: the far entry from INT 2Fh
+  AX=7A00h and INT 7Ah; open/close socket (dynamic sockets 4000h-7FFFh,
+  short-lived ones closed when their program ends: INT 21h 00h/4Ch hook, owner
+  = the current PSP from DOS's swappable data area), get local target, send,
+  listen, schedule IPX/special event (AES, on INT 1Ch), cancel, interval
+  marker, internetwork address (network 0, node = the card's MAC), relinquish,
+  packet size (1500); SPX answers "not installed". AL = 0 after every call that
+  succeeds (Doom checks AL after a send). Frames go out as Ethernet II 8137;
+  Ethernet II 8137, raw 802.3 (FFFF) and 802.2 (E0E0) are taken in. A packet
+  goes to the first listening ECB of its socket (FIFO); immediate address =
+  the sender's MAC; ESR with AL = FFh (IPX) or 00h (AES), interrupts off.
+  A send to our own node is delivered locally; broadcasts are not looped back.
+- **`NPMENU.EXE /CHECK`** finds the card at 0x300 (a reset sets ISR.RST and
+  CR reads back 21h; only when no packet driver owns it) and its IRQ (a
+  zero-length remote DMA sets ISR.RDC; with IMR = RDC the line shows in the
+  PIC's request register while masked; OSD choices 11, 10, 5, 3). It writes
+  `NPLOAD.BAT` (the loads this boot still needs: `NE2000.COM 0x60 <irq> 0x300`,
+  `NPIPX.COM`, or nothing when they are loaded) and `NPIRQ.TXT`; exit code 1 =
+  a card. No environment variables anywhere: the ready-made ao486 disks have
+  no room left in the environment and `SET` fails quietly.
+- **The boot choice, `NPMENU /BOOT`** (from AUTOEXEC.BAT through `NETBOOT.BAT
+  BOOT`): with no card it says so and returns 0 at once, so the disk boots as
+  before with no wait. With the card it does the check (writes `NPLOAD.BAT`,
+  loads nothing) and asks "Online" or "Single player"; Single player is
+  highlighted and starts by itself after 10 s without a key (the BIOS tick
+  counter; keys pressed during the boot are dropped first), so a disk never
+  stops here. Any key stops the countdown; Up/Down and Enter, `1`/`O`
+  online, `2`/`S`/Esc single player. Exit code 1 = online (load, then the
+  menu), 0 = single player: nothing is loaded and the boot goes on to the
+  disk's own game.
+- **`NETBOOT.BAT`**: with `BOOT` the boot choice, else the check; then the
+  loads and the menu in a loop (exit code 2 = run `RUN.BAT` and come back, 3 =
+  stop at the DOS prompt, 0 = go on). `NP` (no `BOOT`) brings the menu at once.
+  F10 leaves `NPSKIP.FLG`, which the AUTOEXEC hook reads.
+- **Install** (`A:\INSTALL` = `NPMENU /INSTALL`): the kit to `C:\NETPLAY`,
+  `C:\NP.BAT`, and in `C:\AUTOEXEC.BAT` (backup `AUTOEXEC.NPB`, made once) the
+  lines `CALL C:\NETPLAY\NETBOOT.BAT BOOT` and `IF EXIST C:\NETPLAY\NPSKIP.FLG
+  GOTO NPEND` before the first `CD ` or `RUNGAME` line (how the ready-made disks
+  start their game; else at the end), and `:NPEND` last. Installing again only
+  updates the files.
+- **All disks at once** (MiSTer Scripts menu, `tools/mister-scripts/
+  ao486_netplay_install.sh`, Python 3 in it, as root): for every `.vhd` in
+  each `games/AO486` (usb0-5 and fat, any case), the first FAT partition (or a
+  FAT image without a partition table) is loop-mounted (vfat) and gets what
+  `A:\INSTALL` gives: the kit's files from `games/AO486/NETPLAY.IMG` (mounted
+  read-only), `C:\NP.BAT`, and the hook by the same rule (backup once; a disk
+  with the hook gets the files only; no AUTOEXEC.BAT: one with `@ECHO OFF`,
+  the hook and `:NPEND`). Skipped: no FAT partition, no `COMMAND.COM` (not
+  DOS), Windows 95/98 (`MSDOS.SYS` text with `[Options]` and no `BootGUI=0`:
+  it boots into Windows), anything not `.vhd` (CD images). Refused while
+  `/tmp/CORENAME` is AO486 (a mounted disk must not change under the core).
+  `--dry-run` mounts read-only and only says what it would do.
+  `ao486_netplay_uninstall.sh` (= `--uninstall`) does `NPMENU /UNINSTALL` on
+  each. The game shortcuts of those disks are copied to `_Netplay/_DOS Games`
+  (section 1.1; `--menu-root` for tests).
+- **Uninstall** (`A:\UNINSTAL` = `NPMENU /UNINSTALL`; `A:\UNINSTALL` works too,
+  DOS cuts the name to eight letters): takes the three netplay lines out of
+  `C:\AUTOEXEC.BAT`; when the rest is the backup line for line, the backup is
+  copied back byte for byte, else only those lines go and later changes stay.
+  Then `AUTOEXEC.NPB`, `C:\NP.BAT` and every file in `C:\NETPLAY` (and the
+  folder) are deleted. Not a batch file in `C:\NETPLAY` (it would delete
+  itself while DOS reads it); from C: it is `C:\NETPLAY\NPMENU /UNINSTALL`.
+- **The menu**: the games of `GAMES.INI` (users add their own) found on the
+  hard disks (fixed disks only, three folders deep, not WINDOWS, DOS, NETPLAY,
+  MISTER, DRIVERS, UTIL): ready first, then found but missing files (named,
+  e.g. FastDoom without DOOM.EXE/IPXSETUP.EXE), then (Tab hides them) the
+  supported ones not on the disks. Types: `ipx` (the menu sets players, mode
+  and skill on the game's own IPX starter, `args=` with %N %M %S), `program`
+  (starts it, shows how its own menus set up network play), `fpu` (listed, not
+  started: the ao486 has no FPU). A start writes `RUN.BAT` (drive, folder, the
+  program or `CALL` of a .BAT, back to C:\) and leaves; the menu comes back
+  after the game.
+- **The room in the menu**: every menu sends an IPX broadcast on socket 4E50h
+  once a second (`NPLB`, version 1, state 0 = in the menu / 1 = starting a game,
+  name, game, arguments); a peer is shown until 5 s of silence, one who
+  started a game for 60 s or until it is back in its menu. When the other
+  player starts a game that is ready here, J follows with the same arguments.
+  The name is `PLAYER-xxxx` (the MAC's last two bytes) until F2 sets one
+  (`NETPLAY.CFG`).
+- **Tests (T3e-m)**: `qemu_test.sh <DOS disk image> <work dir>` in the np-qemu
+  image (two QEMU PCs with ne2k_isa on one socket network, the screen read from
+  VGA text memory): install (hook before the game start, backup, `:NPEND`),
+  card off (boot as before, no question), card on without a key (the question,
+  the countdown, single player after 8-13 s, no menu), card on at IRQ 10 with
+  `1` (drivers loaded once, IRQ found, a fake Heretic listed, NP again loads
+  nothing), two PCs (online by Down+Enter and by `O`; each sees the other, A
+  starts Heretic deathmatch, B follows with J, both fake IPXSETUPs get
+  `-nodes 2 -deathmatch -skill 3`), uninstall by `A:\UNINSTALL` (AUTOEXEC.BAT
+  is the old one again, C:\NETPLAY, NP.BAT and the backup gone; with a line
+  added after the install only the netplay lines go). Doom itself over NPIPX in QEMU: the
+  shareware reaches E1M1 with two players. On hardware: Doom with NPIPX
+  between two MiSTers through the server (2026-11-17).
+
+### 15.6 Rooms of up to eight (the server as the switch, ao486 only)
+
+Only ao486 rooms; every other core keeps host and join, PEER, hole punching
+and the relay exactly as before (section 7). The server's key is checked as
+for every REG.
+
+- **Server** (`server/ethswitch.go`): a REG with core `AO486` opens or joins a
+  switch room. The answer is `OK <role> switch <room>`; no PEER follows (no
+  hole punching: everything goes through the server). Up to 8 members; a ninth
+  gets "room is full" (by room) or is not matched (by `*`). Join `*` takes the
+  oldest AO486 room with a live member and a place ("N rooms … pick one" when
+  there are several). A host that registers its room again from a new socket
+  (its link started over) keeps it; another core's REG for an ao486 room id,
+  or the other way round, is refused.
+- **The link:** the server is each member's other side of NPE1 (15.4): every
+  HELLO from a member is answered with the server's own id for that member
+  (so the member's keepalive is the server's too); a member is connected when
+  its HELLO names that id. FRAME only from a connected member with its ids,
+  14–1536 bytes. Switching: the source address is learned (at most 256 per
+  room, then learning starts over); a unicast to a learned address goes to
+  that member only (to the sender itself: nowhere), a broadcast, multicast or
+  unknown address to all other connected members.
+- **Members** leave by BYE or after 15 s of silence; whenever members come or
+  go, all get `NPS1 ROOM <count> <names in order of arrival, ", ">`. The room
+  closes when the last member is gone (not when the host leaves); the server's
+  list shows the first member as the room's host and the others as joined.
+- **Main:** on `switch` the link's other side is the server ("network linked
+  with the room (through the server)"); `ROOM` shows as "Netplay: N in the
+  room: names". The host keeps its room id while the core runs (a new socket
+  after a lost link registers the same room). A join alone in the room for
+  10 s ("alone in the room, looking again") pairs from the start, so it finds
+  the host's new room after the host loaded the core again. With `peer=`
+  nothing changes (two MiSTers, direct).
+- **DOS side:** nothing changes: NPIPX broadcasts to all and takes packets from
+  anyone (15.5); Doom: `IPXSETUP -nodes 3` or `4`.
+- **Tests:** `server/ethswitch_test.go` (three members: no frame before the
+  handshake, broadcast to the other two, unicast to the learned member only,
+  unknown to all, wrong id and runts dropped; eight fit, the ninth not; the
+  host leaving keeps the room and tells the seven; the last leaving closes it;
+  a host on a new socket keeps its room; other cores unchanged; wrong key
+  refused). T3e-u through the real server: `NP_AO486_PLAYERS=3` (each of
+  three gets at least 150 frames from each other, the names of all three),
+  two players (linked with the room, never direct), Netplay off and on for
+  host and join, and `NP_AO486_RELOAD=1` (the host's Main starts over with a
+  new room, the join finds it and frames flow).

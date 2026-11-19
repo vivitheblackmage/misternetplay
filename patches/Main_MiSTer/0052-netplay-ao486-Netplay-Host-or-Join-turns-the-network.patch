@@ -1,0 +1,150 @@
+From e088d87f9476139016370ae7820d862286f17c5b Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Wed, 18 Nov 2026 22:18:01 +0100
+Subject: [PATCH 52/52] netplay: ao486 Netplay Host or Join turns the network
+ card on when Network is Off (one setting instead of two; only when the choice
+ counts, Network turned off by hand stays off); T3e-u NP_AO486_NET_OFF
+---
+ support/netplay/netplay.cpp          | 31 +++++++++++++++++++++-------
+ support/netplay/test/Makefile        |  1 +
+ support/netplay/test/run_udp_test.sh |  6 +++++-
+ support/netplay/test/udp_harness.cpp |  5 ++++-
+ 4 files changed, 33 insertions(+), 10 deletions(-)
+
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 5b09a83..118fe99 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -756,6 +756,7 @@ static bool              own_reload = false; // main thread only
+ static std::atomic<bool> neo_prearm { false };   // main -> thread: keep CTRL enabled (session 0) with a heartbeat
+ static std::atomic<bool> neo_armed { false };    // thread -> main: the core holds the machine (ARMED)
+ static Mode              ao486_mode = M_OFF;     // main thread: the room's mode as last told to the thread
++static Mode              ao486_choice = M_OFF;   // main thread: Netplay Host/Join/Off as chosen in the OSD (debounced)
+ static bool              neo_ran = false;        // main thread: a ROM set was loaded since this core was (the machine has run)
+ static std::string       neo_pending;            // main thread: a ROM set to load once the core is up again
+ 
+@@ -2981,6 +2982,7 @@ void netplay_start(void)
+ 	// ao486: the room follows the OSD from the start (netplay_poll), no game load;
+ 	// the thread starts from Off, whatever an earlier core left in rom_mode
+ 	ao486_mode = M_OFF;
++	ao486_choice = M_OFF;
+ 	if (core_sys == SYS_AO486)
+ 	{
+ 		{
+@@ -3038,8 +3040,8 @@ void netplay_poll(void)
+ 		static int pend = -1;
+ 		static uint64_t pend_t = 0;
+ 		Mode m = current_mode();
+-		if ((m != M_HOST && m != M_JOIN) || !user_io_status_get("[66]")) m = M_OFF;
+-		if (m == ao486_mode) pend = -1;
++		if (m != M_HOST && m != M_JOIN) m = M_OFF;
++		if (m == ao486_choice) pend = -1;
+ 		else
+ 		{
+ 			uint64_t t = now_ms();
+@@ -3047,14 +3049,27 @@ void netplay_poll(void)
+ 			if (!user_io_osd_is_visible() || t - pend_t >= 1500)
+ 			{
+ 				pend = -1;
+-				ao486_mode = m;
+-				ne2000_room(m != M_OFF);
+-				std::lock_guard<std::mutex> g(info_mtx);
+-				rom_mode = m;
+-				rom_room.clear();
+-				rom_seq++;
++				ao486_choice = m;
++				// Host or Join with Network Off: the card is turned on, once, when
++				// the choice counts (one setting instead of two). Network turned
++				// Off by hand afterwards stays off, and the room with it.
++				if (m != M_OFF && !user_io_status_get("[66]"))
++				{
++					user_io_status_set("[66]", 1);
++					Info("Netplay: network card on.\nReset the PC (OSD Reset)\nso DOS finds it.", 4000);
++				}
+ 			}
+ 		}
++		Mode eff = user_io_status_get("[66]") ? ao486_choice : M_OFF;
++		if (eff != ao486_mode)
++		{
++			ao486_mode = eff;
++			ne2000_room(eff != M_OFF);
++			std::lock_guard<std::mutex> g(info_mtx);
++			rom_mode = eff;
++			rom_room.clear();
++			rom_seq++;
++		}
+ 	}
+ 
+ 	// Neo Geo: the ROM set the core was loaded again for (SPEC.md 14.2)
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index 7b248a9..8407b66 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -32,6 +32,7 @@ test: test_netplay test_rfu test_rfu_link test_ne2000 test_eth_link udp_harness
+ 	NP_SYSTEM=neogeo NP_BIOSSALT=7 NP_EXPECT="Different BIOS files" ./run_udp_test.sh
+ 	NP_SYSTEM=ao486 ./run_udp_test.sh
+ 	NP_SYSTEM=ao486 NP_OSD=1 ./run_udp_test.sh
++	NP_SYSTEM=ao486 NP_OSD=1 NP_AO486_NET_OFF=1 ./run_udp_test.sh
+ 	NP_SYSTEM=ao486 NP_OSD=1 NP_AO486_REPAIR=join ./run_udp_test.sh
+ 	@srv=../../../../server/build/netplay-server-linux-amd64; \
+ 	if [ -x $$srv ]; then srv=$$(cd $$(dirname $$srv) && pwd)/$$(basename $$srv); \
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+index 45594b4..efbb734 100755
+--- a/support/netplay/test/run_udp_test.sh
++++ b/support/netplay/test/run_udp_test.sh
+@@ -61,7 +61,7 @@ echo "host: $h"
+ echo "join: $j"
+ hd=${h##*digest=}; jd=${j##*digest=}
+ repair_what="turns Netplay off and on"; [ -n "${NP_AO486_RELOAD:-}" ] && repair_what="loads the core again"
+-label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_AO486_PLAYERS:+ ($NP_AO486_PLAYERS players)}${NP_TWO:+ (two games)}${NP_NEO_RAN:+ (host played first: core reload)}${NP_NEO_SPLIT_JOIN:+ (the join has the program in two files)}${NP_OSD:+ (OSD mode${NP_OSD_STEPS:+, stepping})}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_INCORE:+, Join room in the core}${NP_DECOY:+, two rooms}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}${NP_GBA_RELOAD:+ ($NP_GBA_RELOAD loads the game again)}${NP_AO486_REPAIR:+ ($NP_AO486_REPAIR $repair_what)}"
++label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_AO486_NET_OFF:+ (Network Off at the start)}${NP_AO486_PLAYERS:+ ($NP_AO486_PLAYERS players)}${NP_TWO:+ (two games)}${NP_NEO_RAN:+ (host played first: core reload)}${NP_NEO_SPLIT_JOIN:+ (the join has the program in two files)}${NP_OSD:+ (OSD mode${NP_OSD_STEPS:+, stepping})}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_INCORE:+, Join room in the core}${NP_DECOY:+, two rooms}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}${NP_GBA_RELOAD:+ ($NP_GBA_RELOAD loads the game again)}${NP_AO486_REPAIR:+ ($NP_AO486_REPAIR $repair_what)}"
+ ok=0
+ [ $hr -eq 0 ] && [ $jr -eq 0 ] && [ $tr -eq 0 ] && [ -n "$hd" ] && [ "$hd" = "$jd" ] && ok=1
+ # GBA wireless adapter: both linked (and through the server: with the other's name)
+@@ -81,6 +81,10 @@ if [ $ok -eq 1 ] && [ "${NP_SYSTEM:-}" = ao486 ]; then
+ 	for side in $sides; do
+ 		grep -q "network linked" "$tmp/$side.log" || { echo "$side: not linked"; ok=0; }
+ 		grep "\[harness\] ao486" "$tmp/$side.log"
++		# NP_AO486_NET_OFF: Network was Off; Host/Join turns the card on (SPEC.md 15.4)
++		if [ -n "${NP_AO486_NET_OFF:-}" ]; then
++			grep -q "Network turned On by netplay" "$tmp/$side.log" || { echo "$side: Network not turned on"; ok=0; }
++		fi
+ 		if [ -n "${NP_SERVER_BIN:-}" ]; then
+ 			grep -q "network linked with the room (through the server)" "$tmp/$side.log" || { echo "$side: not linked with the room"; ok=0; }
+ 			grep -q "direct connection" "$tmp/$side.log" && { echo "$side: went direct in a switch room"; ok=0; }
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index 6831032..5f5bdfd 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -112,10 +112,11 @@ char *user_io_get_confstr(int index)
+ static uint32_t osd_netplay = 0;            // NES [89:88], SNES [59:58], GB2P [47:46], arcade [127:126]: 0 = netplay.ini, 2 Host, 3 Join
+ 
+ static bool osd_visible = false;            // NP_OSD_STEPS: the OSD is open while the option changes
++static uint32_t ao486_net = 1;              // ao486 OSD Network [66]; NP_AO486_NET_OFF=1: Off at the start
+ char user_io_osd_is_visible() { return osd_visible; }
+ uint32_t user_io_status_get(const char *opt, int)
+ {
+-	if (ao486) return !strcmp(opt, "[70:69]") ? osd_netplay : !strcmp(opt, "[66]") ? 1 : 0;   // Network On
++	if (ao486) return !strcmp(opt, "[70:69]") ? osd_netplay : !strcmp(opt, "[66]") ? ao486_net : 0;
+ 	if (!strcmp(opt, gba || neogeo ? "[46:45]" : arcade ? "[127:126]" : gb2p ? "[47:46]" : snes ? "[59:58]" : "[89:88]")) return osd_netplay;
+ 	if (arcade || neogeo) return 0;   // Neo Geo: AES, NTSC, UniBIOS, DIPs off
+ 	if (gb2p) return !strcmp(opt, "[6]") ? status6 : 0;
+@@ -128,6 +129,7 @@ uint32_t user_io_status_get(const char *opt, int)
+ void user_io_status_set(const char *opt, uint32_t value, int)
+ {
+ 	if (gb2p && !strcmp(opt, "[6]")) status6 = value;
++	else if (ao486 && !strcmp(opt, "[66]") && value == 1 && !ao486_net) { ao486_net = 1; printf("[harness] ao486 Network turned On by netplay\n"); }
+ 	else { printf("[harness] unexpected status_set %s\n", opt); reloads += 100; }
+ }
+ 
+@@ -769,6 +771,7 @@ int main(int argc, char **argv)
+ 	workdir = argv[2];
+ 	// NP_OSD=1: netplay.ini says mode=off, the OSD "Netplay" option picks host/join
+ 	bool osd = getenv("NP_OSD") != nullptr;
++	if (getenv("NP_AO486_NET_OFF")) ao486_net = 0;
+ 	if (osd && !arcade) osd_netplay = host ? 2 : 3;   // arcade: set after the MRA, below
+ 	uint32_t want = (uint32_t)atoi(argv[3]);
+ 
+-- 
+2.43.0
+

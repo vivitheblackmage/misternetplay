@@ -77,6 +77,19 @@ is matched on the md5 of the ROM as the MiSTer assembled it. The joining player
 picks the room in the game's OSD (*Join room*) or in the Arcade list, folder
 `_Netplay`. Arcade rooms show the core's name, e.g. `JTBUBL`, and are listed on
 the status page's *Arcade* tab.
+GBA (wireless adapter), Neo Geo and ao486 (network card) never get games from
+the server either and have their own tabs on the status page. GBA and ao486
+rooms match any game (GBA: each player runs their own game; ao486: the room is
+a LAN); Neo Geo rooms match on the game's program. Join takes the open room by
+itself; with ao486 only one room may be open at a time.
+
+**ao486 rooms hold up to eight MiSTers.** For them (and only them) the server
+is the room's network switch: every MiSTer's network card talks to the server,
+which passes each frame on to the member it is for, or to all of them
+(broadcast). So IPX games with three or four players (Doom) or up to eight
+(Duke Nukem 3D, Warcraft II) work through the server. Everything in an ao486
+room goes through the server, so put it near the players. The key works as for
+every room.
 
 Only put games in `roms` that you are allowed to share, such as your own games
 and homebrew.

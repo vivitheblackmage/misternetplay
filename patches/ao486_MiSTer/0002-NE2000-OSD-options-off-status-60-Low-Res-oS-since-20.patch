@@ -1,0 +1,57 @@
+From a18a2fdc56261729a63f516d64bdbd63bf0925d5 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Mon, 16 Nov 2026 21:51:30 +0100
+Subject: [PATCH] NE2000: OSD options off status[60] (Low-Res, oS, since 2020):
+ Network to [66], IRQ to [68:67]; status wire 128 bits (only 64 were
+ connected)
+---
+ ao486.sv | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+diff --git a/ao486.sv b/ao486.sv
+index 303097a..403895c 100644
+--- a/ao486.sv
++++ b/ao486.sv
+@@ -99,8 +99,8 @@ localparam CONF_STR =
+ 	"H5D2P2OG,L2 Cache,On,Off;",
+ `endif
+ 	"P2-;",
+-	"P2oS,Network,Off,On;",
+-	"P2oTU,NE2000 IRQ,11,10,5,3;",
++	"P2O[66],Network,Off,On;",
++	"P2O[68:67],NE2000 IRQ,11,10,5,3;",
+ 	// Letters 0-9,A-V are exhausted across status[63:0] (see the bit map above),
+ 	// so this uses direct [hi:lo] bracket addressing into the untouched
+ 	// status[127:64] range instead of a letter pair. user_io_status_bits()
+@@ -161,7 +161,7 @@ wire        ps2_mouse_clk_in;
+ wire        ps2_mouse_data_in;
+ 
+ wire  [1:0] buttons;
+-wire [63:0] status;
++wire [127:0] status;
+ 
+ wire [13:0] joystick_0;
+ wire [13:0] joystick_1;
+@@ -420,7 +420,7 @@ assign UART_TXD  = ~hps_mpu ? uart1_tx : (mpu_tx & ~mt32_use);
+ 
+ wire user_io_mode = status[10];
+ 
+-// NE2000 network card. status[60] = enable, status[62:61] = IRQ select
++// NE2000 network card. status[66] = enable, status[68:67] = IRQ select
+ // (0 = IRQ 11, 1 = IRQ 10, 2 = IRQ 5, 3 = IRQ 3). status[65:64] selects the
+ // HPS-side delivery mode (0=shared eth0, 1=eth1, 2=macvlan, 3=bridge) -- read
+ // only by Main_MiSTer's support/ne2000/ne2000.cpp; nothing here consumes it.
+@@ -520,8 +520,8 @@ ne2000_ddram_arbiter ne2000_arb
+ 	.s_waitrequest     (DDRAM_BUSY)
+ );
+ 
+-wire       ne2000_en      = status[60];
+-wire [1:0] ne2000_irq_sel = status[62:61];
++wire       ne2000_en      = status[66];
++wire [1:0] ne2000_irq_sel = status[68:67];
+ 
+ assign USER_OUT = user_io_mode ? {1'b1, 1'b1, uart2_dtr, 1'b1, uart2_rts, uart2_tx, 1'b1} : mt32_out;
+ 
+-- 
+2.43.0
+

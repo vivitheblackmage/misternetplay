@@ -81,6 +81,13 @@ func TestGBAAnyGame(t *testing.T) {
 	if got := regCore(t, r, addr(2), "*", "join", md5B, "GBA"); got != "OK\tjoin\tpaired\taaaaaaaa" {
 		t.Fatalf("GBA join without a room, another game: %q", got)
 	}
+	// ao486 with its network card (SPEC.md 15.6): a LAN room, no game at all,
+	// the server as its switch (ethswitch_test.go)
+	r = newRelay(testKey, nil)
+	regCore(t, r, addr(1), "aaaaaaaa", "host", md5A, "AO486")
+	if got := regCore(t, r, addr(2), "*", "join", md5B, "AO486"); got != "OK\tjoin\tswitch\taaaaaaaa" {
+		t.Fatalf("AO486 join without a room: %q", got)
+	}
 	// other cores still need the same game
 	r = newRelay(testKey, nil)
 	regCore(t, r, addr(1), "aaaaaaaa", "host", md5A, "NES")

@@ -1,3 +1,30 @@
 # Third-party files the kit and the releases carry unchanged (md5, name).
 # check_private.sh still looks for the private patterns in them, but not for
 # e-mail addresses: random bytes in a ROM can look like one.
+# ao486 network card, DOS side (tools/ao486/dos): Crynwr packet driver (GPL v1) and Intel PDIPX (freely copyable)
+4085cd2fc75488e153775945518cd5f6  tools/ao486/dos/crynwr/COPYING.DOC
+0f4137af8babe643dff7aa6b1bcb0516  tools/ao486/dos/crynwr/NE2000.COM
+e82e40e8050f9ab893a33c4e53997a14  tools/ao486/dos/crynwr/source/8390.ASM
+be1e50a77744f5cd61c0315465daa14a  tools/ao486/dos/crynwr/source/8390.INC
+3fd2447b285d767c5d8641b4a30e9a2d  tools/ao486/dos/crynwr/source/CHROUT.ASM
+6cef0d58d7b6ab29a0367969eb894d60  tools/ao486/dos/crynwr/source/CRLF.ASM
+d07418d116e69771c97a3d86244f81ab  tools/ao486/dos/crynwr/source/DECOUT.ASM
+1da17349df4d2d22023ea3fc74f0db9b  tools/ao486/dos/crynwr/source/DEFS.ASM
+18951b112076d043d6b0f47ece3fd418  tools/ao486/dos/crynwr/source/DIGOUT.ASM
+9e4c8b670bdafa413abec799979df29e  tools/ao486/dos/crynwr/source/GETDIG.ASM
+f386dce53600ee7d492af6468e7e18a4  tools/ao486/dos/crynwr/source/GETNUM.ASM
+de3c33932568941380eb9183772c7f95  tools/ao486/dos/crynwr/source/HEAD.ASM
+281d6406aab51660b42cd11dbf0a9a9a  tools/ao486/dos/crynwr/source/MAKEFILE.NOR
+40790a3c6535181cc5e4b5e577467789  tools/ao486/dos/crynwr/source/MULTICRC.ASM
+c1e1a2113d25b46b2a56e83806c65522  tools/ao486/dos/crynwr/source/NE2000.ASM
+016cba547719d1e247b402242daabba8  tools/ao486/dos/crynwr/source/PKTERR.ASM
+408f85c85ce1d63c7995877825d63498  tools/ao486/dos/crynwr/source/PRINTEA.ASM
+bd0c5ffe9e43e90185090b3e095bf52f  tools/ao486/dos/crynwr/source/PRINTNUM.ASM
+b517400e75e671f9822936c1a3863b7c  tools/ao486/dos/crynwr/source/SEG_DEFS.INC
+8e99e607ca49018e86b4ac2734f469be  tools/ao486/dos/crynwr/source/SKIPBLK.ASM
+36603d9f6d9f13786634201e8836f381  tools/ao486/dos/crynwr/source/TAIL.ASM
+73e16a63e4739501a38de404068457fb  tools/ao486/dos/crynwr/source/TIMEOUT.ASM
+7f56503564617d5442b33e6e6f4b5a9b  tools/ao486/dos/crynwr/source/VERIFYPI.ASM
+7e4e6327b70b840c83521b1cb84af14e  tools/ao486/dos/pdipx/pdipx.zip
+78115240f072a5f100139e99f1c48188  tools/ao486/dos/pdipx/pdipx1.com
+5b1380c94ae8c4a29e58c1e015202eae  tools/ao486/dos/pdipx/readme.txt

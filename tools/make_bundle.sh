@@ -28,19 +28,24 @@ cp "$rel/SOURCE.txt" "$b/"
 [ -f "$rel/RELEASE_NOTES.md" ] && cp "$rel/RELEASE_NOTES.md" "$b/"
 
 cat > "$b/README.txt" <<EOF
-NES, SNES, GAME BOY 2P, GBA WIRELESS, NEO GEO AND ARCADE NETPLAY $ver - EVERYTHING IN ONE
+NES, SNES, GAME BOY 2P, GBA WIRELESS, NEO GEO, ARCADE AND AO486 NETPLAY $ver - EVERYTHING IN ONE
 
 Two MiSTers play NES, SNES, Game Boy link-cable games, GBA games with the
 Wireless Adapter (Apotris, Pokemon FireRed/LeafGreen ...), Neo Geo (AES) or
-Bubble Bobble (arcade) together over the network. SOURCE.txt says where the
-code comes from (MiSTer-devel's NES, SNES, GBA and Neo Geo cores, the Game Boy 2P core by pomstazlesa,
+Bubble Bobble (arcade) together over the network, and the ao486 PC core gets
+a network card: up to eight MiSTers play DOS network games (Doom, Duke Nukem
+3D, Warcraft II, Command & Conquer ...) as on one LAN. SOURCE.txt says where the
+code comes from (MiSTer-devel's NES, SNES, GBA, Neo Geo and ao486 cores, the Game Boy 2P core by pomstazlesa,
 Jotego's jtcores and Main_MiSTer, plus our patches). RELEASE_NOTES.md says what
 is new.
 
 1. THE MISTER (do this on both)
    Copy the contents of the folder "SD card" to the root of the SD card (where
-   _Console is). None of your files is overwritten. Then: Scripts -> netplay_on.
-   More in "SD card/README-netplay.txt".
+   _Console is). None of your files is overwritten: the netplay cores are in
+   their own folder, _Netplay ("Netplay" in the main menu). Then: Scripts ->
+   netplay_on. From v0.6 or older, netplay_on also removes the old netplay
+   cores from _Console (game shortcuts started those instead of your normal
+   cores). More in "SD card/README-netplay.txt".
 
 2a. WITHOUT A SERVER (one player forwards a port in the router)
    Host: forward UDP 7845 in the router. OSD in NES_netplay, SNES_netplay,
@@ -75,6 +80,15 @@ NEO GEO: NeoGeo_netplay, Console (AES) mode, cartridge games. Both need the
 same BIOS files in games/NeoGeo (uni-bios.rom or neo-epo.sp1, sfix.sfix,
 000-lo.lo), the same game and the same System Type, BIOS and Video Mode
 settings. More in "SD card/README-netplay.txt".
+
+AO486 (PC): Netplay -> ao486_netplay. Once, with the core closed: Scripts ->
+ao486_netplay_install (puts the network game menu on every DOS hard disk in
+games/AO486, and your DOS game shortcuts in Netplay -> DOS Games;
+ao486_netplay_uninstall takes it off). Then start a game from Netplay -> DOS
+Games, OSD Hardware: Netplay -> Host
+on one MiSTer, Join on the others, OSD Reset, and press 1 (Online) at the
+question. Up to eight players need the server; two can play directly with
+peer=. More in "SD card/README-netplay.txt".
 
 Switching between the netplay cores (NES, SNES, Game Boy 2P, GBA, Neo Geo): reboot from the MiSTer's menu
 first (or pick the other core after a reboot). Jumping straight from one core

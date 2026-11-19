@@ -1,0 +1,192 @@
+From b1ce6c0e345fd1f9f15691e65d30e8846da4d61d Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Mon, 16 Nov 2026 23:16:24 +0100
+Subject: [PATCH 48/52] netplay: ao486 NE2000 transmit from the core's 8-slot
+ ring (frame S in slot S % 8, lengths at 0x2C40, frames at 0x3000), every
+ sequence up to the request, done written after; the single buffer at 0x2000
+ that the PR's daemon reads stays empty (seen on hardware); T3e
+---
+ support/netplay/ne2000.cpp           | 62 +++++++++++++++++++++-------
+ support/netplay/test/test_ne2000.cpp | 46 ++++++++++++++++-----
+ 2 files changed, 82 insertions(+), 26 deletions(-)
+
+diff --git a/support/netplay/ne2000.cpp b/support/netplay/ne2000.cpp
+index ede2a39..b513f40 100644
+--- a/support/netplay/ne2000.cpp
++++ b/support/netplay/ne2000.cpp
+@@ -12,9 +12,15 @@
+ // 16-bit values are little-endian and a 32-bit value is {word+2, word}, so
+ // plain little-endian access on the ARM matches both.
+ //
+-// Transmit: the core puts the frame at TX_BUFFER, its length at TX_REQ_LEN and
+-// then a new TX_REQ_SEQ; Main sends it and only then copies the sequence to
+-// TX_DONE_SEQ (the guest's transmit completes on that).
++// Transmit: a ring of 8 slots. The core stages frame number S (1..65535, then
++// 1 again: 0 is never used) in slot S % 8 (its length at TX_SLOT_LEN + 2*slot,
++// the frame at TX_SLOT_DATA + 1536*slot) and then publishes TX_REQ_SEQ = S. It
++// does not wait for Main (the guest's transmit completes once the frame is
++// staged), so Main sends every sequence from the last it sent up to TX_REQ_SEQ
++// and writes the last one to TX_DONE_SEQ. More than 8 behind, the oldest were
++// overwritten: Main goes on from the 8 newest. (The single buffer at 0x2000
++// with its length at 0x2C02, which the PR's ne2000d.py still reads, is the
++// core's old contract: it stays empty.)
+ // Receive: a ring of 16 slots of 1536 bytes; the core owns HEAD, Main owns
+ // TAIL and writes the frame and its length before it advances TAIL.
+ 
+@@ -44,16 +50,18 @@ extern int  a2065_mode_available(int mode);
+ #define OFF_STATUS       0x1052
+ #define OFF_HEARTBEAT    0x1088
+ #define OFF_SIGNATURE    0x108C
+-#define OFF_TX_BUFFER    0x2000
+-#define OFF_TX_REQ_LEN   0x2C02
+ #define OFF_RX_HEAD      0x2C04
+ #define OFF_RX_TAIL      0x2C06
+ #define OFF_TX_REQ_SEQ   0x2C08
+ #define OFF_TX_DONE_SEQ  0x2C0A
+ #define OFF_RX_LEN       0x2C20      // 16 x u16, by slot
++#define OFF_TX_SLOT_LEN  0x2C40      // 8 x u16, by slot
++#define OFF_TX_SLOT_DATA 0x3000      // 8 x 1536 bytes
+ #define OFF_RX_DATA      0x9000      // 16 x 1536 bytes
+ 
+ #define RX_SLOTS         16
++#define TX_SLOTS         8
++#define TX_SLOT_BYTES    0x600
+ #define RX_SLOT_BYTES    0x600
+ #define FLAG_RX_AVAIL    0x04        // Main's bit in the low byte of FLAGS
+ #define SIGNATURE        0xCAFEBABEu
+@@ -192,24 +200,46 @@ void ne2000_stop(void)
+ 	printf("[ne2000] stopped\n");
+ }
+ 
++static inline uint16_t seq_next(uint16_t s) { return s == 0xFFFF ? 1 : s + 1; }
++static inline uint16_t seq_prev(uint16_t s) { return s <= 1 ? 0xFFFF : s - 1; }
++
++// how many frames from the one after 'from' up to 'to' (0 is skipped)
++static uint32_t seq_steps(uint16_t from, uint16_t to)
++{
++	uint32_t n = (uint16_t)(to - from);
++	if (from > to && from != 0) n--;          // passed 0xFFFF -> 1
++	return n;
++}
++
+ static void poll_tx(void)
+ {
+-	uint16_t seq = rd16(OFF_TX_REQ_SEQ);
+-	if (seq == last_tx_seq || seq == 0) return;
++	uint16_t req = rd16(OFF_TX_REQ_SEQ);
++	if (req == 0 || req == last_tx_seq) return;
+ 
+-	int len = rd16(OFF_TX_REQ_LEN);
+-	if (len <= 0 || len > MAX_FRAME) return;      // never ack nonsense: the guest would take it as sent
++	if (seq_steps(last_tx_seq, req) > TX_SLOTS)
++	{
++		// the core lapped Main: the older frames are gone
++		uint16_t s = req;
++		for (int i = 0; i < TX_SLOTS; i++) s = seq_prev(s);
++		last_tx_seq = s;
++	}
+ 
+-	if (link_open)
++	static uint8_t frame[TX_SLOT_BYTES];
++	while (last_tx_seq != req)
+ 	{
+-		static uint8_t frame[MAX_FRAME];
+-		memcpy(frame, (const void *)(win + OFF_TX_BUFFER), len);
+-		ethernet_send(frame, len);
++		uint16_t s = seq_next(last_tx_seq);
++		uint32_t slot = s & (TX_SLOTS - 1);
++		int len = rd16(OFF_TX_SLOT_LEN + slot * 2);
++		// with no link, or a length no frame has, the frame goes nowhere (a card with no cable)
++		if (link_open && len >= 14 && len <= TX_SLOT_BYTES)
++		{
++			memcpy(frame, (const void *)(win + OFF_TX_SLOT_DATA + slot * TX_SLOT_BYTES), len);
++			ethernet_send(frame, len);
++		}
++		last_tx_seq = s;
+ 	}
+-	// with no link the frame is dropped, as a card with no cable does
+ 	__sync_synchronize();
+-	wr16(OFF_TX_DONE_SEQ, seq);
+-	last_tx_seq = seq;
++	wr16(OFF_TX_DONE_SEQ, last_tx_seq);
+ }
+ 
+ static void poll_rx(void)
+diff --git a/support/netplay/test/test_ne2000.cpp b/support/netplay/test/test_ne2000.cpp
+index a0a2ec5..791320b 100644
+--- a/support/netplay/test/test_ne2000.cpp
++++ b/support/netplay/test/test_ne2000.cpp
+@@ -64,11 +64,17 @@ static std::vector<uint8_t> frame(uint8_t tag, int len, const uint8_t *src = 0)
+ 	return f;
+ }
+ 
+-// the core stages a frame and publishes the sequence last
++// the core stages frame 'seq' in slot seq % 8 (length, then data) and only
++// then publishes the sequence (ne2000_core.v, Fix B: BG_WRITE_TX_SEQ_REQ)
++static void core_stage(uint16_t seq, const std::vector<uint8_t> &f)
++{
++	uint32_t slot = seq & 7;
++	memcpy(window + OFF_TX_SLOT_DATA + slot * TX_SLOT_BYTES, f.data(), f.size());
++	set16(OFF_TX_SLOT_LEN + slot * 2, (uint16_t)f.size());
++}
+ static void core_tx(uint16_t seq, const std::vector<uint8_t> &f)
+ {
+-	memcpy(window + OFF_TX_BUFFER, f.data(), f.size());
+-	set16(OFF_TX_REQ_LEN, (uint16_t)f.size());
++	core_stage(seq, f);
+ 	set16(OFF_TX_REQ_SEQ, seq);
+ }
+ 
+@@ -105,7 +111,7 @@ int main()
+ 	CHECK(opens == 1 && open_iface == "eth0" && promisc_seen == 1, "open %d %s %d", opens, open_iface.c_str(), promisc_seen);
+ 	CHECK(filters == 1 && !memcmp(filter_mac, card_mac, 6), "MAC filter not set to the card's address");
+ 
+-	// ---- transmit: sent once, acked after the send, not again for the same sequence
++	// ---- transmit: sent once, from its slot, not again for the same sequence
+ 	std::vector<uint8_t> f2 = frame(0x22, 1514);
+ 	core_tx(2, f2);
+ 	ne2000_poll();
+@@ -113,14 +119,34 @@ int main()
+ 	CHECK(sent.size() == 1 && sent[0] == f2, "TX: %zu frames sent", sent.size());
+ 	CHECK(w16(OFF_TX_DONE_SEQ) == 2, "TX done %u", w16(OFF_TX_DONE_SEQ));
+ 
+-	// a nonsense length is never acked (the guest would take it as sent)
+-	set16(OFF_TX_REQ_LEN, 4000);
+-	set16(OFF_TX_REQ_SEQ, 3);
++	// ---- several staged between two passes: all sent, in order, from their slots
++	std::vector<uint8_t> f3 = frame(0x33, 64), f4 = frame(0x34, 300), f5 = frame(0x35, 60);
++	core_stage(3, f3); core_stage(4, f4); core_tx(5, f5);
++	ne2000_poll();
++	CHECK(sent.size() == 4 && sent[1] == f3 && sent[2] == f4 && sent[3] == f5, "queued TX: %zu sent", sent.size());
++	CHECK(w16(OFF_TX_DONE_SEQ) == 5, "TX done %u", w16(OFF_TX_DONE_SEQ));
++
++	// a slot with a length no frame has is not sent, and the ring goes on past it
++	core_stage(6, frame(0x36, 60));
++	set16(OFF_TX_SLOT_LEN + 6 * 2, 4000);
++	core_tx(7, frame(0x37, 60));
+ 	ne2000_poll();
+-	CHECK(w16(OFF_TX_DONE_SEQ) == 2 && sent.size() == 1, "bad length acked or sent");
+-	core_tx(3, frame(0x33, 64));
++	CHECK(sent.size() == 5 && sent[4][20] == 0x37 && w16(OFF_TX_DONE_SEQ) == 7, "bad length: %zu sent, done %u", sent.size(), w16(OFF_TX_DONE_SEQ));
++
++	// lapped: 12 staged since the last pass, only the 8 newest are still there
++	for (uint16_t q = 8; q <= 19; q++) core_stage(q, frame((uint8_t)q, 60));
++	set16(OFF_TX_REQ_SEQ, 19);
++	ne2000_poll();
++	CHECK(sent.size() == 13 && sent[5][20] == 12 && sent[12][20] == 19, "lapped: %zu sent, first %u", sent.size(), sent.size() > 5 ? sent[5][20] : 0);
++
++	// the sequence goes 0xFFFF -> 1 (0 is never used): 0xFFFE, 0xFFFF, 1, 2 in order
++	last_tx_seq = 0xFFFD;
++	core_stage(0xFFFE, frame(0xA1, 60)); core_stage(0xFFFF, frame(0xA2, 60)); core_stage(1, frame(0xA3, 60)); core_tx(2, frame(0xA4, 60));
++	size_t before = sent.size();
+ 	ne2000_poll();
+-	CHECK(w16(OFF_TX_DONE_SEQ) == 3 && sent.size() == 2, "the retried request did not go");
++	CHECK(sent.size() == before + 4 && sent[before][20] == 0xA1 && sent[before + 2][20] == 0xA3 && sent[before + 3][20] == 0xA4,
++	      "wrap: %zu sent", sent.size() - before);
++	CHECK(w16(OFF_TX_DONE_SEQ) == 2, "wrap: done %u", w16(OFF_TX_DONE_SEQ));
+ 
+ 	// ---- receive: slots in order, the length before the tail, our own echo and runts dropped
+ 	wire_in.push_back(frame(0x41, 60));
+-- 
+2.43.0
+

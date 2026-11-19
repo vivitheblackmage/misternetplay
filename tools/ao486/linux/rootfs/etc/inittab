@@ -1,0 +1,6 @@
+::sysinit:/etc/rc
+tty1::respawn:-/bin/sh
+tty2::askfirst:-/bin/sh
+tty3::askfirst:-/bin/sh
+::ctrlaltdel:/bin/reboot
+::shutdown:/bin/umount -a -r

@@ -1,0 +1,23 @@
+#!/bin/sh
+# ao486 Linux: everything runs from RAM; the network card is eth0 (NE2000,
+# io 0x300, irq 11: OSD Hardware -> Network On, NE2000 IRQ 11).
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev 2>/dev/null
+mkdir -p /dev/pts
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmp /tmp
+hostname ao486
+ip link set lo up
+ip addr add 127.0.0.1/8 dev lo
+if ip link show eth0 >/dev/null 2>&1; then
+	ip link set eth0 up
+	# a lease in the background: the shell comes up at once
+	udhcpc -i eth0 -b -q -s /etc/udhcpc.script >/dev/null 2>&1
+	httpd -h /www
+	telnetd -l /bin/sh
+	echo "eth0: up (DHCP in the background; 'ip addr' shows the address)"
+else
+	echo "no network card: OSD Hardware -> Network On, NE2000 IRQ 11, then reboot"
+fi
+cat /etc/motd

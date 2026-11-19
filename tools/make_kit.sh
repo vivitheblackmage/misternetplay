@@ -40,36 +40,56 @@ rom="$root/netpong/netpong.nes"
 
 for f in "$rbf" "$srbf" "$grbf" "$bin" "$rom"; do [ -f "$f" ] || { echo "missing $f"; exit 1; }; done
 
+# the cores carry their build date, as MiSTer's own: NES_netplay_20261118.rbf
+dated() { echo "$1_$(date -r "$2" +%Y%m%d).rbf"; }
+
 rm -rf "$kit" "$root/dist/netplay-kit.zip"
-mkdir -p "$kit/_Console" "$kit/Scripts" "$kit/games/NES/NetPong" "$kit/games/GAMEBOY2P"
-cp "$rbf" "$kit/_Console/NES_netplay.rbf"
-cp "$srbf" "$kit/_Console/SNES_netplay.rbf"
-cp "$grbf" "$kit/_Console/GAMEBOY2P_netplay.rbf"
+mkdir -p "$kit/_Netplay" "$kit/Scripts" "$kit/games/NES/NetPong" "$kit/games/GAMEBOY2P"
+cp "$rbf" "$kit/_Netplay/$(dated NES_netplay "$rbf")"
+cp "$srbf" "$kit/_Netplay/$(dated SNES_netplay "$srbf")"
+cp "$grbf" "$kit/_Netplay/$(dated GAMEBOY2P_netplay "$grbf")"
 cp "$bin" "$kit/MiSTer_online"
 cp "$root"/tools/mister-scripts/netplay_on.sh "$root"/tools/mister-scripts/netplay_off.sh "$kit/Scripts/"
+mkdir -p "$kit/Scripts/.config/netplay"
+cp "$root"/tools/mister-scripts/normal_main.py "$kit/Scripts/.config/netplay/"
 cp "$rom" "$kit/games/NES/NetPong/NetPong.nes"
 chmod +x "$kit/MiSTer_online" "$kit"/Scripts/*.sh
 # GBA with the wireless adapter (SPEC.md 13), when it is built
 gbarbf="$root/GBA_MiSTer/output_files/GBA.rbf"
 if [ -f "$gbarbf" ]; then
-  cp "$gbarbf" "$kit/_Console/GBA_netplay.rbf"
+  cp "$gbarbf" "$kit/_Netplay/$(dated GBA_netplay "$gbarbf")"
 fi
-# Neo Geo (SPEC.md 14), when it is built: next to the normal NeoGeo core
+# Neo Geo (SPEC.md 14), when it is built
 neorbf="$root/NeoGeo_MiSTer/output_files/NeoGeo.rbf"
 if [ -f "$neorbf" ]; then
-  cp "$neorbf" "$kit/_Console/NeoGeo_netplay.rbf"
+  cp "$neorbf" "$kit/_Netplay/$(dated NeoGeo_netplay "$neorbf")"
 fi
 # arcade (SPEC.md 12): next to Jotego's jtbubl.rbf, never over it
 arbf="$root/jtcores/release/mister/jtbubl.rbf"
 if [ -f "$arbf" ]; then
   mkdir -p "$kit/_Arcade/cores"
-  cp "$arbf" "$kit/_Arcade/cores/jtbubl-netplay.rbf"
+  cp "$arbf" "$kit/_Arcade/cores/$(dated jtbubl-netplay "$arbf")"
   cp "$root"/tools/arcade/*.mra "$kit/_Arcade/"
 fi
 
+# ao486 with the network card (SPEC.md 15), when it is built: next to the
+# normal ao486 core; the DOS kit floppy (tools/ao486/dos/netplay/build.sh, which
+# make_release.sh runs into dist/ao486-dos) and the Scripts that put its menu
+# on all DOS disks
+aorbf="$root/ao486_MiSTer/output_files/ao486.rbf"
+aoimg="$root/dist/ao486-dos/NETPLAY.IMG"
+if [ -f "$aorbf" ]; then
+  [ -f "$aoimg" ] || { echo "missing $aoimg: tools/ao486/dos/netplay/build.sh dist/ao486-dos"; exit 1; }
+  mkdir -p "$kit/games/AO486"
+  cp "$aorbf" "$kit/_Netplay/$(dated ao486_netplay "$aorbf")"
+  cp "$aoimg" "$kit/games/AO486/NETPLAY.IMG"
+  cp "$root"/tools/mister-scripts/ao486_netplay_install.sh "$root"/tools/mister-scripts/ao486_netplay_uninstall.sh "$kit/Scripts/"
+  chmod +x "$kit"/Scripts/*.sh
+fi
+
 cat > "$kit/$ini" <<EOF
-; NES, SNES, Game Boy 2P, GBA, Neo Geo and arcade netplay. The OSD option "Netplay" of the
-; *_netplay cores picks Off/Host/Join;
+; NES, SNES, Game Boy 2P, GBA, Neo Geo, arcade and ao486 netplay. The OSD option "Netplay"
+; of the *_netplay cores picks Off/Host/Join;
 ; this file gives the address, port and delay.
 
 [netplay]
@@ -84,32 +104,41 @@ file=               ; record/replay: empty = one file per game
 EOF
 
 cat > "$kit/README-netplay.txt" <<'EOF'
-NES, SNES, GAME BOY 2P, GBA, NEO GEO AND ARCADE NETPLAY - GETTING STARTED
+NES, SNES, GAME BOY 2P, GBA, NEO GEO, ARCADE AND AO486 NETPLAY - GETTING STARTED
 
 1. Unzip everything into the root of the SD card (where the _Console folder is).
-   None of your own files is overwritten: the cores are NES_netplay.rbf,
-   SNES_netplay.rbf, GAMEBOY2P_netplay.rbf, GBA_netplay.rbf and
-   NeoGeo_netplay.rbf, the binary MiSTer_online,
+   None of your own files is overwritten: the netplay cores are in their own
+   folder, _Netplay (NES_netplay, SNES_netplay, GAMEBOY2P_netplay, GBA_netplay,
+   NeoGeo_netplay and ao486_netplay, each with its build date, as
+   NES_netplay_20261118.rbf), shown as "Netplay" in the MiSTer's main menu;
+   the binary is MiSTer_online,
    NetPong goes to games/NES/NetPong/.
+   From v0.6 or older: netplay_on (step 2) removes the old copies in _Console
+   and _Computer, and older versions in _Netplay. Without that, game shortcuts (MGL files, MiSTer_SAM) would
+   start the netplay core instead of your normal one.
    If you already have a netplay.ini, keep yours and change peer= or server= in it.
    (A kit made with --keep-ini has netplay.ini.example instead: rename it to
    netplay.ini only if you have none.)
 
 2. Scripts menu -> netplay_on. The MiSTer restarts with the netplay binary.
    Your normal binary is kept as MiSTer_offline; netplay_off brings it back.
+   If an older netplay_on (before v0.5) saved a netplay binary there instead,
+   netplay_on and netplay_off fetch the official binary from the MiSTer
+   database (checked against its MD5) and put it there; the MiSTer needs the
+   network for that.
 
-3. Start NES_netplay (under Console). In the OSD:
+3. Start NES_netplay (under Netplay). In the OSD:
      Advanced -> RAM Clear -> $00
      Netplay  -> Host on one MiSTer, Join on the other
      Save settings (at the bottom of the menu), or RAM Clear is lost at restart.
 
-SNES: start SNES_netplay (under Console). OSD Netplay -> Host or Join, the
+SNES: start SNES_netplay (under Netplay). OSD Netplay -> Host or Join, the
    same as NES; no other settings needed (both must have the same OSD settings).
    Games come from your own games/SNES folder (both need the same file) or from
    the server. Not supported: MSU-1, BS-X/Satellaview, games with a clock
    (S-RTC, SPC7110 RTC) and SPC music files.
 
-GAME BOY 2P: start GAMEBOY2P_netplay (under Console). It runs two Game Boys
+GAME BOY 2P: start GAMEBOY2P_netplay (under Netplay). It runs two Game Boys
    linked by cable; the host plays Game Boy 1, the join Game Boy 2, and both
    screens are shown. Games go in games/GAMEBOY2P (.gb/.gbc). OSD Netplay ->
    Host or Join, then load a game (same file on both, same file extension).
@@ -156,6 +185,29 @@ GBA WIRELESS ADAPTER (GBA_netplay): games that use Nintendo's GBA Wireless
    akouzoukos: download it from https://akouzoukos.com/apotris/downloads and
    put Apotris.gba in games/GBA (2 player battle -> wireless).
 
+AO486 (PC) NETWORK GAMES (_Netplay/ao486_netplay.rbf): the MiSTer ao486 core
+   with an NE2000 network card. Up to eight MiSTers in a room share a small
+   network, so DOS games with IPX network play see each other as on a LAN:
+   Doom, Duke Nukem 3D, Warcraft II, Command & Conquer, Blood ... Each MiSTer
+   runs its own PC; only the network frames cross (no lockstep).
+   Once: Scripts menu -> ao486_netplay_install (with the ao486 core closed).
+   It puts the network game menu on every DOS hard disk in games/AO486, from
+   games/AO486/NETPLAY.IMG; Windows 95/98 disks are skipped.
+   ao486_netplay_uninstall takes it off again.
+   It also copies your DOS game shortcuts (MGL files that start the ao486
+   core with a disk, such as _DOS Games) to Netplay -> DOS Games, where they
+   start ao486_netplay; your own shortcuts still start the normal core.
+   Play: start a game from Netplay -> DOS Games (or ao486_netplay with a
+   game disk). OSD, Hardware page: Netplay ->
+   Host on one MiSTer, Join on the others (this turns Network On too), then
+   OSD Reset. At "How do you want to play?" press 1 (Online): the drivers
+   load and the menu shows the network games on that disk and who is in the
+   room. Pick the game and start it; the others press J to follow with the
+   same settings. Single player starts by itself after 10 seconds.
+   More than two players need the server (ao486 rooms of up to eight); with
+   peer= two MiSTers play directly. More in games/AO486/NETPLAY.IMG
+   (README.TXT on the floppy).
+
 SWITCHING CORES: to go from one netplay core to another (NES_netplay to
    SNES_netplay, say), reboot from
    the MiSTer's menu first and then start the other core. Jumping straight from
@@ -185,7 +237,7 @@ WITH A SERVER (server= and key= are set in netplay.ini)
    "... (missing game)" in Rooms        you do not have that game (same md5)
 
 Check: the files must have the md5 sums in md5sums.txt. Over ssh on the MiSTer:
-  cd /media/fat && md5sum MiSTer_online _Console/*_netplay.rbf _Arcade/cores/jtbubl-netplay.rbf
+  cd /media/fat && md5sum MiSTer_online _Netplay/*_netplay_*.rbf _Arcade/cores/jtbubl-netplay_*.rbf
 Always pass on the zip file, not loose files: some transfers (FTP in ASCII
 mode, git) change line endings in binaries, and MiSTer_online then does not
 start (black screen). To recover, put the SD card in a computer: delete

@@ -1,0 +1,1294 @@
+From 7d7a12e708d1aa06f08fda937c3d804d96a2044a Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Tue, 17 Nov 2026 06:44:49 +0100
+Subject: [PATCH 50/52] netplay: ao486's network card in a room (SPEC 15.4):
+ SYS_AO486, OSD Netplay [70:69] (debounced as arcade), lan_thread pairs as the
+ other cores (server room AO486 or peer=) and carries the card's frames over
+ EthLink (NPE1, not reliable), both sides pair again after 10 s of silence;
+ the card's frames cross in two bounded queues; MAC from eth0's last three
+ bytes; T3e-l test_eth_link, T3e-u NP_SYSTEM=ao486 runs (direct, server,
+ direct=no, Netplay off and on)
+---
+ support/netplay/eth_link.cpp           |  95 +++++++++++
+ support/netplay/eth_link.h             |  58 +++++++
+ support/netplay/ne2000.cpp             | 101 ++++++++++--
+ support/netplay/ne2000.h               |  10 ++
+ support/netplay/netplay.cpp            | 203 +++++++++++++++++++++++-
+ support/netplay/netplay_proto.h        |   2 +-
+ support/netplay/test/Makefile          |  19 ++-
+ support/netplay/test/run_udp_test.sh   |  23 ++-
+ support/netplay/test/test_eth_link.cpp | 210 +++++++++++++++++++++++++
+ support/netplay/test/test_ne2000.cpp   |  49 +++++-
+ support/netplay/test/udp_harness.cpp   | 132 +++++++++++++++-
+ 11 files changed, 870 insertions(+), 32 deletions(-)
+ create mode 100644 support/netplay/eth_link.cpp
+ create mode 100644 support/netplay/eth_link.h
+ create mode 100644 support/netplay/test/test_eth_link.cpp
+
+diff --git a/support/netplay/eth_link.cpp b/support/netplay/eth_link.cpp
+new file mode 100644
+index 0000000..481b7a1
+--- /dev/null
++++ b/support/netplay/eth_link.cpp
+@@ -0,0 +1,95 @@
++// eth_link.cpp — ao486's network card frames between two MiSTers (SPEC.md 15.4).
++
++#include "eth_link.h"
++#include <string.h>
++
++namespace {
++const uint8_t MAGIC[4] = { 'N', 'P', 'E', '1' };
++const uint64_t HELLO_MS = 500, KEEPALIVE_MS = 1000;
++
++void put32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
++uint32_t get32(const uint8_t *p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
++}
++
++void EthLink::put(uint8_t type, const uint8_t *data, size_t len)
++{
++	uint8_t pkt[HDR + MAX_FRAME];
++	memcpy(pkt, MAGIC, 4);
++	pkt[4] = type;
++	pkt[5] = VERSION;
++	put32(pkt + 6, sid_);
++	put32(pkt + 10, peer_sid_);
++	if (len) memcpy(pkt + HDR, data, len);
++	t_->send(pkt, HDR + len);
++	if (type == T_HELLO) { last_hello_ = now_; hello_sent_ = true; }
++}
++
++void EthLink::send(const uint8_t *frame, size_t len)
++{
++	if (!connected_ || len < MIN_FRAME || len > MAX_FRAME) { dropped_++; return; }
++	put(T_FRAME, frame, len);
++	sent_++;
++}
++
++void EthLink::tick(uint64_t now_ms, const Deliver &deliver)
++{
++	now_ = now_ms;
++	// larger than any packet: a datagram cut to the buffer still shows as too long
++	uint8_t buf[2048];
++	int n;
++	while ((n = t_->recv(buf, sizeof(buf))) >= 0)
++	{
++		if ((size_t)n < HDR || memcmp(buf, MAGIC, 4))
++		{
++			// a lockstep player, the wireless adapter, or junk
++			foreign_++;
++			if (n >= 4 && !connected_) refusal_ = "Netplay: the other player is not using the network card";
++			continue;
++		}
++		uint8_t type = buf[4];
++		uint32_t from = get32(buf + 6), to = get32(buf + 10);
++		if (buf[5] != VERSION)
++		{
++			foreign_++;
++			refusal_ = "Netplay: different netplay version";
++			continue;
++		}
++		if (from == 0 || (type != T_HELLO && type != T_FRAME)) { foreign_++; continue; }
++
++		if (type == T_HELLO)
++		{
++			if (peer_sid_ != from)
++			{
++				// the first hello, or the other side came back with a new id
++				if (peer_sid_) restarts_++;
++				peer_sid_ = from;
++				connected_ = false;
++			}
++			last_rx_ = now_;
++			if (to == sid_)
++			{
++				if (!connected_)
++				{
++					connected_ = true;
++					refusal_ = nullptr;
++					if (!locked_) { t_->lock_peer(); locked_ = true; }   // from now on only this player
++					put(T_HELLO, nullptr, 0);   // so the other side connects too, not a keepalive later
++				}
++			}
++			else put(T_HELLO, nullptr, 0);   // it has not heard us yet: answer at once
++			continue;
++		}
++
++		// a frame: only from the paired side, addressed to this pairing
++		if (!connected_ || from != peer_sid_ || to != sid_) { foreign_++; continue; }
++		size_t len = (size_t)n - HDR;
++		if (len < MIN_FRAME || len > MAX_FRAME) { foreign_++; continue; }
++		last_rx_ = now_;
++		received_++;
++		deliver(buf + HDR, len);
++	}
++
++	// hellos until the other side has heard us, then a keepalive
++	uint64_t every = connected_ ? KEEPALIVE_MS : HELLO_MS;
++	if (!hello_sent_ || now_ - last_hello_ >= every) put(T_HELLO, nullptr, 0);
++}
+diff --git a/support/netplay/eth_link.h b/support/netplay/eth_link.h
+new file mode 100644
+index 0000000..5d6698d
+--- /dev/null
++++ b/support/netplay/eth_link.h
+@@ -0,0 +1,58 @@
++// eth_link.h — ao486's network card frames between two MiSTers (SPEC.md 15.4):
++// the card's Ethernet frames over the netplay Transport (UDP, direct or through
++// the server). Not reliable and not ordered, as Ethernet is not: IPX games and
++// TCP do their own resending. No lockstep. No OS calls (time comes in as an
++// argument), so it builds in the x86 tests.
++
++#ifndef ETH_LINK_H
++#define ETH_LINK_H
++
++#include <stdint.h>
++#include <stddef.h>
++#include <functional>
++#include "netplay_session.h"   // Transport
++
++class EthLink
++{
++public:
++	static const size_t MIN_FRAME = 14;        // an Ethernet header
++	static const size_t MAX_FRAME = 1536;      // the card's slot (a frame is at most 1514 bytes)
++	static const size_t HDR = 14;              // "NPE1" type version from32 to32
++	using Deliver = std::function<void(const uint8_t *frame, size_t len)>;
++
++	// sid: this side's random id for this pairing (0 is not allowed). The other
++	// side coming back with a new id (its core loaded again) starts over.
++	EthLink(netplay::Transport *t, uint32_t sid) : t_(t), sid_(sid ? sid : 1) {}
++
++	void send(const uint8_t *frame, size_t len);          // dropped until connected (no cable yet)
++	void tick(uint64_t now_ms, const Deliver &deliver);   // receive, hello, keep alive
++
++	bool connected() const { return connected_; }
++	// ten seconds without a packet from the side it last heard (also after that
++	// side came back with a new id and then went quiet)
++	bool lost(uint64_t now_ms) const { return peer_sid_ && now_ms - last_rx_ > 10000; }
++	const char *refusal() const { return refusal_; }     // the other side is not a network card
++	uint32_t restarts() const { return restarts_; }
++
++	// observation (netplay.log, tests)
++	uint32_t sent() const { return sent_; }
++	uint32_t received() const { return received_; }
++	uint32_t dropped() const { return dropped_; }        // frames to send before the link was up, or too long
++	uint32_t foreign() const { return foreign_; }
++
++private:
++	enum : uint8_t { T_HELLO = 0, T_FRAME = 1 };
++	static const uint8_t VERSION = 1;
++
++	netplay::Transport *t_;
++	uint32_t sid_, peer_sid_ = 0;
++	bool connected_ = false, locked_ = false;
++	const char *refusal_ = nullptr;
++	uint64_t now_ = 0, last_hello_ = 0, last_rx_ = 0;
++	bool hello_sent_ = false;
++	uint32_t restarts_ = 0, sent_ = 0, received_ = 0, dropped_ = 0, foreign_ = 0;
++
++	void put(uint8_t type, const uint8_t *data, size_t len);
++};
++
++#endif
+diff --git a/support/netplay/ne2000.cpp b/support/netplay/ne2000.cpp
+index 5687185..76e8dd5 100644
+--- a/support/netplay/ne2000.cpp
++++ b/support/netplay/ne2000.cpp
+@@ -27,6 +27,9 @@
+ #include <stdio.h>
+ #include <string.h>
+ #include <stdint.h>
++#include <mutex>
++#include <deque>
++#include <vector>
+ 
+ #include "../../user_io.h"
+ #include "../../shmem.h"
+@@ -75,6 +78,7 @@ extern int  a2065_mode_available(int mode);
+ #define MODE_ETH1        2
+ #define MODE_MACVLAN     3
+ #define MODE_TAP         4
++#define MODE_ROOM        5           // Netplay Host/Join: the frames go to the room (SPEC 15.4)
+ 
+ #define MACVLAN_NAME     "ne2k0"
+ 
+@@ -88,12 +92,19 @@ static uint16_t last_tx_seq = 0;
+ static uint16_t last_status = 0;
+ static uint8_t  mac[6];
+ 
++// the room's queues (main thread <-> netplay thread)
++static const size_t ROOM_QUEUE = 64;
++static std::mutex room_mtx;
++static std::deque<std::vector<uint8_t>> room_out, room_in;
++static bool room_on = false;      // main thread
++
+ static inline uint16_t rd16(uint32_t off) { return *(volatile uint16_t *)(win + off); }
+ static inline void wr16(uint32_t off, uint16_t v) { *(volatile uint16_t *)(win + off) = v; }
+ static inline void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(win + off) = v; }
+ 
+-// 52:54:05:04 (unicast, locally administered: the card's own prefix) and the
+-// last two bytes of eth0's address, so two MiSTers on one LAN differ.
++// 52:54:05 (unicast, locally administered: the card's own prefix) and the last
++// three bytes of eth0's address, so two MiSTers on one LAN, or in one room,
++// differ. eth0's address exists also when the MiSTer is on WiFi.
+ static void make_mac(void)
+ {
+ 	static const uint8_t def[6] = { 0x52, 0x54, 0x05, 0x04, 0x03, 0x02 };
+@@ -103,6 +114,7 @@ static void make_mac(void)
+ 	unsigned int b[6];
+ 	if (fscanf(f, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6)
+ 	{
++		mac[3] = (uint8_t)b[3];
+ 		mac[4] = (uint8_t)b[4];
+ 		mac[5] = (uint8_t)b[5];
+ 	}
+@@ -156,6 +168,7 @@ static void open_link(int mode)
+ static int mode_from_status(void)
+ {
+ 	if (!user_io_status_get("[66]")) return MODE_OFF;
++	if (room_on) return MODE_ROOM;
+ 	int mode = (int)user_io_status_get("[65:64]") + 1;
+ 	if (!a2065_mode_available(mode)) return MODE_OFF;
+ 	return mode;
+@@ -196,6 +209,7 @@ void ne2000_stop(void)
+ 	if (!running) return;
+ 	running = 0;
+ 	close_link();
++	ne2000_room(false);
+ 	if (win) wr32(OFF_SIGNATURE, 0);
+ 	printf("[ne2000] stopped\n");
+ }
+@@ -247,11 +261,17 @@ static void poll_tx(void)
+ 		uint32_t slot = s & (TX_SLOTS - 1);
+ 		int len = rd16(OFF_TX_SLOT_LEN + slot * 2);
+ 		// with no link, or a length no frame has, the frame goes nowhere (a card with no cable)
+-		if (link_open && len >= 14 && len <= TX_SLOT_BYTES)
++		if (len >= 14 && len <= TX_SLOT_BYTES && (link_open || cur_mode == MODE_ROOM))
+ 		{
+ 			memcpy(frame, (const void *)(win + OFF_TX_SLOT_DATA + slot * TX_SLOT_BYTES), len);
+ 			follow_guest_mac(frame + 6);
+-			ethernet_send(frame, len);
++			if (cur_mode == MODE_ROOM)
++			{
++				std::lock_guard<std::mutex> g(room_mtx);
++				if (room_out.size() >= ROOM_QUEUE) room_out.pop_front();   // the thread is behind: the oldest goes
++				room_out.push_back(std::vector<uint8_t>(frame, frame + len));
++			}
++			else ethernet_send(frame, len);
+ 		}
+ 		last_tx_seq = s;
+ 	}
+@@ -259,6 +279,23 @@ static void poll_tx(void)
+ 	wr16(OFF_TX_DONE_SEQ, last_tx_seq);
+ }
+ 
++// a frame into the card's RX ring: false when the ring is full
++static bool ring_put(const uint8_t *frame, int len)
++{
++	uint16_t head = rd16(OFF_RX_HEAD) & (RX_SLOTS - 1);
++	uint16_t tail = rd16(OFF_RX_TAIL) & (RX_SLOTS - 1);
++	uint16_t next = (tail + 1) & (RX_SLOTS - 1);
++	if (next == head) return false;
++
++	if (len > RX_SLOT_BYTES) len = RX_SLOT_BYTES;
++	memcpy((void *)(win + OFF_RX_DATA + tail * RX_SLOT_BYTES), frame, len);
++	wr16(OFF_RX_LEN + tail * 2, (uint16_t)len);
++	__sync_synchronize();
++	wr16(OFF_RX_TAIL, next);                     // only now is the slot the core's
++	win[OFF_FLAGS] = win[OFF_FLAGS] | FLAG_RX_AVAIL;
++	return true;
++}
++
+ static void poll_rx(void)
+ {
+ 	static uint8_t frame[MAX_FRAME];
+@@ -271,21 +308,52 @@ static void poll_rx(void)
+ 		if (len <= 0) break;
+ 		if (len < 14) continue;
+ 		if (!memcmp(frame + 6, mac, 6)) continue;  // our own transmit, echoed by AF_PACKET
++		ring_put(frame, len);                        // ring full: the guest is behind, the frame goes
++	}
++}
+ 
+-		uint16_t head = rd16(OFF_RX_HEAD) & (RX_SLOTS - 1);
+-		uint16_t tail = rd16(OFF_RX_TAIL) & (RX_SLOTS - 1);
+-		uint16_t next = (tail + 1) & (RX_SLOTS - 1);
+-		if (next == head) continue;                  // ring full: the guest is behind
+-
+-		if (len > RX_SLOT_BYTES) len = RX_SLOT_BYTES;
+-		memcpy((void *)(win + OFF_RX_DATA + tail * RX_SLOT_BYTES), frame, len);
+-		wr16(OFF_RX_LEN + tail * 2, (uint16_t)len);
+-		__sync_synchronize();
+-		wr16(OFF_RX_TAIL, next);                     // only now is the slot the core's
+-		win[OFF_FLAGS] = win[OFF_FLAGS] | FLAG_RX_AVAIL;
++// the room's frames for the card, while the ring has room (the queue holds the rest)
++static void poll_room_rx(void)
++{
++	std::lock_guard<std::mutex> g(room_mtx);
++	while (!room_in.empty())
++	{
++		const std::vector<uint8_t> &f = room_in.front();
++		if (!ring_put(f.data(), (int)f.size())) break;
++		room_in.pop_front();
+ 	}
+ }
+ 
++void ne2000_room(bool on)
++{
++	if (on == room_on) return;
++	room_on = on;
++	std::lock_guard<std::mutex> g(room_mtx);
++	room_out.clear();
++	room_in.clear();
++	printf("[ne2000] %s\n", on ? "frames go to the netplay room" : "frames go to the MiSTer's network");
++}
++
++bool ne2000_room_take(uint8_t *buf, size_t cap, size_t *len)
++{
++	std::lock_guard<std::mutex> g(room_mtx);
++	if (room_out.empty()) return false;
++	const std::vector<uint8_t> &f = room_out.front();
++	size_t n = f.size() < cap ? f.size() : cap;
++	memcpy(buf, f.data(), n);
++	*len = n;
++	room_out.pop_front();
++	return true;
++}
++
++void ne2000_room_give(const uint8_t *frame, size_t len)
++{
++	if (len < 14 || len > MAX_FRAME) return;
++	std::lock_guard<std::mutex> g(room_mtx);
++	if (room_in.size() >= ROOM_QUEUE) room_in.pop_front();
++	room_in.push_back(std::vector<uint8_t>(frame, frame + len));
++}
++
+ void ne2000_poll(void)
+ {
+ 	if (!running || !win) return;
+@@ -296,12 +364,13 @@ void ne2000_poll(void)
+ 	if (mode != cur_mode)
+ 	{
+ 		cur_mode = mode;
+-		if (mode == MODE_OFF) close_link();
++		if (mode == MODE_OFF || mode == MODE_ROOM) close_link();
+ 		else open_link(mode);
+ 	}
+ 
+ 	poll_tx();
+ 	if (link_open) poll_rx();
++	if (cur_mode == MODE_ROOM) poll_room_rx();
+ 
+ 	uint16_t st = rd16(OFF_STATUS);
+ 	if ((st & ST_COMM_OK) != (last_status & ST_COMM_OK))
+diff --git a/support/netplay/ne2000.h b/support/netplay/ne2000.h
+index 676beec..81cdc90 100644
+--- a/support/netplay/ne2000.h
++++ b/support/netplay/ne2000.h
+@@ -1,6 +1,9 @@
+ #ifndef NP_NE2000_H
+ #define NP_NE2000_H
+ 
++#include <stdint.h>
++#include <stddef.h>
++
+ // The wire behind the ao486 core's NE2000 (rtl/soc/ne2000, from upstream
+ // ao486 PR #238). The card exchanges raw Ethernet frames with Main through a
+ // 64 KB window in DDR3 at ARM physical 0x1FF00000, the same window the A2065
+@@ -14,4 +17,11 @@ void ne2000_start(void);   // the core was loaded: publish the window
+ void ne2000_stop(void);    // another core: close the link, withdraw the window
+ void ne2000_poll(void);    // every pass of Main's loop
+ 
++// Netplay room (SPEC 15.4): the card's frames go to the netplay thread and the
++// other MiSTers instead of the MiSTer's own network. The window stays the main
++// thread's; frames cross in two bounded queues.
++void ne2000_room(bool on);                                  // main thread
++bool ne2000_room_take(uint8_t *buf, size_t cap, size_t *len);   // netplay thread: a frame the card sent
++void ne2000_room_give(const uint8_t *frame, size_t len);    // netplay thread: a frame for the card
++
+ #endif
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index c462748..ae87b3b 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -50,6 +50,7 @@
+ 
+ #include "netplay.h"
+ #include "ne2000.h"
++#include "eth_link.h"
+ #include "netplay_proto.h"
+ #include "netplay_session.h"
+ 
+@@ -723,6 +724,7 @@ static bool              own_reload = false; // main thread only
+ // the FPGA was loaded, armed before the ROM set loads.
+ static std::atomic<bool> neo_prearm { false };   // main -> thread: keep CTRL enabled (session 0) with a heartbeat
+ static std::atomic<bool> neo_armed { false };    // thread -> main: the core holds the machine (ARMED)
++static Mode              ao486_mode = M_OFF;     // main thread: the room's mode as last told to the thread
+ static bool              neo_ran = false;        // main thread: a ROM set was loaded since this core was (the machine has run)
+ static std::string       neo_pending;            // main thread: a ROM set to load once the core is up again
+ 
+@@ -1318,6 +1320,153 @@ static void *gba_wireless_thread(void *)
+ 	return nullptr;
+ }
+ 
++// ---------------------------------------------------------------------------
++// ao486's network card in a room (SPEC.md 15.4): two MiSTers pair as the other
++// cores do (OSD Netplay Host or Join, peer= or the server's AO486 room, hole
++// punching, relay) and the card's Ethernet frames cross the pair. No lockstep
++// and no game: the room is a LAN. The window is the main thread's (ne2000.cpp);
++// the frames reach this thread through ne2000_room_take/give. A change of the
++// mode (the OSD or Network Off/On) comes as a new rom_seq.
++
++static void *lan_thread(void *)
++{
++	Udp *udp = nullptr;
++	EthLink *link = nullptr;
++	uint32_t seen = 0, restarts = 0;
++	Mode mode = M_OFF;
++	bool linked = false, lost_told = false, repair = false;
++	const char *told = nullptr;
++	uint64_t last_stats = 0;
++
++	while (!quit)
++	{
++		uint64_t now = now_ms();
++		uint32_t seq;
++		{
++			std::lock_guard<std::mutex> g(info_mtx);
++			seq = rom_seq;
++			if (seq != seen) mode = rom_mode;
++		}
++		// a new mode from the OSD, or the link lost: pair from the start. After
++		// 10 s of silence both sides do it (a new socket, the host a new room, the
++		// join asks for the open room again), so they find each other after one
++		// of them toggled its option or loaded the core again.
++		if (seq != seen || repair)
++		{
++			seen = seq;
++			repair = false;
++			delete link; link = nullptr;
++			if (udp) udp->leave();
++			delete udp; udp = nullptr;
++			lobby_host("");
++			linked = false;
++			told = nullptr;
++			restarts = 0;
++
++			bool ok = mode == M_HOST || mode == M_JOIN;
++			if (ok && mode == M_JOIN && !cfg.peer[0] && !cfg.server[0])
++			{
++				post_message("Netplay: Join needs peer= or server= in netplay.ini");
++				ok = false;
++			}
++			else if (ok && cfg.server[0])
++			{
++				ServerReg r {};
++				r.host = mode == M_HOST;
++				if (r.host) random_id(r.room, sizeof(r.room));
++				else snprintf(r.room, sizeof(r.room), "*");    // the open AO486 room (no game to match)
++				snprintf(r.core, sizeof(r.core), "%s", srv_core.c_str());
++				snprintf(r.game, sizeof(r.game), "LAN");
++				lobby_host(r.host ? r.room : "");
++				udp = new Udp();
++				if (!udp->open_server(cfg, r))
++				{
++					post_message("Netplay: cannot reach server (check server=)");
++					ok = false;
++				}
++			}
++			else if (ok)
++			{
++				udp = new Udp();
++				if (!udp->open_socket(cfg.port, mode == M_JOIN ? cfg.peer : nullptr))
++				{
++					post_message(mode == M_JOIN ? "Netplay: cannot reach peer (check peer=)" : "Netplay: cannot open port");
++					ok = false;
++				}
++			}
++			if (ok)
++			{
++				link = new EthLink(udp, random32());
++				if (!lost_told) post_message(mode == M_HOST ? "Netplay: waiting for player 2 (network card)" : "Netplay: connecting (network card)");
++			}
++			else
++			{
++				delete udp;
++				udp = nullptr;
++			}
++			if (!ok) lost_told = false;
++		}
++
++		if (udp)
++		{
++			udp->tick(now);
++			if (const char *n = udp->take_notice()) post_message(n);
++		}
++		if (link)
++		{
++			link->tick(now, [](const uint8_t *f, size_t n) { ne2000_room_give(f, n); });
++			uint8_t frame[EthLink::MAX_FRAME];
++			size_t len;
++			for (int i = 0; i < 64 && ne2000_room_take(frame, sizeof(frame), &len); i++) link->send(frame, len);
++
++			if (link->connected() && !linked)
++			{
++				linked = true;
++				lost_told = false;
++				char text[96];
++				if (udp->via_server())
++					snprintf(text, sizeof(text), "Netplay: network linked with %s (%s)", udp->peer_name(),
++					         udp->direct() ? "direct" : "through the server");
++				else snprintf(text, sizeof(text), "Netplay: network linked");
++				post_message(text);
++			}
++			if (linked && !link->connected()) linked = false;   // the other side started over: "linked" again once it is back
++			if (link->restarts() != restarts)
++			{
++				restarts = link->restarts();
++				post_message("Netplay: the other player started over");
++			}
++			if (link->refusal() && link->refusal() != told)
++			{
++				told = link->refusal();
++				post_message(told);
++			}
++			if (link->lost(now))
++			{
++				if (!lost_told) post_message("Netplay: connection lost");
++				lost_told = true;
++				repair = true;
++			}
++			if (now - last_stats >= 10000)
++			{
++				last_stats = now;
++				char text[160];
++				snprintf(text, sizeof(text), "network card: frames sent %u received %u dropped %u foreign %u %s%s",
++				         link->sent(), link->received(), link->dropped(), link->foreign(),
++				         udp->via_server() ? (udp->direct() ? "direct" : "via server") : "peer=",
++				         link->connected() ? "" : " (not linked)");
++				log_line(text);
++			}
++		}
++		usleep(500);
++	}
++
++	delete link;
++	if (udp) udp->leave();
++	delete udp;
++	return nullptr;
++}
++
+ // ---------------------------------------------------------------------------
+ // Main-thread side
+ 
+@@ -2128,11 +2277,18 @@ static bool neogeo_has_netplay()
+ 	return confstr_any([](const char *p) { return strstr(p, ",Netplay,netplay.ini,") != nullptr; });
+ }
+ 
++// ao486 with the network card and its OSD option "Netplay" (SPEC.md 15.4)
++static bool ao486_has_netplay()
++{
++	return confstr_any([](const char *p) { return strstr(p, "O[70:69],Netplay,netplay.ini,") != nullptr; });
++}
++
+ static int netplay_system()
+ {
+ 	const char *n = user_io_get_core_name();
+ 	if (!strcasecmp(n, "GBA") && gba_has_wireless()) return SYS_GBA;
+ 	if (!strcasecmp(n, "NEOGEO") && neogeo_has_netplay()) return SYS_NEOGEO;
++	if (!strcasecmp(n, "AO486") && ao486_has_netplay()) return SYS_AO486;
+ 	if (!strcasecmp(n, "NES")) return SYS_NES;
+ 	if (!strcasecmp(n, "SNES")) return SYS_SNES;
+ 	if (!strcasecmp(n, "GAMEBOY2P")) return SYS_GB2P;
+@@ -2150,6 +2306,7 @@ static const char *osd_netplay_bits()
+ 	case SYS_ARCADE: return "[127:126]";
+ 	case SYS_GBA:    return "[46:45]";
+ 	case SYS_NEOGEO: return "[46:45]";
++	case SYS_AO486:  return "[70:69]";
+ 	default:         return "[89:88]";
+ 	}
+ }
+@@ -2748,7 +2905,8 @@ static void start_thread()
+ 	quit = false;
+ 	reload_req = false;
+ 	reload_done = false;
+-	if (pthread_create(&thread, nullptr, core_sys == SYS_GBA ? gba_wireless_thread : netplay_thread, nullptr) == 0) thread_running = true;
++	void *(*fn)(void *) = core_sys == SYS_GBA ? gba_wireless_thread : core_sys == SYS_AO486 ? lan_thread : netplay_thread;
++	if (pthread_create(&thread, nullptr, fn, nullptr) == 0) thread_running = true;
+ 	else printf("netplay: cannot start thread\n");
+ }
+ 
+@@ -2771,13 +2929,26 @@ void netplay_start(void)
+ 	core_armed = true;
+ 	// arcade: no games from the server, no room folder (the games are MRA files, SPEC.md 12.5);
+ 	// Neo Geo: none either (ROM sets are folders and zips, SPEC.md 14)
+-	if (cfg.server[0] && core_sys != SYS_ARCADE && core_sys != SYS_NEOGEO) server_games_start();
++	if (cfg.server[0] && core_sys != SYS_ARCADE && core_sys != SYS_NEOGEO && core_sys != SYS_AO486) server_games_start();
+ 	// Neo Geo: the core was loaded again for a session; its ROM set follows (netplay_poll)
+ 	neo_ran = false;
+ 	neo_prearm = false;
+ 	if (core_sys == SYS_NEOGEO) neo_pending = neo_pending_take();
+ 	// GBA: the adapter answers the game from the start, paired or not (SPEC.md 13.4)
+ 	if (core_sys == SYS_GBA && !thread_running) start_thread();
++	// ao486: the room follows the OSD from the start (netplay_poll), no game load;
++	// the thread starts from Off, whatever an earlier core left in rom_mode
++	ao486_mode = M_OFF;
++	if (core_sys == SYS_AO486)
++	{
++		{
++			std::lock_guard<std::mutex> g(info_mtx);
++			rom_mode = M_OFF;
++			rom_room.clear();
++			rom_seq++;
++		}
++		if (!thread_running) start_thread();
++	}
+ }
+ 
+ void netplay_stop(void)
+@@ -2816,6 +2987,34 @@ void netplay_poll(void)
+ 	}
+ 	if (!thread_running && !core_armed) return;   // lobby messages come before any session
+ 
++	// ao486: the network card is in a room while Netplay is Host or Join and the
++	// card is on (SPEC.md 15.4); a change goes to the thread as a new rom_seq
++	if (core_armed && core_sys == SYS_AO486)
++	{
++		// Stepping from Off to Join passes Host: the choice counts once the OSD
++		// is closed, or after it has stood for 1.5 s with the OSD open (as arcade)
++		static int pend = -1;
++		static uint64_t pend_t = 0;
++		Mode m = current_mode();
++		if ((m != M_HOST && m != M_JOIN) || !user_io_status_get("[66]")) m = M_OFF;
++		if (m == ao486_mode) pend = -1;
++		else
++		{
++			uint64_t t = now_ms();
++			if ((int)m != pend) { pend = (int)m; pend_t = t; }
++			if (!user_io_osd_is_visible() || t - pend_t >= 1500)
++			{
++				pend = -1;
++				ao486_mode = m;
++				ne2000_room(m != M_OFF);
++				std::lock_guard<std::mutex> g(info_mtx);
++				rom_mode = m;
++				rom_room.clear();
++				rom_seq++;
++			}
++		}
++	}
++
+ 	// Neo Geo: the ROM set the core was loaded again for (SPEC.md 14.2)
+ 	if (core_armed && core_sys == SYS_NEOGEO && !neo_pending.empty())
+ 	{
+diff --git a/support/netplay/netplay_proto.h b/support/netplay/netplay_proto.h
+index 6485549..e6f6946 100644
+--- a/support/netplay/netplay_proto.h
++++ b/support/netplay/netplay_proto.h
+@@ -19,7 +19,7 @@ namespace netplay {
+ // own system byte (SPEC.md 14).
+ 
+ enum System : uint8_t { SYS_NES = 0, SYS_SNES = 1, SYS_GB2P = 2, SYS_ARCADE = 3, SYS_GBA = 4,   // SYS_GBA: wireless adapter, not lockstep (SPEC.md 13)
+-                        SYS_NEOGEO = 5 };
++                        SYS_NEOGEO = 5, SYS_AO486 = 6 };   // SYS_AO486: the network card in a room, not lockstep (SPEC.md 15.4)
+ 
+ // ---------------------------------------------------------------------------
+ // DDR3 mailbox, shared with rtl/netplay.sv of each core
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index b8d9cad..e688910 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -8,9 +8,10 @@ ENGINE   := ../netplay_proto.cpp ../netplay_session.cpp
+ HDRS     := ../netplay_proto.h ../netplay_session.h fake_fpga.h
+ 
+ .PHONY: test clean
+-test: test_netplay test_rfu test_rfu_link test_ne2000 udp_harness
++test: test_netplay test_rfu test_rfu_link test_ne2000 test_eth_link udp_harness
+ 	./test_netplay
+ 	./test_ne2000
++	./test_eth_link
+ 	./test_rfu
+ 	./test_rfu_link
+ 	./run_udp_test.sh
+@@ -29,6 +30,9 @@ test: test_netplay test_rfu test_rfu_link test_ne2000 udp_harness
+ 	NP_SYSTEM=neogeo NP_NEO_SPLIT_JOIN=1 ./run_udp_test.sh
+ 	NP_SYSTEM=neogeo NP_ROMSALT=5 NP_EXPECT="Different ROM set" ./run_udp_test.sh
+ 	NP_SYSTEM=neogeo NP_BIOSSALT=7 NP_EXPECT="Different BIOS files" ./run_udp_test.sh
++	NP_SYSTEM=ao486 ./run_udp_test.sh
++	NP_SYSTEM=ao486 NP_OSD=1 ./run_udp_test.sh
++	NP_SYSTEM=ao486 NP_OSD=1 NP_AO486_REPAIR=join ./run_udp_test.sh
+ 	@srv=../../../../server/build/netplay-server-linux-amd64; \
+ 	if [ -x $$srv ]; then srv=$$(cd $$(dirname $$srv) && pwd)/$$(basename $$srv); \
+ 	  NP_SERVER_BIN=$$srv ./run_udp_test.sh && \
+@@ -53,9 +57,16 @@ test: test_netplay test_rfu test_rfu_link test_ne2000 udp_harness
+ 	  NP_SYSTEM=gba NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_GBA_RELOAD=host ./run_udp_test.sh && \
+ 	  NP_SYSTEM=gba NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_GBA_RELOAD=join ./run_udp_test.sh && \
+ 	  NP_SYSTEM=neogeo NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
+-	  NP_SYSTEM=neogeo NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_OSD=1 NP_NEO_RAN=1 ./run_udp_test.sh; \
++	  NP_SYSTEM=neogeo NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_OSD=1 NP_NEO_RAN=1 ./run_udp_test.sh && \
++	  NP_SYSTEM=ao486 NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 ./run_udp_test.sh && \
++	  NP_SYSTEM=ao486 NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_DIRECT=no ./run_udp_test.sh && \
++	  NP_SYSTEM=ao486 NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_OSD=1 NP_AO486_REPAIR=host ./run_udp_test.sh && \
++	  NP_SYSTEM=ao486 NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_OSD=1 NP_AO486_REPAIR=join ./run_udp_test.sh; \
+ 	else echo "SKIP udp (server): build it with server/build.sh"; fi
+ 
++test_eth_link: test_eth_link.cpp ../eth_link.cpp ../eth_link.h ../netplay_session.h
++	$(CXX) $(CXXFLAGS) -o $@ test_eth_link.cpp ../eth_link.cpp
++
+ test_ne2000: test_ne2000.cpp ../ne2000.cpp ../ne2000.h
+ 	$(CXX) $(CXXFLAGS) -o $@ test_ne2000.cpp
+ 
+@@ -73,10 +84,10 @@ test_rfu_link: test_rfu_link.cpp ../rfu_link.cpp ../rfu_link.h ../netplay_sessio
+ md5.o: $(ROOT)/lib/md5/md5.c
+ 	$(CC) -O1 -g -fsanitize=address,undefined -c -o $@ $<
+ 
+-RFU := ../rfu.cpp ../rfu_mailbox.cpp ../rfu_link.cpp
++RFU := ../rfu.cpp ../rfu_mailbox.cpp ../rfu_link.cpp ../eth_link.cpp
+ udp_harness: $(ENGINE) $(RFU) ../netplay.cpp ../netplay.h udp_harness.cpp $(HDRS) md5.o
+ 	$(CXX) $(CXXFLAGS) -Wno-psabi -D_FILE_OFFSET_BITS=64 -I$(ROOT) -I$(ROOT)/lib/md5 \
+ 	  -o $@ $(ENGINE) $(RFU) ../netplay.cpp udp_harness.cpp md5.o -lpthread
+ 
+ clean:
+-	rm -f test_netplay test_rfu test_rfu_link test_ne2000 udp_harness md5.o
++	rm -f test_netplay test_rfu test_rfu_link test_ne2000 test_eth_link udp_harness md5.o
+diff --git a/support/netplay/test/run_udp_test.sh b/support/netplay/test/run_udp_test.sh
+index d39e644..d70b8b8 100755
+--- a/support/netplay/test/run_udp_test.sh
++++ b/support/netplay/test/run_udp_test.sh
+@@ -13,6 +13,7 @@ case "${NP_SYSTEM:-}" in
+ 	gb2p) sysdir=GB; ext=gb ;;
+ 	arcade) sysdir=; ext=nes ;;   # nothing from the server: the games are MRA files
+ 	gba) sysdir=GBA; ext=gba ;;   # wireless adapter (SPEC.md 13): each side its own game
++	ao486) sysdir=; ext=nes ;;    # network card (SPEC.md 15.4): a LAN room, no game
+ 	*)    sysdir=; ext=nes ;;
+ esac
+ 
+@@ -49,7 +50,7 @@ h=$(grep RESULT "$tmp/host.log"); j=$(grep RESULT "$tmp/join.log")
+ echo "host: $h"
+ echo "join: $j"
+ hd=${h##*digest=}; jd=${j##*digest=}
+-label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_TWO:+ (two games)}${NP_NEO_RAN:+ (host played first: core reload)}${NP_NEO_SPLIT_JOIN:+ (the join has the program in two files)}${NP_OSD:+ (OSD mode${NP_OSD_STEPS:+, stepping})}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_INCORE:+, Join room in the core}${NP_DECOY:+, two rooms}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}${NP_GBA_RELOAD:+ ($NP_GBA_RELOAD loads the game again)}"
++label="udp${NP_SYSTEM:+ $NP_SYSTEM}${NP_TWO:+ (two games)}${NP_NEO_RAN:+ (host played first: core reload)}${NP_NEO_SPLIT_JOIN:+ (the join has the program in two files)}${NP_OSD:+ (OSD mode${NP_OSD_STEPS:+, stepping})}${NP_SERVER_BIN:+ (server${NP_MENU:+, room from the menu}${NP_INCORE:+, Join room in the core}${NP_DECOY:+, two rooms}${NP_AUTOJOIN:+, Join same game}${NP_DIRECT:+, direct=$NP_DIRECT}${NP_SAV:+, .sav})}${NP_GBA_RELOAD:+ ($NP_GBA_RELOAD loads the game again)}${NP_AO486_REPAIR:+ ($NP_AO486_REPAIR turns Netplay off and on)}"
+ ok=0
+ [ $hr -eq 0 ] && [ $jr -eq 0 ] && [ -n "$hd" ] && [ "$hd" = "$jd" ] && ok=1
+ # GBA wireless adapter: both linked (and through the server: with the other's name)
+@@ -62,8 +63,26 @@ if [ $ok -eq 1 ] && [ "${NP_SYSTEM:-}" = gba ]; then
+ 		grep -q "linked with Par..Host" "$tmp/join.log" || { echo "join: name of host missing"; ok=0; }
+ 	fi
+ fi
++# ao486's network card: both linked; through the server with the other's name and the right path
++if [ $ok -eq 1 ] && [ "${NP_SYSTEM:-}" = ao486 ]; then
++	for side in host join; do
++		grep -q "network linked" "$tmp/$side.log" || { echo "$side: not linked"; ok=0; }
++		grep "\[harness\] ao486" "$tmp/$side.log"
++		if [ -n "${NP_SERVER_BIN:-}" ]; then
++			if [ "${NP_DIRECT:-yes}" = no ]; then
++				grep -q "network linked with .*through the server" "$tmp/$side.log" || { echo "$side: not through the server"; ok=0; }
++			else
++				grep -q "direct connection to" "$tmp/$side.log" || { echo "$side: no direct path"; ok=0; }
++			fi
++		fi
++	done
++	if [ -n "${NP_SERVER_BIN:-}" ]; then
++		grep -q "linked with Joinor" "$tmp/host.log" || { echo "host: name of join missing"; ok=0; }
++		grep -q "linked with Par..Host" "$tmp/join.log" || { echo "join: name of host missing"; ok=0; }
++	fi
++fi
+ # through a server: the path the session took, and the names
+-if [ $ok -eq 1 ] && [ -n "${NP_SERVER_BIN:-}" ] && [ "${NP_SYSTEM:-}" != gba ]; then
++if [ $ok -eq 1 ] && [ -n "${NP_SERVER_BIN:-}" ] && [ "${NP_SYSTEM:-}" != gba ] && [ "${NP_SYSTEM:-}" != ao486 ]; then
+ 	for side in host join; do
+ 		if [ "${NP_DIRECT:-yes}" = no ]; then
+ 			grep -q "playing with .*through the server" "$tmp/$side.log" || { echo "$side: not through the server"; ok=0; }
+diff --git a/support/netplay/test/test_eth_link.cpp b/support/netplay/test/test_eth_link.cpp
+new file mode 100644
+index 0000000..19aebbf
+--- /dev/null
++++ b/support/netplay/test/test_eth_link.cpp
+@@ -0,0 +1,210 @@
++// T3e, the room: eth_link.cpp (ao486's network card frames between two
++// MiSTers, SPEC.md 15.4) over a bad network. Not reliable by design: what
++// arrives must be whole, from the paired side and of this pairing; the link
++// comes up, follows a restart, refuses a lockstep player and another version,
++// and drops what it cannot send.
++
++#include "../eth_link.h"
++#include <stdio.h>
++#include <string.h>
++#include <vector>
++#include <deque>
++
++static int fails = 0, checks = 0;
++#define CHECK(c, ...) do { checks++; if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
++
++static uint32_t rng = 7;
++static uint32_t rnd() { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; return rng; }
++
++struct Net;
++struct End : netplay::Transport
++{
++	Net *net; int me;
++	void send(const uint8_t *b, size_t n) override;
++	int recv(uint8_t *b, size_t cap) override;
++	void lock_peer() override { locked = true; }
++	bool locked = false;
++};
++struct Pkt { uint64_t at; std::vector<uint8_t> d; };
++struct Net
++{
++	End e[2];
++	std::vector<Pkt> q[2];
++	uint64_t now = 0;
++	int loss = 0, dup = 0, maxdelay = 1;
++	bool cut = false;                 // nothing gets through
++	Net() { e[0].net = e[1].net = this; e[0].me = 0; e[1].me = 1; }
++	void inject(int to, const std::vector<uint8_t> &d) { q[to].push_back({ now, d }); }
++};
++void End::send(const uint8_t *b, size_t n)
++{
++	if (net->cut) return;
++	int to = 1 - me;
++	if ((int)(rnd() % 100) < net->loss) return;
++	int copies = (int)(rnd() % 100) < net->dup ? 2 : 1;
++	for (int i = 0; i < copies; i++)
++		net->q[to].push_back({ net->now + 1 + rnd() % net->maxdelay, std::vector<uint8_t>(b, b + n) });
++}
++int End::recv(uint8_t *b, size_t cap)
++{
++	auto &q = net->q[me];
++	for (size_t i = 0; i < q.size(); i++)
++		if (q[i].at <= net->now)
++		{
++			size_t n = q[i].d.size() < cap ? q[i].d.size() : cap;
++			if (n) memcpy(b, q[i].d.data(), n);
++			q.erase(q.begin() + i);
++			return (int)n;
++		}
++	return -1;
++}
++
++// a frame whose bytes all follow from (tag, len): any damage shows
++static std::vector<uint8_t> frame(uint16_t tag, size_t len)
++{
++	std::vector<uint8_t> f(len);
++	f[0] = (uint8_t)(tag >> 8);
++	f[1] = (uint8_t)tag;
++	for (size_t i = 2; i < len; i++) f[i] = (uint8_t)(tag * 31 + i * 7);
++	return f;
++}
++static bool intact(const uint8_t *f, size_t len, uint16_t *tag)
++{
++	uint16_t t = (uint16_t)(f[0] << 8 | f[1]);
++	for (size_t i = 2; i < len; i++) if (f[i] != (uint8_t)(t * 31 + i * 7)) return false;
++	*tag = t;
++	return true;
++}
++
++struct Side
++{
++	explicit Side(EthLink *l) : link(l) {}
++	EthLink *link;
++	std::vector<std::vector<uint8_t>> got;
++	void tick(uint64_t now) { link->tick(now, [this](const uint8_t *f, size_t n) { got.push_back(std::vector<uint8_t>(f, f + n)); }); }
++};
++
++static void run(Net &net, Side &a, Side &b, uint64_t ms)
++{
++	for (uint64_t t = 0; t < ms; t++) { net.now++; a.tick(net.now); b.tick(net.now); }
++}
++
++int main()
++{
++	// ---- a clean network: up, frames both ways, whole and once
++	{
++		Net net;
++		Side a(new EthLink(&net.e[0], 0x1111)), b(new EthLink(&net.e[1], 0x2222));
++		std::vector<uint8_t> early = frame(1, 60);
++		a.link->send(early.data(), early.size());
++		CHECK(a.link->dropped() == 1, "a frame before the link is up is dropped (no cable yet)");
++		run(net, a, b, 50);
++		CHECK(a.link->connected() && b.link->connected(), "not connected: %d %d", a.link->connected(), b.link->connected());
++		CHECK(net.e[0].locked && net.e[1].locked, "the transport was not locked to the peer");
++		for (uint16_t i = 0; i < 20; i++)
++		{
++			std::vector<uint8_t> f = frame(i, 60 + i * 70);
++			a.link->send(f.data(), f.size());
++			b.link->send(f.data(), f.size());
++		}
++		run(net, a, b, 20);
++		CHECK(a.got.size() == 20 && b.got.size() == 20, "frames: %zu %zu", a.got.size(), b.got.size());
++		bool ok = true;
++		for (size_t i = 0; i < b.got.size(); i++) { uint16_t t; ok = ok && intact(b.got[i].data(), b.got[i].size(), &t) && b.got[i].size() == 60 + t * 70u; }
++		CHECK(ok, "a frame arrived damaged");
++		std::vector<uint8_t> big = frame(9, 1514);
++		a.link->send(big.data(), big.size());
++		run(net, a, b, 5);
++		CHECK(b.got.size() == 21 && b.got.back() == big, "a full-size frame (1514) did not arrive whole");
++		std::vector<uint8_t> runt(10, 1), huge(1600, 2);
++		uint32_t d0 = a.link->dropped();
++		a.link->send(runt.data(), runt.size());
++		a.link->send(huge.data(), huge.size());
++		CHECK(a.link->dropped() == d0 + 2, "a runt or an oversize frame was sent");
++
++		// silence: lost after 10 s; frames again: not lost
++		net.cut = true;
++		run(net, a, b, 10500);
++		CHECK(a.link->lost(net.now) && b.link->lost(net.now), "not lost after 10 s of silence");
++		net.cut = false;
++		run(net, a, b, 1100);
++		CHECK(!a.link->lost(net.now) && !b.link->lost(net.now), "still lost after the network came back");
++		delete a.link; delete b.link;
++	}
++
++	// ---- a bad network: loss, duplicates, reordering; what arrives is whole
++	{
++		Net net; net.loss = 20; net.dup = 10; net.maxdelay = 60;
++		Side a(new EthLink(&net.e[0], 0xA)), b(new EthLink(&net.e[1], 0xB));
++		run(net, a, b, 3000);
++		CHECK(a.link->connected() && b.link->connected(), "not connected over a lossy network");
++		for (uint16_t i = 0; i < 500; i++)
++		{
++			std::vector<uint8_t> f = frame(i, 64 + (i % 20) * 50);
++			a.link->send(f.data(), f.size());
++			if (i % 5 == 0) run(net, a, b, 1);
++		}
++		run(net, a, b, 200);
++		size_t whole = 0;
++		for (auto &f : b.got) { uint16_t t; if (intact(f.data(), f.size(), &t) && f.size() == 64 + (t % 20) * 50u) whole++; }
++		CHECK(whole == b.got.size(), "%zu of %zu frames damaged", b.got.size() - whole, b.got.size());
++		CHECK(b.got.size() > 350 && b.got.size() < 650, "with 20 %% loss and 10 %% duplicates: %zu of 500 arrived", b.got.size());
++		delete a.link; delete b.link;
++	}
++
++	// ---- the other side loads its core again: a new id, the link starts over
++	{
++		Net net;
++		Side a(new EthLink(&net.e[0], 0x1)), b(new EthLink(&net.e[1], 0x2));
++		run(net, a, b, 50);
++		delete b.link;
++		b.link = new EthLink(&net.e[1], 0x3);
++		run(net, a, b, 50);
++		CHECK(a.link->restarts() == 1 && a.link->connected() && b.link->connected(), "restart: %u %d %d", a.link->restarts(), a.link->connected(), b.link->connected());
++		// a frame of the old pairing (from 0x2) is not taken
++		std::vector<uint8_t> old = { 'N', 'P', 'E', '1', 1, 1, 0, 0, 0, 2, 0, 0, 0, 1 };
++		std::vector<uint8_t> f = frame(5, 60);
++		old.insert(old.end(), f.begin(), f.end());
++		size_t before = a.got.size();
++		net.inject(0, old);
++		run(net, a, b, 2);
++		CHECK(a.got.size() == before && a.link->foreign() >= 1, "a frame of the old pairing was delivered");
++		// the other side starts over and then goes quiet: lost all the same
++		delete b.link;
++		b.link = new EthLink(&net.e[1], 0x4);
++		run(net, a, b, 3);                                 // a hears the new id, not yet connected
++		net.cut = true;
++		run(net, a, b, 10500);
++		CHECK(a.link->lost(net.now), "not lost when the other side went quiet after starting over");
++		net.cut = false;
++		// a datagram longer than any packet is not taken as a (cut) frame
++		std::vector<uint8_t> big = { 'N', 'P', 'E', '1', 1, 1, 0, 0, 0, 4, 0, 0, 0, 1 };
++		big.resize(1700, 0x55);
++		uint32_t fb = a.link->foreign();
++		net.inject(0, big);
++		run(net, a, b, 2);
++		CHECK(a.link->foreign() > fb, "an oversize datagram was not refused");
++		delete a.link; delete b.link;
++	}
++
++	// ---- a lockstep player, another version, junk: refused, never connected
++	{
++		Net net;
++		Side a(new EthLink(&net.e[0], 0x1));
++		net.inject(0, std::vector<uint8_t> { 'N', 'P', '0', '1', 1, 2, 3, 4 });
++		net.now++; a.tick(net.now);
++		CHECK(a.link->refusal() && strstr(a.link->refusal(), "not using the network card") && !a.link->connected(), "lockstep player: %s", a.link->refusal() ? a.link->refusal() : "(none)");
++		net.inject(0, std::vector<uint8_t> { 'N', 'P', 'E', '1', 0, 9, 0, 0, 0, 5, 0, 0, 0, 1 });
++		net.now++; a.tick(net.now);
++		CHECK(a.link->refusal() && strstr(a.link->refusal(), "version") && !a.link->connected(), "another version: %s", a.link->refusal() ? a.link->refusal() : "(none)");
++		net.inject(0, std::vector<uint8_t> { 'N', 'P', 'E', '1', 7, 1, 0, 0, 0, 5, 0, 0, 0, 1 });   // unknown type
++		net.inject(0, std::vector<uint8_t> { 'N', 'P', 'E', '1', 1, 1, 0, 0, 0, 0, 0, 0, 0, 1 });   // from 0
++		uint32_t f0 = a.link->foreign();
++		net.now++; a.tick(net.now);
++		CHECK(a.link->foreign() == f0 + 2 && !a.link->connected(), "junk taken");
++		delete a.link;
++	}
++
++	printf("%s: %d checks, %d failed\n", fails ? "FAIL test_eth_link" : "PASS test_eth_link", checks, fails);
++	return fails ? 1 : 0;
++}
+diff --git a/support/netplay/test/test_ne2000.cpp b/support/netplay/test/test_ne2000.cpp
+index 0081bdc..c56e9c6 100644
+--- a/support/netplay/test/test_ne2000.cpp
++++ b/support/netplay/test/test_ne2000.cpp
+@@ -86,8 +86,8 @@ int main()
+ 	CHECK(core32(OFF_SIGNATURE) == 0xCAFEBABE, "signature %08X", core32(OFF_SIGNATURE));
+ 	CHECK(w16(OFF_RX_HEAD) == 0 && w16(OFF_RX_TAIL) == 0 && w16(OFF_TX_REQ_SEQ) == 0, "window not cleared");
+ 	CHECK(window[0x8000] == 0 && window[0xFFFF] == 0, "window not cleared to the end");
+-	CHECK(window[OFF_MAC] == 0x52 && window[OFF_MAC + 1] == 0x54 && window[OFF_MAC + 2] == 0x05 && window[OFF_MAC + 3] == 0x04,
+-	      "MAC prefix %02X:%02X:%02X:%02X", window[OFF_MAC], window[OFF_MAC + 1], window[OFF_MAC + 2], window[OFF_MAC + 3]);
++	CHECK(window[OFF_MAC] == 0x52 && window[OFF_MAC + 1] == 0x54 && window[OFF_MAC + 2] == 0x05,
++	      "MAC prefix %02X:%02X:%02X", window[OFF_MAC], window[OFF_MAC + 1], window[OFF_MAC + 2]);
+ 	CHECK(!(window[OFF_MAC] & 1) && (window[OFF_MAC] & 2), "the core adopts only a unicast, locally administered MAC");
+ 	uint8_t card_mac[6];
+ 	memcpy(card_mac, window + OFF_MAC, 6);
+@@ -201,6 +201,51 @@ int main()
+ 	ne2000_poll();
+ 	CHECK(closes == closes_before + 1, "Network Off did not close the link");
+ 
++	// ---- the netplay room: frames go to the netplay thread's queue, not the wire
++	st_enable = 1; st_mode = 0;
++	ne2000_poll();                                     // eth0 again
++	int closes_room = closes;
++	size_t sent_room = sent.size();
++	ne2000_room(true);
++	ne2000_poll();
++	CHECK(closes == closes_room + 1, "the room did not close the MiSTer's link");
++	uint16_t q = last_tx_seq;
++	std::vector<uint8_t> r1 = frame(0x61, 100, card_mac), r2 = frame(0x62, 1514, card_mac);
++	q = seq_next(q); core_stage(q, r1);
++	q = seq_next(q); core_tx(q, r2);
++	ne2000_poll();
++	uint8_t got[1600]; size_t glen = 0;
++	CHECK(sent.size() == sent_room, "a room frame went to the wire");
++	CHECK(ne2000_room_take(got, sizeof(got), &glen) && glen == 100 && got[50] == 0x61, "room TX 1: %zu", glen);
++	CHECK(ne2000_room_take(got, sizeof(got), &glen) && glen == 1514 && got[1000] == 0x62, "room TX 2: %zu", glen);
++	CHECK(!ne2000_room_take(got, sizeof(got), &glen), "room TX: more than was sent");
++
++	// from the room into the card's ring; what does not fit waits in the queue
++	set16(OFF_RX_HEAD, w16(OFF_RX_TAIL));             // the core has taken everything
++	uint16_t t0 = w16(OFF_RX_TAIL);
++	for (int i = 0; i < 20; i++) { std::vector<uint8_t> f = frame((uint8_t)(0x80 + i), 70); ne2000_room_give(f.data(), f.size()); }
++	std::vector<uint8_t> runt(8, 0);
++	ne2000_room_give(runt.data(), runt.size());       // not a frame: never queued
++	ne2000_poll();
++	CHECK((uint16_t)((w16(OFF_RX_TAIL) - t0) & 15) == 15, "room RX: %u in the ring", (unsigned)((w16(OFF_RX_TAIL) - t0) & 15));
++	set16(OFF_RX_HEAD, w16(OFF_RX_TAIL));             // taken
++	ne2000_poll();
++	CHECK((uint16_t)((w16(OFF_RX_TAIL) - t0) & 15) == 4, "room RX: the 5 left in the queue did not follow (%u)", (unsigned)((w16(OFF_RX_TAIL) - t0) & 15));
++	uint32_t last = (w16(OFF_RX_TAIL) - 1) & 15;
++	CHECK(window[OFF_RX_DATA + last * RX_SLOT_BYTES + 30] == 0x80 + 19, "room RX: the last frame is not the 20th");
++
++	// the queue to the thread is bounded: the oldest go
++	for (int i = 0; i < 70; i++) { q = seq_next(q); core_tx(q, frame((uint8_t)i, 60, card_mac)); ne2000_poll(); }
++	int n = 0; uint8_t first = 0;
++	while (ne2000_room_take(got, sizeof(got), &glen)) { if (!n) first = got[30]; n++; }
++	CHECK(n == 64 && first == 6, "bounded queue: %d frames, first %u", n, first);
++
++	// out of the room: the MiSTer's link again
++	int opens_room = opens;
++	ne2000_room(false);
++	ne2000_poll();
++	CHECK(opens == opens_room + 1 && open_iface == "eth0", "leaving the room did not reopen eth0");
++
+ 	// ---- another core: the signature is withdrawn
+ 	ne2000_stop();
+ 	CHECK(core32(OFF_SIGNATURE) == 0, "signature left after stop");
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index 2b55594..f80e9d4 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -7,6 +7,8 @@
+ // Prints "RESULT frames=<n> digest=<hash of every input seen>" on success.
+ // run_udp_test.sh starts a host and a join and compares the digests.
+ 
++#include <mutex>
++#include <deque>
+ #include <thread>
+ #include <atomic>
+ #include <stdio.h>
+@@ -34,7 +36,7 @@ static std::string workdir;
+ static int         reloads = 0;
+ // NP_SYSTEM=snes: the SNES core (SPEC.md 10); NP_SYSTEM=gb2p: Game Boy 2P (SPEC.md 11);
+ // NP_SYSTEM=arcade: a jtframe arcade core loaded from an MRA (SPEC.md 12); else NES
+-static bool        snes = false, gb2p = false, arcade = false, gba = false, neogeo = false;
++static bool        snes = false, gb2p = false, arcade = false, gba = false, neogeo = false, ao486 = false;
+ static uint64_t    gba_mb[0x1000 / 8];      // GBA: the wireless adapter's mailbox (gba_rfu.sv's side is faked below)
+ static sw_struct   sw;                      // arcade: the DIP switches as mra_loader keeps them
+ static std::string dip_sends;               // arcade: what went to the core, in order
+@@ -48,16 +50,31 @@ static int         spi_cmd = -1, spi_words = 0;
+ // --- stubs for the MiSTer functions netplay.cpp uses ------------------------
+ 
+ // arcade: the MRA's set name, and with orig the core's own name (as Main has them)
+-char *user_io_get_core_name(int orig) { static char n[] = "NES", sn[] = "SNES", g[] = "GAMEBOY2P", a[] = "bublboblr", ao[] = "JTBUBL", ga[] = "GBA", ng[] = "NEOGEO"; return neogeo ? ng : gba ? ga : arcade ? (orig ? ao : a) : gb2p ? g : snes ? sn : n; }
++char *user_io_get_core_name(int orig) { static char n[] = "NES", sn[] = "SNES", g[] = "GAMEBOY2P", a[] = "bublboblr", ao[] = "JTBUBL", ga[] = "GBA", ng[] = "NEOGEO", pc[] = "AO486"; return ao486 ? pc : neogeo ? ng : gba ? ga : arcade ? (orig ? ao : a) : gb2p ? g : snes ? sn : n; }
+ char *user_io_get_core_path(const char *, int) { static char p[] = "games/NES", sp[] = "games/SNES", g[] = "games/GAMEBOY2P", ga[] = "games/GBA"; return gba ? ga : gb2p ? g : snes ? sp : p; }
+ char is_arcade() { return arcade; }
+ static bool menu_mode = false;              // NP_MENU: the join starts in the main menu
+ char is_menu() { return menu_mode; }
+-char is_x86() { return 0; }
+-// ao486's network card (ne2000.cpp) has its own test, test_ne2000
++char is_x86() { return ao486; }
++// ao486's network card: the window has its own test (test_ne2000); here the
++// card is two queues, the frames it sends and the frames it got (SPEC.md 15.4)
++static std::mutex card_mtx;
++static std::deque<std::vector<uint8_t>> card_out, card_in;
++static bool card_room = false;
+ void ne2000_start() {}
+ void ne2000_stop() {}
+ void ne2000_poll() {}
++void ne2000_room(bool on) { card_room = on; printf("[harness] card %s the room\n", on ? "in" : "out of"); }
++bool ne2000_room_take(uint8_t *buf, size_t cap, size_t *len)
++{
++	std::lock_guard<std::mutex> g(card_mtx);
++	if (card_out.empty()) return false;
++	*len = card_out.front().size() < cap ? card_out.front().size() : cap;
++	memcpy(buf, card_out.front().data(), *len);
++	card_out.pop_front();
++	return true;
++}
++void ne2000_room_give(const uint8_t *f, size_t n) { std::lock_guard<std::mutex> g(card_mtx); card_in.push_back(std::vector<uint8_t>(f, f + n)); }
+ 
+ sw_struct *arcade_sw() { return &sw; }
+ void arcade_sw_send()
+@@ -86,6 +103,9 @@ char *user_io_get_confstr(int index)
+ 	// Neo Geo as neogeo.sv's CONF_STR (SPEC.md 14.2)
+ 	static char nn[] = "NEOGEO", nl[] = "FS1,*,Load ROM set", nnp[] = "oDE,Netplay,netplay.ini,Off,Host,Join";
+ 	if (neogeo) return index == 0 ? nn : index == 1 ? nl : index == 2 ? nnp : index == 3 ? b : nullptr;
++	// ao486 as ao486.sv's CONF_STR with the network card (SPEC.md 15)
++	static char pn[] = "AO486", pnet[] = "P2O[66],Network,Off,On", pnp[] = "P2O[70:69],Netplay,netplay.ini,Off,Host,Join";
++	if (ao486) return index == 0 ? pn : index == 1 ? pnet : index == 2 ? pnp : index == 3 ? b : nullptr;
+ 	return index == 0 ? (gb2p ? ga : snes ? sa : a) : index == 1 ? b : nullptr;
+ }
+ 
+@@ -95,6 +115,7 @@ static bool osd_visible = false;            // NP_OSD_STEPS: the OSD is open whi
+ char user_io_osd_is_visible() { return osd_visible; }
+ uint32_t user_io_status_get(const char *opt, int)
+ {
++	if (ao486) return !strcmp(opt, "[70:69]") ? osd_netplay : !strcmp(opt, "[66]") ? 1 : 0;   // Network On
+ 	if (!strcmp(opt, gba || neogeo ? "[46:45]" : arcade ? "[127:126]" : gb2p ? "[47:46]" : snes ? "[59:58]" : "[89:88]")) return osd_netplay;
+ 	if (arcade || neogeo) return 0;   // Neo Geo: AES, NTSC, UniBIOS, DIPs off
+ 	if (gb2p) return !strcmp(opt, "[6]") ? status6 : 0;
+@@ -142,7 +163,9 @@ const char *getFullPath(const char *name)
+ 	return buf;
+ }
+ 
+-void Info(const char *message, int, int, int, int) { printf("[osd] %s\n", message); fflush(stdout); }
++static std::string osd_log;                 // every OSD message, for the checks
++void Info(const char *message, int, int, int, int) { printf("[osd] %s\n", message); fflush(stdout); osd_log += message; osd_log += "\n"; }
++static bool log_has(const char *text) { return osd_log.find(text) != std::string::npos; }
+ 
+ void *shmem_map(uint32_t phys, uint32_t)
+ {
+@@ -603,6 +626,103 @@ static int run_gba(bool host)
+ 	return ok ? 0 : 1;
+ }
+ 
++// ao486's network card in a room (SPEC.md 15.4, T3e): once linked, each side's
++// card sends a frame every 20 ms for 4 s, tagged with the side and a number,
++// and goes on receiving for 6 s more (through the server one side is linked a
++// few seconds after the other); the other side must get most of them, whole,
++// and nothing of its own.
++static std::vector<uint8_t> card_frame(bool host, uint16_t n)
++{
++	std::vector<uint8_t> f(64 + n % 1400);
++	for (size_t i = 0; i < f.size(); i++) f[i] = (uint8_t)(n * 13 + i * (host ? 3 : 5));
++	f[0] = host ? 0xAA : 0xBB;
++	f[1] = (uint8_t)(n >> 8); f[2] = (uint8_t)n;
++	return f;
++}
++static int run_ao486(bool host)
++{
++	netplay_start();
++	bool linked = false;
++	uint64_t t0 = now_ms();
++	while (!linked && now_ms() - t0 < 20000)
++	{
++		netplay_poll();
++		usleep(1000);
++		linked = card_room && log_has("network linked");
++	}
++	int sent = 0, got = 0, bad = 0, mine = 0, per_s[6] = {};
++	uint64_t t_start = now_ms();
++	for (uint64_t t = now_ms(), next = 0; linked && now_ms() - t < 10000; usleep(1000))
++	{
++		netplay_poll();
++		if (now_ms() - t < 4000 && now_ms() >= next)
++		{
++			next = now_ms() + 20;
++			std::lock_guard<std::mutex> g(card_mtx);
++			card_out.push_back(card_frame(host, (uint16_t)sent++));
++		}
++		std::lock_guard<std::mutex> g(card_mtx);
++		while (!card_in.empty())
++		{
++			std::vector<uint8_t> &f = card_in.front();
++			if (f.size() >= 3 && f[0] == (host ? 0xAA : 0xBB)) mine++;
++			else if (f.size() < 3 || f != card_frame(!host, (uint16_t)(f[1] << 8 | f[2]))) bad++;
++			else { got++; per_s[(now_ms() - t_start) / 2000 < 5 ? (now_ms() - t_start) / 2000 : 5]++; }
++			card_in.pop_front();
++		}
++	}
++	// NP_AO486_REPAIR=host|join (with NP_OSD): that side turns Netplay Off and
++	// back, which is a new pairing (through the server: the host opens a new
++	// room); both must find each other again and frames flow (SPEC.md 15.4)
++	int got2 = 0;
++	bool relinked = true;
++	if (const char *rp = getenv("NP_AO486_REPAIR"))
++	{
++		bool me = !strcmp(rp, host ? "host" : "join");
++		uint32_t back = osd_netplay;
++		size_t links0 = 0;
++		for (size_t p = 0; (p = osd_log.find("network linked", p)) != std::string::npos; p++) links0++;
++		if (me)
++		{
++			osd_netplay = 1;                              // Off
++			for (uint64_t t = now_ms(); now_ms() - t < 1000; usleep(1000)) netplay_poll();
++			osd_netplay = back;
++		}
++		relinked = false;
++		int n2 = 0;
++		uint64_t t0 = now_ms(), next = 0, until = t0 + 45000;
++		while (now_ms() < until)
++		{
++			netplay_poll();
++			usleep(1000);
++			size_t links = 0;
++			for (size_t p = 0; (p = osd_log.find("network linked", p)) != std::string::npos; p++) links++;
++			if (!relinked && links > links0) { relinked = true; until = now_ms() + 8000; }
++			if (now_ms() >= next)
++			{
++				next = now_ms() + 50;
++				std::lock_guard<std::mutex> g(card_mtx);
++				card_out.push_back(card_frame(host, (uint16_t)(10000 + n2++)));
++			}
++			std::lock_guard<std::mutex> g(card_mtx);
++			while (!card_in.empty())
++			{
++				std::vector<uint8_t> &f = card_in.front();
++				uint16_t n = f.size() >= 3 ? (uint16_t)(f[1] << 8 | f[2]) : 0;
++				if (f.size() >= 3 && f[0] != (host ? 0xAA : 0xBB) && n >= 10000 && f == card_frame(!host, n)) got2++;
++				card_in.pop_front();
++			}
++		}
++		printf("[harness] ao486 after %s turned Netplay off and on: linked again %d, got %d\n", rp, relinked, got2);
++	}
++	for (uint64_t t = now_ms(); now_ms() - t < 500; usleep(1000)) netplay_poll();
++	netplay_stop();
++	bool ok = linked && got >= 150 && bad == 0 && mine == 0 && relinked && (!getenv("NP_AO486_REPAIR") || got2 >= 40);
++	printf("[harness] ao486: linked %d, sent %d, got %d, damaged %d, own %d (per 2 s %d %d %d %d %d)\n", linked, sent, got, bad, mine, per_s[0], per_s[1], per_s[2], per_s[3], per_s[4]);
++	printf("RESULT frames=0 stalls=0 reloads=0 dip=0 digest=%s\n", ok ? "ao486-ok" : "ao486-fail");
++	return ok ? 0 : 1;
++}
++
+ int main(int argc, char **argv)
+ {
+ 	snes = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "snes");
+@@ -610,6 +730,7 @@ int main(int argc, char **argv)
+ 	arcade = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "arcade");
+ 	gba = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "gba");
+ 	neogeo = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "neogeo");
++	ao486 = getenv("NP_SYSTEM") && !strcasecmp(getenv("NP_SYSTEM"), "ao486");
+ 	two = gb2p && getenv("NP_TWO") != nullptr;
+ 	const char *sysdir = gb2p ? "GAMEBOY2P" : snes ? "SNES" : "NES", *ext = gb2p ? ".gb" : snes ? ".sfc" : ".nes";
+ 	if (argc == 4 && !strcmp(argv[1], "makerom")) { make_rom(argv[2], atoi(argv[3])); return 0; }
+@@ -642,6 +763,7 @@ int main(int argc, char **argv)
+ 
+ 	if (arcade) return run_arcade(host, osd, want);
+ 	if (gba) return run_gba(host);
++	if (ao486) return run_ao486(host);
+ 	if (neogeo) return run_neogeo(host, want);
+ 
+ 	std::string game = std::string("game") + ext;
+-- 
+2.43.0
+

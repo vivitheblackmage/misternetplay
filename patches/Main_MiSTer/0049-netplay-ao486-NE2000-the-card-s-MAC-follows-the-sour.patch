@@ -1,0 +1,77 @@
+From a4510c06a3f1e8931e00119eb12e88c5a3f11aee Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Mon, 16 Nov 2026 23:21:06 +0100
+Subject: [PATCH 49/52] netplay: ao486 NE2000: the card's MAC follows the
+ source of the guest's frames (a DOS driver reads the PROM before the core has
+ fetched Main's address and uses the built-in one; seen on hardware: DHCP
+ replies filtered away); T3e
+---
+ support/netplay/ne2000.cpp           | 17 +++++++++++++++++
+ support/netplay/test/test_ne2000.cpp | 16 ++++++++++++++++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/support/netplay/ne2000.cpp b/support/netplay/ne2000.cpp
+index b513f40..5687185 100644
+--- a/support/netplay/ne2000.cpp
++++ b/support/netplay/ne2000.cpp
+@@ -200,6 +200,22 @@ void ne2000_stop(void)
+ 	printf("[ne2000] stopped\n");
+ }
+ 
++// The card's address is whatever the guest's driver uses, not always the one
++// Main published: the core fetches that from DDR3 in the background after a
++// reset, and a DOS driver reads the PROM right after resetting the card, before
++// the fetch is done, and programs the card with the built-in address (seen on
++// hardware: DHCP went out from 52:54:05:04:03:02 and the replies to it were
++// filtered away). So Main takes the source address of the guest's frames as the
++// card's: the filter on eth0 and the echo check follow it.
++static void follow_guest_mac(const uint8_t *src)
++{
++	if ((src[0] & 1) || !memcmp(src, mac, 6)) return;    // a group address is no card's, or no change
++	memcpy(mac, src, 6);
++	if (link_open && cur_mode == MODE_ETH0) ethernet_set_mac_filter(mac);
++	printf("[ne2000] the guest uses MAC %02X:%02X:%02X:%02X:%02X:%02X\n",
++	       mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++}
++
+ static inline uint16_t seq_next(uint16_t s) { return s == 0xFFFF ? 1 : s + 1; }
+ static inline uint16_t seq_prev(uint16_t s) { return s <= 1 ? 0xFFFF : s - 1; }
+ 
+@@ -234,6 +250,7 @@ static void poll_tx(void)
+ 		if (link_open && len >= 14 && len <= TX_SLOT_BYTES)
+ 		{
+ 			memcpy(frame, (const void *)(win + OFF_TX_SLOT_DATA + slot * TX_SLOT_BYTES), len);
++			follow_guest_mac(frame + 6);
+ 			ethernet_send(frame, len);
+ 		}
+ 		last_tx_seq = s;
+diff --git a/support/netplay/test/test_ne2000.cpp b/support/netplay/test/test_ne2000.cpp
+index 791320b..0081bdc 100644
+--- a/support/netplay/test/test_ne2000.cpp
++++ b/support/netplay/test/test_ne2000.cpp
+@@ -148,6 +148,22 @@ int main()
+ 	      "wrap: %zu sent", sent.size() - before);
+ 	CHECK(w16(OFF_TX_DONE_SEQ) == 2, "wrap: done %u", w16(OFF_TX_DONE_SEQ));
+ 
++	// ---- the guest's driver uses another address (the card's built-in one): the
++	//      eth0 filter and the echo check follow the source of its frames
++	static const uint8_t builtin[6] = { 0x52, 0x54, 0x05, 0x04, 0x03, 0x02 };
++	int filters_before = filters;
++	core_tx(3, frame(0x38, 304, builtin));
++	ne2000_poll();
++	CHECK(filters == filters_before + 1 && !memcmp(filter_mac, builtin, 6), "filter did not follow the guest's MAC");
++	core_tx(4, frame(0x39, 60, builtin));
++	ne2000_poll();
++	CHECK(filters == filters_before + 1, "filter set again for the same address");
++	memcpy(card_mac, builtin, 6);
++	static const uint8_t group[6] = { 0x01, 0x00, 0x5E, 0, 0, 1 };
++	core_tx(5, frame(0x3A, 60, group));
++	ne2000_poll();
++	CHECK(!memcmp(filter_mac, builtin, 6), "a group source address was taken as the card's");
++
+ 	// ---- receive: slots in order, the length before the tail, our own echo and runts dropped
+ 	wire_in.push_back(frame(0x41, 60));
+ 	wire_in.push_back(frame(0x42, 60, card_mac));     // our own transmit, echoed
+-- 
+2.43.0
+

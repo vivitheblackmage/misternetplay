@@ -1,0 +1,13 @@
+
+  Linux on the MiSTer ao486 core, with its NE2000 network card.
+  Everything runs from RAM: nothing is written to the disk.
+
+  ip addr                  your address (DHCP)
+  ping -c 3 8.8.8.8        the internet
+  wget -O - http://example.com
+  telnet <host> <port>
+  http://<this address>/   a web page served from here (busybox httpd)
+  telnet <this address>    a shell from another computer (no password!)
+
+  Alt+F2, Alt+F3           more consoles.  Ctrl+Alt+Del reboots.
+

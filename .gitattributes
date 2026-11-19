@@ -10,3 +10,8 @@ patches/GBA_MiSTer/*.patch -text
 *.gba binary
 # NeoGeo_MiSTer has CRLF files too
 patches/NeoGeo_MiSTer/*.patch -text
+# ao486_MiSTer has CRLF and mixed files, and the patch carries binary DOS tools
+patches/ao486_MiSTer/*.patch -text
+# the ao486 DOS drivers are third-party files carried byte for byte (tools/third-party.md5)
+tools/ao486/dos/crynwr/** -text
+tools/ao486/dos/pdipx/** -text

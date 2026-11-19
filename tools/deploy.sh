@@ -3,10 +3,12 @@
 #
 #   tools/deploy.sh <mister-ip> [core|main|ini|arcade|all] [--no-reboot]
 #
-#   core  NES_MiSTer/output_files/NES.rbf  -> /media/fat/_Console/NES_netplay.rbf
-#         SNES_MiSTer/output_files/SNES.rbf -> /media/fat/_Console/SNES_netplay.rbf
-#         Gameboy2P_MiSTer/output_files/Gameboy.rbf -> /media/fat/_Console/GAMEBOY2P_netplay.rbf
-#         GBA_MiSTer/output_files/GBA.rbf -> /media/fat/_Console/GBA_netplay.rbf (wireless adapter, SPEC.md 13)
+#   core  NES_MiSTer/output_files/NES.rbf  -> /media/fat/_Netplay/NES_netplay_<build date>.rbf
+#         SNES_MiSTer/output_files/SNES.rbf -> /media/fat/_Netplay/SNES_netplay.rbf
+#         Gameboy2P_MiSTer/output_files/Gameboy.rbf -> /media/fat/_Netplay/GAMEBOY2P_netplay.rbf
+#         GBA_MiSTer/output_files/GBA.rbf -> /media/fat/_Netplay/GBA_netplay.rbf (wireless adapter, SPEC.md 13)
+#         NeoGeo, ao486 the same; an old copy in _Console/_Computer is removed
+#         (game shortcuts would start it instead of the normal core)
 #         (each when built)
 #   main  Main_MiSTer/bin/MiSTer           -> /media/fat/MiSTer_online, plus
 #         Scripts/netplay_on.sh and netplay_off.sh to switch (your MiSTer is kept)
@@ -39,12 +41,16 @@ ssh_opts=(-o StrictHostKeyChecking=accept-new)
 
 if [[ "$what" == core || "$what" == all ]]; then
 	n=0
+	ssh "${ssh_opts[@]}" "root@$host" 'mkdir -p /media/fat/_Netplay'
 	for c in NES:NES_MiSTer/output_files/NES.rbf SNES:SNES_MiSTer/output_files/SNES.rbf \
-	         GAMEBOY2P:Gameboy2P_MiSTer/output_files/Gameboy.rbf GBA:GBA_MiSTer/output_files/GBA.rbf; do
+	         GAMEBOY2P:Gameboy2P_MiSTer/output_files/Gameboy.rbf GBA:GBA_MiSTer/output_files/GBA.rbf \
+	         NeoGeo:NeoGeo_MiSTer/output_files/NeoGeo.rbf ao486:ao486_MiSTer/output_files/ao486.rbf; do
 		rbf="$root/${c#*:}"
 		[ -f "$rbf" ] || continue
-		scp "${ssh_opts[@]}" "$rbf" "root@$host:/media/fat/_Console/${c%%:*}_netplay.rbf"
-		echo "core -> /media/fat/_Console/${c%%:*}_netplay.rbf"
+		name="${c%%:*}_netplay_$(date -r "$rbf" +%Y%m%d).rbf"
+		ssh "${ssh_opts[@]}" "root@$host" "cd /media/fat && rm -f _Console/${c%%:*}_netplay*.rbf _Computer/${c%%:*}_netplay*.rbf _Netplay/${c%%:*}_netplay*.rbf"
+		scp "${ssh_opts[@]}" "$rbf" "root@$host:/media/fat/_Netplay/$name"
+		echo "core -> /media/fat/_Netplay/$name"
 		n=$((n + 1))
 	done
 	[ $n -gt 0 ] || { echo "no core built - build one in Quartus first"; exit 1; }
@@ -53,7 +59,8 @@ fi
 if [[ "$what" == arcade ]]; then
 	rbf="$root/jtcores/release/mister/jtbubl.rbf"
 	[ -f "$rbf" ] || { echo "no $rbf - run tools/jt_build.sh bubl first"; exit 1; }
-	scp "${ssh_opts[@]}" "$rbf" "root@$host:/media/fat/_Arcade/cores/jtbubl-netplay.rbf"
+	ssh "${ssh_opts[@]}" "root@$host" 'rm -f /media/fat/_Arcade/cores/jtbubl-netplay*.rbf'
+	scp "${ssh_opts[@]}" "$rbf" "root@$host:/media/fat/_Arcade/cores/jtbubl-netplay_$(date -r "$rbf" +%Y%m%d).rbf"
 	ssh "${ssh_opts[@]}" "root@$host" 'cd /media/fat/_Arcade && src="_alternatives/_Bubble Bobble/Bubble Bobble (US, Ver 5.1).mra" &&
 		{ [ -f "$src" ] || { echo "no $src on the MiSTer (update_all installs it)"; exit 1; }; } &&
 		sed -e "s|<rbf>jtbubl</rbf>|<rbf>jtbubl-netplay</rbf>|" -e "s|</name>| [netplay]</name>|" -e "/<switches /s|default=\"ff,ff\"|default=\"fe,ff\"|" "$src" > "Bubble Bobble (US, Ver 5.1) [netplay].mra" &&
@@ -69,6 +76,8 @@ if [[ "$what" == main || "$what" == all ]]; then
 	ssh "${ssh_opts[@]}" "root@$host" 'mkdir -p /media/fat/Scripts'
 	scp "${ssh_opts[@]}" "$bin" "root@$host:/media/fat/MiSTer_online.new"
 	scp "${ssh_opts[@]}" "$root"/tools/mister-scripts/netplay_{on,off}.sh "root@$host:/media/fat/Scripts/"
+	ssh "${ssh_opts[@]}" "root@$host" 'mkdir -p /media/fat/Scripts/.config/netplay'
+	scp "${ssh_opts[@]}" "$root"/tools/mister-scripts/normal_main.py "root@$host:/media/fat/Scripts/.config/netplay/"
 	active=$(ssh "${ssh_opts[@]}" "root@$host" 'cd /media/fat && chmod +x MiSTer_online.new Scripts/netplay_on.sh Scripts/netplay_off.sh &&
 		if [ -f MiSTer_online ] && cmp -s MiSTer MiSTer_online; then
 			cp MiSTer_online.new MiSTer.new && mv MiSTer.new MiSTer && echo yes

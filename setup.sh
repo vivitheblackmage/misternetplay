@@ -7,6 +7,7 @@
 #   jtcores/      Jotego's jtcores (arcade cores, jtframe), branch "netplay" (work in progress)
 #   GBA_MiSTer/   MiSTer-devel GBA (master), branch "netplay": GBA 2P netplay (work in progress)
 #   NeoGeo_MiSTer/  MiSTer-devel Neo Geo (master), branch "netplay": AES lockstep
+#   ao486_MiSTer/   MiSTer-devel ao486 (master), branch "netplay": NE2000 network card (SPEC.md 15)
 #
 # Use your own forks so you can push:
 #   NES_URL=git@github.com:<you>/NES_MiSTer.git MAIN_URL=git@github.com:<you>/Main_MiSTer.git ./setup.sh
@@ -20,6 +21,7 @@ MAIN_URL="${MAIN_URL:-https://github.com/MiSTer-devel/Main_MiSTer.git}"
 JTCORES_URL="${JTCORES_URL:-https://github.com/jotego/jtcores.git}"
 GBA_URL="${GBA_URL:-https://github.com/MiSTer-devel/GBA_MiSTer.git}"
 NEOGEO_URL="${NEOGEO_URL:-https://github.com/MiSTer-devel/NeoGeo_MiSTer.git}"
+AO486_URL="${AO486_URL:-https://github.com/MiSTer-devel/ao486_MiSTer.git}"
 
 # The patches were written against these upstream commits.
 NES_BASE=49a0a662e244469ca77b2155746a066df704ffae
@@ -29,6 +31,7 @@ MAIN_BASE=08271656799ede50358de1248f6ee878dd7ce5c4
 JTCORES_BASE=15d60ca4f7f8e050b38eefee8c2125657ae65b37
 GBA_BASE=93790a023395bbd90e5eaf4dfb2cb5910afd55f5
 NEOGEO_BASE=ffaab14cd6cc8683bcf88b710cb7d52934f0ec68
+AO486_BASE=628ddbcb101f836812981b06367b5080161fad4f
 
 setup_repo() {
 	local dir=$1 url=$2 base=$3 patches=$4
@@ -56,6 +59,7 @@ setup_repo Main_MiSTer "$MAIN_URL" "$MAIN_BASE" Main_MiSTer
 setup_repo jtcores "$JTCORES_URL" "$JTCORES_BASE" jtcores
 setup_repo GBA_MiSTer "$GBA_URL" "$GBA_BASE" GBA_MiSTer
 setup_repo NeoGeo_MiSTer "$NEOGEO_URL" "$NEOGEO_BASE" NeoGeo_MiSTer
+setup_repo ao486_MiSTer "$AO486_URL" "$AO486_BASE" ao486_MiSTer
 # the sound chips Bubble Bobble needs (jtbubl)
 git -C "$here/jtcores" submodule update --init --recursive modules/jt12 modules/jtopl
 

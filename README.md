@@ -1,4 +1,4 @@
-# NES, SNES, Game Boy, GBA, Neo Geo and arcade netplay for MiSTer
+# NES, SNES, Game Boy, GBA, Neo Geo, arcade and PC (ao486) netplay for MiSTer
 
 Play NES, Super NES, Game Boy link-cable games, Neo Geo (AES) and Bubble Bobble (arcade)
 together on two [MiSTer FPGA](https://github.com/MiSTer-devel/Wiki_MiSTer/wiki) boards over the
@@ -10,6 +10,13 @@ silently.
 GBA games that use Nintendo's **GBA Wireless Adapter** work differently: each
 MiSTer runs its own game, and the adapter is emulated, so the two GBAs talk to
 each other over the internet as they would over the air.
+
+The **ao486** PC core gets a network card instead: up to eight MiSTers in a
+room share one small network, so DOS games with network play (Doom, Duke
+Nukem 3D, Warcraft II, Command & Conquer, Blood ...) see each other as on a
+LAN. Each MiSTer runs its own PC, and only the network frames cross. A menu
+on the PC's hard disk loads the network drivers and starts the games with the
+right settings.
 
 It comes in these parts:
 
@@ -34,6 +41,15 @@ It comes in these parts:
   and Emerald, and other games that use the adapter. The adapter's commands
   are answered by the Main binary (ported from gpSP's adapter emulation), and
   its packets travel between the two MiSTers.
+- **ao486 core** (`ao486_netplay.rbf`): the MiSTer ao486
+  core with an NE2000 network card (from ao486_MiSTer pull request #238 by
+  georgemog, not merged upstream). The card's frames go to the room, or to the
+  MiSTer's own network (DHCP and internet from DOS).
+- **ao486 DOS kit** (`games/AO486/NETPLAY.IMG`, a floppy image): the network
+  game menu (`NPMENU`), our IPX driver (`NPIPX`) and the Crynwr NE2000 packet
+  driver. A script in the MiSTer's Scripts menu puts the menu on every DOS
+  hard disk at once; with the network on, the PC then asks at boot: online or
+  single player.
 - **Main binary** (`MiSTer_online`): the MiSTer main program (menu, file
   browser, input) with the netplay engine and the UDP networking added. Your
   normal MiSTer binary is kept, and you can switch back from the Scripts menu.
@@ -86,6 +102,14 @@ MiSTer-devel project.
   (packet loss and packet sync: 65,534 packets without a loss). In simulation:
   the core's serial port and adapter against Pokémon's own wireless library
   (librfu), with the Main binary's answers late and out of order.
+- ao486 on hardware: Doom between two MiSTers over the internet through the
+  lobby server (on a Raspberry Pi), with our IPX driver; the boot question,
+  the game menu and its uninstall; DHCP and ping from DOS on the MiSTer's own
+  network. Rooms of three to eight players and the direct link without a
+  server so far only in the automated tests (three Main programs through a
+  real server). The DOS kit in QEMU: two PCs see each other in the menu's room
+  and start a game with the same settings; Doom reaches its first level with
+  two players.
 - Automated tests for the core (Verilator testbench) and for the netplay engine,
   host and join over real UDP, with and without the server.
 
@@ -101,20 +125,29 @@ them; it holds our changes as patches on top of exact upstream commits:
 | Game Boy 2P core (FPGA) | [github.com/pomstazlesa/Gameboy2PUW_MiSTer](https://github.com/pomstazlesa/Gameboy2PUW_MiSTer) (branch `Gameboy2P`) | `83e167f` (2025-10-05) | [`patches/Gameboy2P_MiSTer/`](patches/Gameboy2P_MiSTer) |
 | GBA core (FPGA) | [github.com/MiSTer-devel/GBA_MiSTer](https://github.com/MiSTer-devel/GBA_MiSTer) | `93790a0` | [`patches/GBA_MiSTer/`](patches/GBA_MiSTer) |
 | Neo Geo core (FPGA) | [github.com/MiSTer-devel/NeoGeo_MiSTer](https://github.com/MiSTer-devel/NeoGeo_MiSTer) | `ffaab14` | [`patches/NeoGeo_MiSTer/`](patches/NeoGeo_MiSTer) |
+| ao486 core (FPGA) | [github.com/MiSTer-devel/ao486_MiSTer](https://github.com/MiSTer-devel/ao486_MiSTer) | `628ddbc` | [`patches/ao486_MiSTer/`](patches/ao486_MiSTer) (the first is pull request #238's NE2000 card by georgemog) |
 | Arcade core (FPGA) | [github.com/jotego/jtcores](https://github.com/jotego/jtcores) (jtbubl and jtframe) | `15d60ca` (2026-10-23) | [`patches/jtcores/`](patches/jtcores) |
 | Main binary (ARM) | [github.com/MiSTer-devel/Main_MiSTer](https://github.com/MiSTer-devel/Main_MiSTer) | `0827165` (2026-10-30) | [`patches/Main_MiSTer/`](patches/Main_MiSTer) |
 
-The NES, SNES, GBA and Neo Geo cores are the work of the MiSTer-devel contributors and of the
+The NES, SNES, GBA, Neo Geo and ao486 cores are the work of the MiSTer-devel contributors and of the
 authors credited in their own READMEs; Main_MiSTer likewise. The Game Boy 2P
 core is pomstazlesa's two-player fork of the MiSTer-devel Game Boy core. The
 arcade core and jtframe are Jotego's (jtcores). All are licensed GPL-3.0, and
-so are our patches.
+so are our patches. The ao486 network card itself (the NE2000 in the FPGA and
+its shared-memory window) is georgemog's, from ao486_MiSTer pull request #238
+(not merged upstream), built on apolkosnik's RTL8019AS core from
+Minimig-AGA_MiSTer. We took it as it is and fixed what the hardware showed
+(an OSD bit it shared with Low-Res, the MAC address after a reset, the
+transmit ring on the ARM side), and added the rooms and the DOS side; the
+release notes for v0.7 list it.
 
-`./setup.sh` clones the seven upstream repositories next to it and applies the
+`./setup.sh` clones the eight upstream repositories next to it and applies the
 patches on a branch called `netplay`.
 
 Everything else here is our own: the lobby server (`server/`), the tools
-(`tools/`) and the NetPong test game (`netpong/`). The Quartus Docker setup in
+(`tools/`), the NetPong test game (`netpong/`) and the ao486 DOS kit's menu and
+IPX driver (`tools/ao486/dos/netplay`). The DOS kit also carries the Crynwr
+NE2000 packet driver (GPL-1.0, its source in `tools/ao486/dos/crynwr`). The Quartus Docker setup in
 `tools/quartus-docker/` is based on
 [ebraminio/mister-docker-build](https://github.com/ebraminio/mister-docker-build) (MIT).
 
@@ -151,6 +184,7 @@ pairing through the lobby, and the fixes Pokémon needed over the internet
 | --- | --- |
 | MiSTer | Two MiSTers (DE10-Nano) with SDRAM, a network connection (Ethernet is best) and the current MiSTer Linux. Tested on kernel `6.18.38-MiSTer` (glibc 2.31). `MiSTer_online` needs glibc 2.29 or newer, so a MiSTer kept up to date with the official updater (`update_all` or `downloader`) is fine. Check with `uname -r` over ssh. |
 | Game | The same ROM file on both MiSTers (same md5), or the server's copy. NetPong, a free two-player NES test game, is included. Game Boy 2P needs the SDRAM board, as the original core. Bubble Bobble: the ROM set the MiSTer updater installs for Jotego's core (`games/mame/bublbobl.zip`), the same on both MiSTers; arcade games never come from the server. Neo Geo: the same game and the same BIOS files (`uni-bios.rom` or `neo-epo.sp1`, `sfix.sfix`, `000-lo.lo`) on both; Neo Geo games never come from the server either. |
+| ao486 | DOS hard disk images in `games/AO486` (the ready-made ones work: the menu goes in front of their own game start). The game itself on that disk, with its network play: DOS games with IPX. More than two players need the server. |
 | Server (optional) | Windows 10/11, or Linux on x86-64, ARM64 or ARMv7, such as Raspberry Pi OS (32- or 64-bit), Debian or Ubuntu. The binaries have no dependencies; the installer needs systemd (without it, run the binary by hand). Tested on Windows 10; Linux x86-64 in the automated tests. One forwarded port (7845, UDP and TCP) on the server's router. |
 | Building (developers) | Linux, tested on Ubuntu 24.04 (also in WSL2 on Windows 10). Docker for Quartus Prime Lite 17.0.2, Verilator 5, g++, Python 3, Go 1.22 (or Docker). See [Building](#building). |
 
@@ -162,32 +196,65 @@ computer. Then on **each** MiSTer:
 1. Copy everything in the folder `SD card` to the root of the MiSTer's SD card
    (where `_Console` is), over the network share or with the card in a
    computer. None of your files is overwritten:
-   - `_Console/NES_netplay.rbf`, `_Console/SNES_netplay.rbf`,
-     `_Console/GAMEBOY2P_netplay.rbf`, `_Console/GBA_netplay.rbf` and
-     `_Console/NeoGeo_netplay.rbf`: the cores, next to the normal ones
-   - `_Arcade/cores/jtbubl-netplay.rbf` and
+   - `_Netplay/`: the netplay cores in their own folder, shown as **Netplay**
+     in the MiSTer's main menu: `NES_netplay`, `SNES_netplay`,
+     `GAMEBOY2P_netplay`, `GBA_netplay`, `NeoGeo_netplay` and `ao486_netplay`,
+     each with its build date as MiSTer's own cores have it
+     (`NES_netplay_20261118.rbf`). Your normal cores are not changed.
+   - `_Arcade/cores/jtbubl-netplay_<date>.rbf` and
      `_Arcade/Bubble Bobble (US, Ver 5.1) [netplay].mra`: the arcade core and
      its MRA, next to Jotego's (which are not changed)
    - `MiSTer_online`: the netplay main binary
-   - `Scripts/netplay_on.sh`, `Scripts/netplay_off.sh`
+   - `Scripts/netplay_on.sh`, `Scripts/netplay_off.sh` (with
+     `Scripts/.config/netplay/normal_main.py`),
+     `Scripts/ao486_netplay_install.sh`, `Scripts/ao486_netplay_uninstall.sh`
+   - `games/AO486/NETPLAY.IMG`: the ao486 DOS kit
    - `netplay.ini`: the settings (keep yours if you already have one)
    - `games/NES/NetPong/NetPong.nes`
 2. On the MiSTer: **Scripts → netplay_on**. Your binary is saved as
    `MiSTer_offline`, `MiSTer_online` becomes `MiSTer`, and the MiSTer
-   reboots. **Scripts → netplay_off** switches back.
-3. NES: start **Console → NES_netplay**. In the OSD: **Advanced → RAM Clear → $00**,
+   reboots. **Scripts → netplay_off** switches back. If an older netplay_on
+   (before v0.5) saved a netplay binary as `MiSTer_offline`, netplay_on and
+   netplay_off fetch the official binary from the MiSTer database (checked
+   against its MD5) and put it there; the MiSTer needs the network for that.
+   netplay_on also removes
+   older netplay cores: see [Updating from v0.6 or older](#updating-from-v06-or-older).
+3. NES: start **Netplay → NES_netplay**. In the OSD: **Advanced → RAM Clear → $00**,
    then **Save settings** at the bottom of the menu (both players need the
    same settings).
-4. SNES: start **Console → SNES_netplay**. Nothing to set up; both players need
+4. SNES: start **Netplay → SNES_netplay**. Nothing to set up; both players need
    the same OSD settings.
-5. Game Boy 2P: start **Console → GAMEBOY2P_netplay**. Put the games
+5. Game Boy 2P: start **Netplay → GAMEBOY2P_netplay**. Put the games
    (`.gb`, `.gbc`) in `games/GAMEBOY2P`. Nothing to set up.
 6. Arcade: start **Arcade → Bubble Bobble (US, Ver 5.1) [netplay]**. Nothing
    to set up; the DIP switches are the host's during a session.
-7. GBA: start **Console → GBA_netplay**. In the OSD: **Hardware → Link Port →
+7. GBA: start **Netplay → GBA_netplay**. In the OSD: **Hardware → Link Port →
    Wireless Adapter**. See [GBA Wireless Adapter](#gba-wireless-adapter).
-8. Neo Geo: start **Console → NeoGeo_netplay** with **System Type → Console
+8. Neo Geo: start **Netplay → NeoGeo_netplay** with **System Type → Console
    (AES)**. See [Neo Geo](#neo-geo).
+9. ao486: **Scripts → ao486_netplay_install** once (with the ao486 core
+   closed). See [ao486 (PC)](#ao486-pc).
+
+### Updating from v0.6 or older
+
+Up to v0.6 the netplay cores went into `_Console` (`NES_netplay.rbf` next to
+`NES_20260823.rbf`). That has a side effect: a game shortcut (an `.mgl` file,
+MiSTer_SAM, a favourite) names its core without the date, `_Console/NES`, and
+the MiSTer then takes the file whose name sorts last, which is
+`NES_netplay.rbf`. Such shortcuts started the netplay core instead of your
+normal one. Starting a core from the menu was never affected.
+
+Since v0.7 the cores are in `_Netplay`, where no shortcut to `_Console` finds
+them. After copying the new `SD card` folder, run **Scripts → netplay_on**: it
+removes the old `_Console/NES_netplay.rbf`, `SNES_netplay.rbf`,
+`GAMEBOY2P_netplay.rbf`, `GBA_netplay.rbf`, `NeoGeo_netplay.rbf` (and
+`_Computer/ao486_netplay.rbf` from a test kit) once their new copy is in
+`_Netplay`, older versions in `_Netplay`, and `_Arcade/cores/jtbubl-netplay.rbf`.
+
+If you stay on v0.6 or older for now, delete those files in `_Console` by hand
+when you are not using netplay, or rename them so they do not start with the
+core's name (for example `Netplay-NES.rbf`); netplay works the same with any
+file name.
 
 **Switching between the netplay cores:** reboot from the MiSTer's menu first,
 then start the other core. Jumping straight from one core to the
@@ -306,6 +373,44 @@ All settings are described in [`tools/netplay.ini.example`](tools/netplay.ini.ex
   (the adapter itself allows five). Wireless multiboot (playing with one
   cartridge) is not supported.
 
+### ao486 (PC)
+
+- **Once:** Scripts → **ao486_netplay_install**, with the ao486 core closed.
+  It puts the network game menu on every DOS hard disk image in
+  `games/AO486` (from `games/AO486/NETPLAY.IMG`): `C:\NETPLAY`, `C:\NP.BAT` and
+  two lines in `C:\AUTOEXEC.BAT` (the old one is kept as `C:\AUTOEXEC.NPB`).
+  Windows 95/98 disks, disks without DOS and CD images are left alone. Run it
+  again after an update. **ao486_netplay_uninstall** takes it off all disks;
+  changes you made to `AUTOEXEC.BAT` since stay. The script also copies your
+  DOS game shortcuts (`.mgl` files that start the ao486 core with one of those
+  disks, such as the ready-made `_DOS Games`) to **Netplay → DOS Games**, where
+  they start `ao486_netplay`; the originals keep the normal ao486 core. One
+  disk by hand: mount `NETPLAY.IMG` as floppy A: and type `A:\INSTALL`
+  (`A:\UNINSTALL`).
+- **Play:** start the game from **Netplay → DOS Games** (or **Netplay →
+  ao486_netplay** with a game disk). OSD,
+  Hardware page: **Netplay → Host** on one MiSTer and **Join** on the others
+  (this turns **Network** on too), then **Reset**. The OSD says
+  `Netplay: network linked with the room`, and `Netplay: 3 in the room: ...`
+  as players come.
+- At **How do you want to play?** press **1** (Online): the drivers load and
+  the menu shows the network games on that disk and who is in the room. Pick
+  the game: games with an IPX starter (Doom, Heretic) take the players, mode
+  and skill in the menu; the others start and show how their own menus set up
+  network play. The others press **J** to follow with the same settings.
+  **2**, or no key for 10 seconds, starts the disk as usual without drivers.
+  With Network off nothing is asked.
+- **Players:** with a server, up to eight in a room, all through the server
+  (the server passes the frames on like a network switch). Without one,
+  `peer=` as above, two players directly.
+- The menu finds a game by its files (`GAMES.INI` on the disk, add your own).
+  Each ready-made disk holds one game, so the menu shows that one as ready.
+  Doom needs id's `DOOM.EXE`/`DOOM2.EXE` and `IPXSETUP.EXE`; FastDoom has no
+  network play. The ao486 has no maths coprocessor, so Quake does not run.
+- **Netplay → Off** with **Network → On** puts the card on the MiSTer's own
+  network instead (NE2000 Mode Shared needs an Ethernet cable): DHCP and the
+  internet from DOS with a packet driver and mTCP.
+
 ## Running the server
 
 - **Windows:** double-click `netplay-server.exe`.
@@ -349,7 +454,7 @@ The MiSTer boots, but the screen stays black and there is no menu. The new
 | Message | Meaning |
 | --- | --- |
 | `Different ROM file` | the two players do not have the same game file (md5) |
-| `Different core build` | different `NES_netplay.rbf`, `SNES_netplay.rbf` or `GAMEBOY2P_netplay.rbf` files: use the same release on both |
+| `Different core build` | different netplay cores (`NES_netplay`, `SNES_netplay`, `GAMEBOY2P_netplay` ...): use the same release on both |
 | `Different save (.sav) file` | the game has battery saves and they differ; copy one player's `.sav` to the other, or remove both |
 | `Set RAM Clear to $00 or $FF` | OSD → Advanced → RAM Clear, then Save settings |
 | `Different core settings` | an OSD setting differs (NES: system type, PPU reset, extra sprites, mask edges, overscan; SNES: region, ROM header, blending, audio clock, initial WRAM/ARAM, GSU slow ROM, Sufami swap): make them the same before loading the game |
@@ -364,6 +469,8 @@ The MiSTer boots, but the screen stays black and there is no menu. The new
 | `cannot reach server` | wrong `server=`, or the server is not running |
 | `server: wrong key` | `key=` does not match the server's |
 | `connection lost` | nothing arrived from the other player for 5 seconds |
+| `Netplay: network card on. Reset the PC` | ao486: Netplay Host or Join turned Network on; reset so DOS finds the card |
+| `Netplay: alone in the room, looking again` | ao486: the others left the room (or the host loaded the core again); Join finds the host's new room |
 | no connection at all (direct) | the host's router must forward UDP 7845 to the MiSTer |
 | `(missing game)` in Rooms | you do not have that game with the same md5 |
 | host stays at `waiting for player 2` although the server shows you joined | the joining player stopped on an error of its own: look at the message on that MiSTer (often RAM Clear on NES) |
@@ -385,18 +492,21 @@ system, not under `/mnt/c`):
 
 ```sh
 sudo apt install -y git make g++ verilator python3 rsync
-./setup.sh                                   # NES_MiSTer/, SNES_MiSTer/, Gameboy2P_MiSTer/, GBA_MiSTer/, NeoGeo_MiSTer/, jtcores/ and Main_MiSTer/ with the patches
+./setup.sh                                   # NES_MiSTer/, SNES_MiSTer/, Gameboy2P_MiSTer/, GBA_MiSTer/, NeoGeo_MiSTer/, ao486_MiSTer/, jtcores/ and Main_MiSTer/ with the patches
 make -C NES_MiSTer/sim lint test             # RTL lint and testbench
 make -C SNES_MiSTer/sim                      # whole SNES core in Verilator (GHDL in Docker): snes_sim
 make -C Main_MiSTer/support/netplay/test     # netplay engine tests, host + join over UDP
 tools/quartus_build.sh                       # the NES core, Quartus 17.0.2 in Docker (10-30 min)
 CORE=SNES tools/quartus_build.sh             # the SNES core (about 40 min)
 CORE=NeoGeo tools/quartus_build.sh           # the Neo Geo core (about 20 min)
+CORE=ao486 tools/quartus_build.sh            # the ao486 core with the network card (about 40 min)
+tools/ao486/dos/netplay/build.sh dist/ao486-dos   # the DOS kit floppy, Open Watcom in Docker
+tools/ao486/dos/netplay/qemu_test.sh <DOS disk image> dist/ao486-dos   # the kit in QEMU
 make -C NeoGeo_MiSTer/npsim det ROM=<romset> BIOS=<bios folder>   # whole Neo Geo core in Verilator, six timings compared
 (cd Main_MiSTer && source setup_default_toolchain.sh && make)   # MiSTer_online
 tools/jt_build.sh bubl                       # the arcade core, Quartus 20.1 in Docker (jotego/jtcore20, about 15 min)
 server/build.sh                              # netplay-server, Go in Docker
-tools/make_release.sh v0.6                   # releases/v0.6/ and mister-netplay-v0.6.zip
+tools/make_release.sh v0.7                   # releases/v0.7/ and mister-netplay-v0.7.zip
 ```
 
 The Quartus image: [`tools/quartus-docker/README.md`](tools/quartus-docker/README.md).
@@ -405,6 +515,8 @@ The design and the protocols are specified in [`SPEC.md`](SPEC.md).
 
 ## Licence
 
-GPL-3.0 (see `LICENSE`), as the upstream NES_MiSTer, SNES_MiSTer, Gameboy2P, jtcores and Main_MiSTer.
+GPL-3.0 (see `LICENSE`), as the upstream NES_MiSTer, SNES_MiSTer, Gameboy2P, ao486_MiSTer, jtcores and Main_MiSTer.
+The ao486 DOS kit's menu and IPX driver are GPL-2.0-or-later; the Crynwr NE2000
+packet driver on its floppy is GPL-1.0 (source in `tools/ao486/dos/crynwr`).
 `tools/quartus-docker` is MIT (see `tools/quartus-docker/LICENSE.ebraminio`).
 Only put games on a server that you are allowed to share.

@@ -13,6 +13,9 @@ package main
 //   REG  key room role name local core md5 game  -> OK role state room | ERR text
 //   BYE  key room role
 //   server -> client: PEER name public local token
+//
+// ao486 rooms (and only those) are different: up to eight members on one
+// virtual LAN with the server as their switch (ethswitch.go, SPEC.md 15.6).
 
 import (
 	"crypto/rand"
@@ -46,7 +49,8 @@ type room struct {
 	id, core, md5, game string
 	created             time.Time
 	host, join          member
-	token               string // set when host and join are paired
+	token               string     // set when host and join are paired
+	sw                  *ethSwitch // ao486: the room's switch and its members (host and join unused but host)
 }
 
 type binding struct {
@@ -118,14 +122,34 @@ func (r *relay) peerMsg(other *member, token string) string {
 
 func (r *relay) bind(k string, rm *room, host bool) {
 	if old, ok := r.by[k]; ok && (old.room != rm || old.host != host) {
-		r.release(old)
+		r.release(k, old)
 	}
 	r.by[k] = binding{rm, host}
 }
 
-// release frees a member's place. A host leaving closes the room.
-func (r *relay) release(b binding) {
+// release frees a member's place (k: its address). A host leaving closes the
+// room; in an ao486 room only the last member leaving does, and the others
+// hear who is left.
+func (r *relay) release(k string, b binding) []outgoing {
 	rm := b.room
+	if rm.sw != nil {
+		delete(r.by, k)
+		rm.sw.remove(k)
+		if len(rm.sw.members) == 0 {
+			delete(r.rooms, rm.id)
+			return nil
+		}
+		if rm.host.addr != nil && rm.host.addr.String() == k { // the oldest member leads the room's listing
+			var first *swMember
+			for _, m := range rm.sw.members {
+				if first == nil || m.joined < first.joined {
+					first = m
+				}
+			}
+			rm.host = member{first.addr, first.seen, first.name, ""}
+		}
+		return rm.sw.roster()
+	}
 	if b.host {
 		if rm.join.addr != nil {
 			delete(r.by, rm.join.addr.String())
@@ -134,13 +158,14 @@ func (r *relay) release(b binding) {
 			delete(r.by, rm.host.addr.String())
 		}
 		delete(r.rooms, rm.id)
-		return
+		return nil
 	}
 	if rm.join.addr != nil {
 		delete(r.by, rm.join.addr.String())
 	}
 	rm.join = member{}
 	rm.token = ""
+	return nil
 }
 
 func (r *relay) control(pkt string, from *net.UDPAddr, now time.Time) []outgoing {
@@ -160,9 +185,15 @@ func (r *relay) control(pkt string, from *net.UDPAddr, now time.Time) []outgoing
 	k := from.String()
 
 	if f[0] == "BYE" {
+		if b, ok := r.by[k]; ok && b.room.id == id && b.room.sw != nil {
+			if m, in := b.room.sw.members[k]; in {
+				log.Printf("room %s: %s left", id, m.name)
+			}
+			return r.release(k, b)
+		}
 		if b, ok := r.by[k]; ok && b.room.id == id && b.host == (role == "host") {
 			log.Printf("room %s: %s %s left", id, role, b.room.memberName(b.host))
-			r.release(b)
+			r.release(k, b)
 		}
 		return nil
 	}
@@ -181,6 +212,9 @@ func (r *relay) control(pkt string, from *net.UDPAddr, now time.Time) []outgoing
 	if !(isHex(sum, 32) || (isHex(sum, 64) && strings.EqualFold(core, "GB2P"))) || core == "" {
 		return reply("ERR bad request")
 	}
+	if isSwitchCore(core) {
+		return r.controlSwitch(id, role, name, local, core, from, now)
+	}
 
 	var rm *room
 	if role == "host" {
@@ -195,6 +229,8 @@ func (r *relay) control(pkt string, from *net.UDPAddr, now time.Time) []outgoing
 			rm = &room{id: id, created: now}
 			r.rooms[id] = rm
 			log.Printf("room %s: %s opens it with %s (%s)", id, name, game, core)
+		} else if rm.sw != nil {
+			return reply("ERR room " + id + " already has a host")
 		} else if rm.host.live(now) && rm.host.addr.String() != k {
 			return reply("ERR room " + id + " already has a host")
 		}
@@ -219,7 +255,7 @@ func (r *relay) control(pkt string, from *net.UDPAddr, now time.Time) []outgoing
 			if rm == nil {
 				return reply("ERR no room with this game")
 			}
-		} else if rm = r.rooms[id]; rm == nil || !rm.host.live(now) {
+		} else if rm = r.rooms[id]; rm == nil || rm.sw != nil || !rm.host.live(now) {
 			return reply("ERR room is gone")
 		}
 		if rm.core != core || (rm.md5 != sum && !anyGame(core)) {
@@ -263,7 +299,11 @@ func (rm *room) memberName(host bool) string {
 
 // anyGame: a core whose players need not run the same game. GBA with the
 // wireless adapter (SPEC.md 13.5) is not lockstep: FireRed and LeafGreen talk.
-func anyGame(core string) bool { return strings.EqualFold(core, "GBA") }
+// ao486 with its network card (SPEC.md 15.4): the room is a LAN, each player
+// runs whatever PC software they like.
+func anyGame(core string) bool {
+	return strings.EqualFold(core, "GBA") || strings.EqualFold(core, "AO486")
+}
 
 // match: the oldest waiting room with this game, and how many are waiting.
 func (r *relay) match(core, sum string, now time.Time) (*room, int) {
@@ -300,6 +340,14 @@ func (r *relay) run() {
 			continue
 		}
 		b, ok := r.by[from.String()]
+		if ok && b.room.sw != nil {
+			out := b.room.sw.packet(from.String(), pkt, now)
+			r.mu.Unlock()
+			for _, o := range out {
+				r.conn.WriteToUDP([]byte(o.msg), o.to)
+			}
+			continue
+		}
 		var to *net.UDPAddr
 		if ok {
 			me, other := &b.room.host, &b.room.join
@@ -322,17 +370,30 @@ func (r *relay) sweep() {
 	for range time.Tick(5 * time.Second) {
 		now := time.Now()
 		r.mu.Lock()
+		var out []outgoing
 		for _, rm := range r.rooms {
+			if rm.sw != nil {
+				for k, m := range rm.sw.members {
+					if now.Sub(m.seen) > peerTimeout {
+						log.Printf("room %s: %s gone", rm.id, m.name)
+						out = append(out, r.release(k, binding{rm, false})...)
+					}
+				}
+				continue
+			}
 			if rm.join.addr != nil && now.Sub(rm.join.seen) > peerTimeout {
 				log.Printf("room %s: %s gone", rm.id, rm.join.name)
-				r.release(binding{rm, false})
+				r.release(rm.join.addr.String(), binding{rm, false})
 			}
 			if now.Sub(rm.host.seen) > peerTimeout {
 				log.Printf("room %s: closed (%s gone)", rm.id, rm.host.name)
-				r.release(binding{rm, true})
+				r.release(rm.host.addr.String(), binding{rm, true})
 			}
 		}
 		r.mu.Unlock()
+		for _, o := range out {
+			r.conn.WriteToUDP([]byte(o.msg), o.to)
+		}
 	}
 }
 
@@ -346,7 +407,7 @@ func (r *relay) list(core string) []roomInfo {
 	r.mu.Lock()
 	var rs []*room
 	for _, rm := range r.rooms {
-		if rm.host.live(now) && (core == "" || strings.EqualFold(core, rm.core)) {
+		if (rm.host.live(now) || (rm.sw != nil && rm.sw.live(now) > 0)) && (core == "" || strings.EqualFold(core, rm.core)) {
 			rs = append(rs, rm)
 		}
 	}
@@ -354,6 +415,17 @@ func (r *relay) list(core string) []roomInfo {
 	out := make([]roomInfo, 0, len(rs))
 	for _, rm := range rs {
 		ri := roomInfo{rm.id, "waiting", rm.core, rm.md5, rm.host.name, rm.game, ""}
+		if rm.sw != nil {
+			names := rm.sw.names()
+			if len(names) > 0 {
+				ri.host = names[0]
+			}
+			if len(names) > 1 { // still open: up to eight
+				ri.join = strings.Join(names[1:], ", ")
+			}
+			out = append(out, ri)
+			continue
+		}
 		if rm.join.live(now) {
 			ri.state, ri.join = "playing", rm.join.name
 		}

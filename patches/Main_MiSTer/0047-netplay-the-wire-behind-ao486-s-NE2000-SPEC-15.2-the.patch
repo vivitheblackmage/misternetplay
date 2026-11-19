@@ -1,0 +1,572 @@
+From db07c2c1ff63efc51fb61717db308dc926e8ce32 Mon Sep 17 00:00:00 2001
+From: netplay <netplay@localhost>
+Date: Mon, 16 Nov 2026 22:03:43 +0100
+Subject: [PATCH 47/52] netplay: the wire behind ao486's NE2000 (SPEC 15.2):
+ the shared window at 0x1FF00000 published at core start (MAC, heartbeat,
+ signature last), TX sent then acked, RX into the 16-slot ring, modes from the
+ OSD (eth0/eth1/macvlan/tap, the A2065 host layer); called from
+ netplay_start/stop/poll; T3e test_ne2000
+---
+ support/netplay/ne2000.cpp           | 263 +++++++++++++++++++++++++++
+ support/netplay/ne2000.h             |  17 ++
+ support/netplay/netplay.cpp          |   4 +
+ support/netplay/test/Makefile        |   8 +-
+ support/netplay/test/test_ne2000.cpp | 168 +++++++++++++++++
+ support/netplay/test/udp_harness.cpp |   5 +
+ 6 files changed, 463 insertions(+), 2 deletions(-)
+ create mode 100644 support/netplay/ne2000.cpp
+ create mode 100644 support/netplay/ne2000.h
+ create mode 100644 support/netplay/test/test_ne2000.cpp
+
+diff --git a/support/netplay/ne2000.cpp b/support/netplay/ne2000.cpp
+new file mode 100644
+index 0000000..ede2a39
+--- /dev/null
++++ b/support/netplay/ne2000.cpp
+@@ -0,0 +1,263 @@
++// The wire behind the ao486 core's NE2000 -- see ne2000.h.
++//
++// The window's contract is the core's (rtl/soc/ne2000/ne2000_core.v, the
++// ETH_SHM_* offsets) and the PR's reference daemon (sw/nettest/ne2000d.py):
++//   1. clear the whole window before publishing anything
++//   2. the MAC, then the signature 0xCAFEBABE, last
++//   3. a heartbeat that changes on every pass (the core reports COMM_OK only
++//      while it moves)
++//   4. the signature cleared when Main lets go
++// The core reads the MAC once, when it leaves reset; it keeps its built-in
++// address unless the window holds a unicast, locally administered one.
++// 16-bit values are little-endian and a 32-bit value is {word+2, word}, so
++// plain little-endian access on the ARM matches both.
++//
++// Transmit: the core puts the frame at TX_BUFFER, its length at TX_REQ_LEN and
++// then a new TX_REQ_SEQ; Main sends it and only then copies the sequence to
++// TX_DONE_SEQ (the guest's transmit completes on that).
++// Receive: a ring of 16 slots of 1536 bytes; the core owns HEAD, Main owns
++// TAIL and writes the frame and its length before it advances TAIL.
++
++#include <stdio.h>
++#include <string.h>
++#include <stdint.h>
++
++#include "../../user_io.h"
++#include "../../shmem.h"
++#include "ne2000.h"
++
++// shared host-network layer from the A2065 module
++extern int  ethernet_open(const char *iface, int promiscuous);
++extern void ethernet_close(void);
++extern void ethernet_send(const uint8_t *frame, int len);
++extern int  ethernet_recv_nb(uint8_t *buf, int maxlen);
++extern int  ethernet_set_mac_filter(const uint8_t *mac);
++extern int  ethernet_macvlan_create(const char *parent, const char *name, const uint8_t *mac);
++extern void ethernet_macvlan_delete(const char *name);
++extern int  a2065_mode_available(int mode);
++
++#define NE_BASE          0x1FF00000UL
++#define NE_SIZE          0x10000UL
++
++#define OFF_FLAGS        0x1000
++#define OFF_MAC          0x104C
++#define OFF_STATUS       0x1052
++#define OFF_HEARTBEAT    0x1088
++#define OFF_SIGNATURE    0x108C
++#define OFF_TX_BUFFER    0x2000
++#define OFF_TX_REQ_LEN   0x2C02
++#define OFF_RX_HEAD      0x2C04
++#define OFF_RX_TAIL      0x2C06
++#define OFF_TX_REQ_SEQ   0x2C08
++#define OFF_TX_DONE_SEQ  0x2C0A
++#define OFF_RX_LEN       0x2C20      // 16 x u16, by slot
++#define OFF_RX_DATA      0x9000      // 16 x 1536 bytes
++
++#define RX_SLOTS         16
++#define RX_SLOT_BYTES    0x600
++#define FLAG_RX_AVAIL    0x04        // Main's bit in the low byte of FLAGS
++#define SIGNATURE        0xCAFEBABEu
++#define MAX_FRAME        1536
++
++#define ST_COMM_OK       0x1000
++
++// modes as the A2065 module numbers them (a2065_mode_available)
++#define MODE_OFF         0
++#define MODE_ETH0        1
++#define MODE_ETH1        2
++#define MODE_MACVLAN     3
++#define MODE_TAP         4
++
++#define MACVLAN_NAME     "ne2k0"
++
++static volatile uint8_t *win = 0;
++static int      running = 0;
++static int      link_open = 0;
++static int      made_macvlan = 0;
++static int      cur_mode = MODE_OFF;
++static uint32_t heartbeat = 0;
++static uint16_t last_tx_seq = 0;
++static uint16_t last_status = 0;
++static uint8_t  mac[6];
++
++static inline uint16_t rd16(uint32_t off) { return *(volatile uint16_t *)(win + off); }
++static inline void wr16(uint32_t off, uint16_t v) { *(volatile uint16_t *)(win + off) = v; }
++static inline void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(win + off) = v; }
++
++// 52:54:05:04 (unicast, locally administered: the card's own prefix) and the
++// last two bytes of eth0's address, so two MiSTers on one LAN differ.
++static void make_mac(void)
++{
++	static const uint8_t def[6] = { 0x52, 0x54, 0x05, 0x04, 0x03, 0x02 };
++	memcpy(mac, def, 6);
++	FILE *f = fopen("/sys/class/net/eth0/address", "r");
++	if (!f) return;
++	unsigned int b[6];
++	if (fscanf(f, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) == 6)
++	{
++		mac[4] = (uint8_t)b[4];
++		mac[5] = (uint8_t)b[5];
++	}
++	fclose(f);
++}
++
++static void close_link(void)
++{
++	if (link_open)
++	{
++		ethernet_close();
++		link_open = 0;
++	}
++	if (made_macvlan)
++	{
++		ethernet_macvlan_delete(MACVLAN_NAME);
++		made_macvlan = 0;
++	}
++}
++
++static void open_link(int mode)
++{
++	const char *iface;
++	int promisc = 0;
++
++	close_link();
++	switch (mode)
++	{
++	case MODE_ETH0:    iface = "eth0"; promisc = 1; break;   // shared NIC: promiscuous plus the MAC filter
++	case MODE_ETH1:    iface = "eth1"; break;
++	case MODE_MACVLAN:
++		if (!ethernet_macvlan_create("eth0", MACVLAN_NAME, mac)) return;
++		made_macvlan = 1;
++		iface = MACVLAN_NAME;
++		break;
++	case MODE_TAP:     iface = "tap0"; break;
++	default: return;
++	}
++
++	if (!ethernet_open(iface, promisc)) return;
++	link_open = 1;
++
++	// what the kernel queued before the link was up is stale for the guest
++	uint8_t scratch[MAX_FRAME];
++	while (ethernet_recv_nb(scratch, MAX_FRAME) > 0) {}
++
++	if (mode == MODE_ETH0) ethernet_set_mac_filter(mac);
++	printf("[ne2000] link up on %s (mode %d)\n", iface, mode);
++}
++
++static int mode_from_status(void)
++{
++	if (!user_io_status_get("[66]")) return MODE_OFF;
++	int mode = (int)user_io_status_get("[65:64]") + 1;
++	if (!a2065_mode_available(mode)) return MODE_OFF;
++	return mode;
++}
++
++void ne2000_start(void)
++{
++	if (!win)
++	{
++		win = (volatile uint8_t *)shmem_map(NE_BASE, NE_SIZE);
++		if (!win)
++		{
++			printf("[ne2000] shmem_map failed\n");
++			return;
++		}
++	}
++
++	close_link();
++	memset((void *)win, 0, NE_SIZE);
++	make_mac();
++	for (int i = 0; i < 6; i++) win[OFF_MAC + i] = mac[i];
++	heartbeat = 0;
++	wr32(OFF_HEARTBEAT, 0);
++	__sync_synchronize();
++	wr32(OFF_SIGNATURE, SIGNATURE);
++	__sync_synchronize();
++
++	last_tx_seq = rd16(OFF_TX_DONE_SEQ);
++	last_status = 0;
++	cur_mode = MODE_OFF;
++	running = 1;
++	printf("[ne2000] window at 0x%08lX, card MAC %02X:%02X:%02X:%02X:%02X:%02X\n",
++	       NE_BASE, mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++}
++
++void ne2000_stop(void)
++{
++	if (!running) return;
++	running = 0;
++	close_link();
++	if (win) wr32(OFF_SIGNATURE, 0);
++	printf("[ne2000] stopped\n");
++}
++
++static void poll_tx(void)
++{
++	uint16_t seq = rd16(OFF_TX_REQ_SEQ);
++	if (seq == last_tx_seq || seq == 0) return;
++
++	int len = rd16(OFF_TX_REQ_LEN);
++	if (len <= 0 || len > MAX_FRAME) return;      // never ack nonsense: the guest would take it as sent
++
++	if (link_open)
++	{
++		static uint8_t frame[MAX_FRAME];
++		memcpy(frame, (const void *)(win + OFF_TX_BUFFER), len);
++		ethernet_send(frame, len);
++	}
++	// with no link the frame is dropped, as a card with no cable does
++	__sync_synchronize();
++	wr16(OFF_TX_DONE_SEQ, seq);
++	last_tx_seq = seq;
++}
++
++static void poll_rx(void)
++{
++	static uint8_t frame[MAX_FRAME];
++
++	// drain the socket dry every pass: a card that is not keeping up drops
++	// frames on the wire, it does not get them later
++	for (;;)
++	{
++		int len = ethernet_recv_nb(frame, MAX_FRAME);
++		if (len <= 0) break;
++		if (len < 14) continue;
++		if (!memcmp(frame + 6, mac, 6)) continue;  // our own transmit, echoed by AF_PACKET
++
++		uint16_t head = rd16(OFF_RX_HEAD) & (RX_SLOTS - 1);
++		uint16_t tail = rd16(OFF_RX_TAIL) & (RX_SLOTS - 1);
++		uint16_t next = (tail + 1) & (RX_SLOTS - 1);
++		if (next == head) continue;                  // ring full: the guest is behind
++
++		if (len > RX_SLOT_BYTES) len = RX_SLOT_BYTES;
++		memcpy((void *)(win + OFF_RX_DATA + tail * RX_SLOT_BYTES), frame, len);
++		wr16(OFF_RX_LEN + tail * 2, (uint16_t)len);
++		__sync_synchronize();
++		wr16(OFF_RX_TAIL, next);                     // only now is the slot the core's
++		win[OFF_FLAGS] = win[OFF_FLAGS] | FLAG_RX_AVAIL;
++	}
++}
++
++void ne2000_poll(void)
++{
++	if (!running || !win) return;
++
++	wr32(OFF_HEARTBEAT, ++heartbeat);
++
++	int mode = mode_from_status();
++	if (mode != cur_mode)
++	{
++		cur_mode = mode;
++		if (mode == MODE_OFF) close_link();
++		else open_link(mode);
++	}
++
++	poll_tx();
++	if (link_open) poll_rx();
++
++	uint16_t st = rd16(OFF_STATUS);
++	if ((st & ST_COMM_OK) != (last_status & ST_COMM_OK))
++		printf("[ne2000] core %s the window\n", (st & ST_COMM_OK) ? "talks to" : "lost");
++	last_status = st;
++}
+diff --git a/support/netplay/ne2000.h b/support/netplay/ne2000.h
+new file mode 100644
+index 0000000..676beec
+--- /dev/null
++++ b/support/netplay/ne2000.h
+@@ -0,0 +1,17 @@
++#ifndef NP_NE2000_H
++#define NP_NE2000_H
++
++// The wire behind the ao486 core's NE2000 (rtl/soc/ne2000, from upstream
++// ao486 PR #238). The card exchanges raw Ethernet frames with Main through a
++// 64 KB window in DDR3 at ARM physical 0x1FF00000, the same window the A2065
++// and the NeXT core use (one core runs at a time). The host network side
++// (AF_PACKET sockets, the MAC filter, macvlan, tap) is the A2065 module's.
++//
++// OSD (ao486.sv): [66] Network Off/On, [68:67] the card's IRQ (the core's
++// business), [65:64] the mode: Shared (eth0), eth1, MACVLAN, Bridge (tap0).
++
++void ne2000_start(void);   // the core was loaded: publish the window
++void ne2000_stop(void);    // another core: close the link, withdraw the window
++void ne2000_poll(void);    // every pass of Main's loop
++
++#endif
+diff --git a/support/netplay/netplay.cpp b/support/netplay/netplay.cpp
+index 19716c2..c462748 100644
+--- a/support/netplay/netplay.cpp
++++ b/support/netplay/netplay.cpp
+@@ -49,6 +49,7 @@
+ #include "../../fpga_io.h"
+ 
+ #include "netplay.h"
++#include "ne2000.h"
+ #include "netplay_proto.h"
+ #include "netplay_session.h"
+ 
+@@ -2755,6 +2756,7 @@ static void start_thread()
+ // option can still host (port 7845, delay 2); Join needs its peer=.
+ void netplay_start(void)
+ {
++	if (is_x86()) ne2000_start();      // ao486's network card: the window before the core leaves reset (SPEC 15)
+ 	int sys = netplay_system();
+ 	if (thread_running || sys < 0) return;
+ 	core_sys = (System)sys;
+@@ -2780,6 +2782,7 @@ void netplay_start(void)
+ 
+ void netplay_stop(void)
+ {
++	ne2000_stop();
+ 	core_armed = false;
+ 	gb_boot.clear();                    // the next core starts without them
+ 	arc_xml.clear();
+@@ -2793,6 +2796,7 @@ void netplay_stop(void)
+ 
+ void netplay_poll(void)
+ {
++	ne2000_poll();
+ 	// The main menu keeps the arcade rooms in _Arcade/_Netplay up to date
+ 	// (SPEC.md 12.5), so a player sees them before loading any MRA. Loading
+ 	// one stops it (netplay_stop() on the core change; the folder stays).
+diff --git a/support/netplay/test/Makefile b/support/netplay/test/Makefile
+index f690636..b8d9cad 100644
+--- a/support/netplay/test/Makefile
++++ b/support/netplay/test/Makefile
+@@ -8,8 +8,9 @@ ENGINE   := ../netplay_proto.cpp ../netplay_session.cpp
+ HDRS     := ../netplay_proto.h ../netplay_session.h fake_fpga.h
+ 
+ .PHONY: test clean
+-test: test_netplay test_rfu test_rfu_link udp_harness
++test: test_netplay test_rfu test_rfu_link test_ne2000 udp_harness
+ 	./test_netplay
++	./test_ne2000
+ 	./test_rfu
+ 	./test_rfu_link
+ 	./run_udp_test.sh
+@@ -55,6 +56,9 @@ test: test_netplay test_rfu test_rfu_link udp_harness
+ 	  NP_SYSTEM=neogeo NP_SERVER_BIN=$$srv NP_AUTOJOIN=1 NP_OSD=1 NP_NEO_RAN=1 ./run_udp_test.sh; \
+ 	else echo "SKIP udp (server): build it with server/build.sh"; fi
+ 
++test_ne2000: test_ne2000.cpp ../ne2000.cpp ../ne2000.h
++	$(CXX) $(CXXFLAGS) -o $@ test_ne2000.cpp
++
+ test_netplay: $(ENGINE) test_netplay.cpp $(HDRS)
+ 	$(CXX) $(CXXFLAGS) -o $@ $(ENGINE) test_netplay.cpp
+ 
+@@ -75,4 +79,4 @@ udp_harness: $(ENGINE) $(RFU) ../netplay.cpp ../netplay.h udp_harness.cpp $(HDRS
+ 	  -o $@ $(ENGINE) $(RFU) ../netplay.cpp udp_harness.cpp md5.o -lpthread
+ 
+ clean:
+-	rm -f test_netplay test_rfu test_rfu_link udp_harness md5.o
++	rm -f test_netplay test_rfu test_rfu_link test_ne2000 udp_harness md5.o
+diff --git a/support/netplay/test/test_ne2000.cpp b/support/netplay/test/test_ne2000.cpp
+new file mode 100644
+index 0000000..a0a2ec5
+--- /dev/null
++++ b/support/netplay/test/test_ne2000.cpp
+@@ -0,0 +1,168 @@
++// T3 for the ao486 NE2000's wire in Main (support/netplay/ne2000.cpp): the
++// shared window's contract as the core (rtl/soc/ne2000/ne2000_core.v) and the
++// PR's reference daemon (sw/nettest/ne2000d.py) define it, with the window in
++// plain memory, a fake core writing and reading it, and a fake Ethernet.
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <stdint.h>
++#include <vector>
++#include <deque>
++#include <string>
++
++// ---- Main's surroundings, faked ---------------------------------------------
++static uint8_t window[0x10000] __attribute__((aligned(8)));
++void *shmem_map(uint32_t, uint32_t) { return window; }
++
++static uint32_t st_enable = 0, st_mode = 0;
++uint32_t user_io_status_get(const char *opt, int)
++{
++	if (!strcmp(opt, "[66]")) return st_enable;
++	if (!strcmp(opt, "[65:64]")) return st_mode;
++	return 0;
++}
++
++static int opens = 0, closes = 0, promisc_seen = -1;
++static std::string open_iface;
++static uint8_t filter_mac[6];
++static int filters = 0;
++static std::vector<std::vector<uint8_t>> sent;
++static std::deque<std::vector<uint8_t>> wire_in;
++int  ethernet_open(const char *iface, int promiscuous) { opens++; open_iface = iface; promisc_seen = promiscuous; return 1; }
++void ethernet_close(void) { closes++; }
++void ethernet_send(const uint8_t *f, int len) { sent.push_back(std::vector<uint8_t>(f, f + len)); }
++int  ethernet_recv_nb(uint8_t *buf, int maxlen)
++{
++	if (wire_in.empty()) return 0;
++	std::vector<uint8_t> f = wire_in.front(); wire_in.pop_front();
++	int n = (int)f.size() < maxlen ? (int)f.size() : maxlen;
++	memcpy(buf, f.data(), n);
++	return n;
++}
++int  ethernet_set_mac_filter(const uint8_t *mac) { memcpy(filter_mac, mac, 6); filters++; return 1; }
++int  ethernet_macvlan_create(const char *, const char *, const uint8_t *) { return 1; }
++void ethernet_macvlan_delete(const char *) {}
++int  a2065_mode_available(int mode) { return mode != 2; }   // no eth1 on this "MiSTer"
++
++#include "../ne2000.cpp"
++
++// ---- checks -----------------------------------------------------------------
++static int fails = 0, checks = 0;
++#define CHECK(c, ...) do { checks++; if (!(c)) { fails++; printf("FAIL %s:%d: ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
++
++static uint16_t w16(uint32_t off) { return (uint16_t)(window[off] | (window[off + 1] << 8)); }
++static void set16(uint32_t off, uint16_t v) { window[off] = v & 0xFF; window[off + 1] = v >> 8; }
++// a 32-bit slot as the core assembles it: {word@off+2, word@off}
++static uint32_t core32(uint32_t off) { return ((uint32_t)w16(off + 2) << 16) | w16(off); }
++
++static std::vector<uint8_t> frame(uint8_t tag, int len, const uint8_t *src = 0)
++{
++	std::vector<uint8_t> f(len, tag);
++	memset(f.data(), 0xFF, 6);                                  // broadcast
++	static const uint8_t other[6] = { 0x02, 0, 0, 0, 0, 0x99 };
++	memcpy(f.data() + 6, src ? src : other, 6);
++	return f;
++}
++
++// the core stages a frame and publishes the sequence last
++static void core_tx(uint16_t seq, const std::vector<uint8_t> &f)
++{
++	memcpy(window + OFF_TX_BUFFER, f.data(), f.size());
++	set16(OFF_TX_REQ_LEN, (uint16_t)f.size());
++	set16(OFF_TX_REQ_SEQ, seq);
++}
++
++int main()
++{
++	// ---- start: the window is published over whatever DDR3 held
++	memset(window, 0xA5, sizeof(window));
++	ne2000_start();
++	CHECK(core32(OFF_SIGNATURE) == 0xCAFEBABE, "signature %08X", core32(OFF_SIGNATURE));
++	CHECK(w16(OFF_RX_HEAD) == 0 && w16(OFF_RX_TAIL) == 0 && w16(OFF_TX_REQ_SEQ) == 0, "window not cleared");
++	CHECK(window[0x8000] == 0 && window[0xFFFF] == 0, "window not cleared to the end");
++	CHECK(window[OFF_MAC] == 0x52 && window[OFF_MAC + 1] == 0x54 && window[OFF_MAC + 2] == 0x05 && window[OFF_MAC + 3] == 0x04,
++	      "MAC prefix %02X:%02X:%02X:%02X", window[OFF_MAC], window[OFF_MAC + 1], window[OFF_MAC + 2], window[OFF_MAC + 3]);
++	CHECK(!(window[OFF_MAC] & 1) && (window[OFF_MAC] & 2), "the core adopts only a unicast, locally administered MAC");
++	uint8_t card_mac[6];
++	memcpy(card_mac, window + OFF_MAC, 6);
++
++	// ---- the heartbeat moves on every pass; Network Off opens nothing
++	uint32_t hb0 = core32(OFF_HEARTBEAT);
++	ne2000_poll();
++	uint32_t hb1 = core32(OFF_HEARTBEAT);
++	ne2000_poll();
++	CHECK(hb1 != hb0 && core32(OFF_HEARTBEAT) != hb1, "heartbeat %u %u %u", hb0, hb1, core32(OFF_HEARTBEAT));
++	CHECK(opens == 0, "a link opened with Network Off");
++
++	// ---- with no link, a transmit completes and goes nowhere (a card without a cable)
++	core_tx(1, frame(0x11, 60));
++	ne2000_poll();
++	CHECK(w16(OFF_TX_DONE_SEQ) == 1 && sent.empty(), "TX without link: done %u, sent %zu", w16(OFF_TX_DONE_SEQ), sent.size());
++
++	// ---- Network On, Shared: eth0, promiscuous, filtered on the card's MAC
++	st_enable = 1; st_mode = 0;
++	ne2000_poll();
++	CHECK(opens == 1 && open_iface == "eth0" && promisc_seen == 1, "open %d %s %d", opens, open_iface.c_str(), promisc_seen);
++	CHECK(filters == 1 && !memcmp(filter_mac, card_mac, 6), "MAC filter not set to the card's address");
++
++	// ---- transmit: sent once, acked after the send, not again for the same sequence
++	std::vector<uint8_t> f2 = frame(0x22, 1514);
++	core_tx(2, f2);
++	ne2000_poll();
++	ne2000_poll();
++	CHECK(sent.size() == 1 && sent[0] == f2, "TX: %zu frames sent", sent.size());
++	CHECK(w16(OFF_TX_DONE_SEQ) == 2, "TX done %u", w16(OFF_TX_DONE_SEQ));
++
++	// a nonsense length is never acked (the guest would take it as sent)
++	set16(OFF_TX_REQ_LEN, 4000);
++	set16(OFF_TX_REQ_SEQ, 3);
++	ne2000_poll();
++	CHECK(w16(OFF_TX_DONE_SEQ) == 2 && sent.size() == 1, "bad length acked or sent");
++	core_tx(3, frame(0x33, 64));
++	ne2000_poll();
++	CHECK(w16(OFF_TX_DONE_SEQ) == 3 && sent.size() == 2, "the retried request did not go");
++
++	// ---- receive: slots in order, the length before the tail, our own echo and runts dropped
++	wire_in.push_back(frame(0x41, 60));
++	wire_in.push_back(frame(0x42, 60, card_mac));     // our own transmit, echoed
++	wire_in.push_back(std::vector<uint8_t>(10, 0x43)); // runt
++	wire_in.push_back(frame(0x44, 1514));
++	ne2000_poll();
++	CHECK(w16(OFF_RX_TAIL) == 2, "RX tail %u", w16(OFF_RX_TAIL));
++	CHECK(w16(OFF_RX_LEN + 0) == 60 && window[OFF_RX_DATA + 20] == 0x41, "slot 0");
++	CHECK(w16(OFF_RX_LEN + 2) == 1514 && window[OFF_RX_DATA + RX_SLOT_BYTES + 1000] == 0x44, "slot 1");
++	CHECK(window[OFF_FLAGS] & FLAG_RX_AVAIL, "RX_AVAIL not set");
++
++	// ---- the ring holds 15; what does not fit is dropped, not kept for later
++	for (int i = 0; i < 20; i++) wire_in.push_back(frame((uint8_t)(0x50 + i), 100));
++	ne2000_poll();
++	CHECK(w16(OFF_RX_TAIL) == 15 && wire_in.empty(), "full ring: tail %u, left %zu", w16(OFF_RX_TAIL), wire_in.size());
++	CHECK(window[OFF_RX_DATA + 14 * RX_SLOT_BYTES + 50] == 0x50 + 12, "slot 14 holds the 13th frame");
++
++	// the core consumes four: four more fit, wrapping past slot 15
++	set16(OFF_RX_HEAD, 4);
++	for (int i = 0; i < 6; i++) wire_in.push_back(frame((uint8_t)(0x70 + i), 80));
++	ne2000_poll();
++	CHECK(w16(OFF_RX_TAIL) == 3, "wrapped tail %u", w16(OFF_RX_TAIL));
++	CHECK(window[OFF_RX_DATA + 15 * RX_SLOT_BYTES + 40] == 0x70 && window[OFF_RX_DATA + 2 * RX_SLOT_BYTES + 40] == 0x73, "wrapped slots");
++
++	// ---- a mode the MiSTer lacks (eth1) is Off; back to Off closes the link
++	st_mode = 1;
++	ne2000_poll();
++	CHECK(closes >= 1, "eth1 (absent) did not close the link");
++	int opens_before = opens;
++	st_mode = 2;                                       // MACVLAN
++	ne2000_poll();
++	CHECK(opens == opens_before + 1 && open_iface == "ne2k0", "macvlan: %s", open_iface.c_str());
++	st_enable = 0;
++	int closes_before = closes;
++	ne2000_poll();
++	CHECK(closes == closes_before + 1, "Network Off did not close the link");
++
++	// ---- another core: the signature is withdrawn
++	ne2000_stop();
++	CHECK(core32(OFF_SIGNATURE) == 0, "signature left after stop");
++
++	printf("%s: %d checks, %d failed\n", fails ? "FAIL test_ne2000" : "PASS test_ne2000", checks, fails);
++	return fails ? 1 : 0;
++}
+diff --git a/support/netplay/test/udp_harness.cpp b/support/netplay/test/udp_harness.cpp
+index 6a0e043..2b55594 100644
+--- a/support/netplay/test/udp_harness.cpp
++++ b/support/netplay/test/udp_harness.cpp
+@@ -53,6 +53,11 @@ char *user_io_get_core_path(const char *, int) { static char p[] = "games/NES",
+ char is_arcade() { return arcade; }
+ static bool menu_mode = false;              // NP_MENU: the join starts in the main menu
+ char is_menu() { return menu_mode; }
++char is_x86() { return 0; }
++// ao486's network card (ne2000.cpp) has its own test, test_ne2000
++void ne2000_start() {}
++void ne2000_stop() {}
++void ne2000_poll() {}
+ 
+ sw_struct *arcade_sw() { return &sw; }
+ void arcade_sw_send()
+-- 
+2.43.0
+

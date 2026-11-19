@@ -1,5 +1,124 @@
 # Release notes
 
+## v0.7: ao486 (PC) network games, the Netplay folder
+
+### Changed: the netplay cores have their own folder
+
+- The cores are now in **`_Netplay`**, shown as **Netplay** in the main menu,
+  with their build date in the name as MiSTer's own cores have it
+  (`NES_netplay_20261118.rbf`).
+- Why: up to v0.6 they were in `_Console` next to the normal cores. A game
+  shortcut (an `.mgl` file, MiSTer_SAM, a favourite) names its core without the
+  date, such as `_Console/NES`, and the MiSTer takes the file whose name sorts
+  last: `NES_netplay.rbf`. So those shortcuts started the netplay core instead
+  of your normal one. Starting a core from the menu was not affected.
+- **Updating from v0.6 or older:** copy the new `SD card` folder, then run
+  **Scripts → netplay_on**. It removes the old `_Console/*_netplay.rbf` once
+  their new copies are in `_Netplay`, older versions in `_Netplay` and the old
+  `_Arcade/cores/jtbubl-netplay.rbf`.
+- **Staying on v0.6 or older for now:** delete `_Console/NES_netplay.rbf`,
+  `SNES_netplay.rbf`, `GAMEBOY2P_netplay.rbf`, `GBA_netplay.rbf` and
+  `NeoGeo_netplay.rbf` when you do not play netplay, or rename them so that
+  they do not start with the core's name (`Netplay-NES.rbf`): netplay works
+  with any file name.
+
+### Fixed: netplay_off when MiSTer_offline is a netplay binary
+
+- `netplay_on` before v0.5 saved the netplay binary as `MiSTer_offline` when it
+  updated one netplay binary with another, so your normal binary was gone and
+  `netplay_off` refused. `update_all` does not bring it back: downloader trusts
+  its list of installed files and never sees that `MiSTer` was changed.
+- Now `netplay_on` and `netplay_off` see it and fetch the official `MiSTer`
+  binary from the MiSTer database (the one in your `downloader.ini`), check it
+  against the database's MD5 and put it in `MiSTer_offline`. Nothing to do by
+  hand: copy the new `SD card` folder and run **Scripts → netplay_on** as
+  usual. The MiSTer needs the network for this; without it, downloader's own
+  backup `.MiSTer.old` is used when it is a normal binary, or `netplay_off`
+  tries again next time.
+
+### New: a network card for the ao486 core
+
+- **`_Netplay/ao486_netplay_<date>.rbf`**: the MiSTer ao486 core with an NE2000
+  network card (from ao486_MiSTer pull request #238 by georgemog), next to the
+  normal ao486 core, which is not changed. Up to eight MiSTers in a room share
+  one small network: DOS games with IPX network play see each other as on a
+  LAN (Doom, Duke Nukem 3D, Warcraft II, Command & Conquer, Blood ...). Each
+  MiSTer runs its own PC; only the network frames cross, so there is no
+  lockstep and nothing to desync.
+- In the OSD's Hardware page: **Netplay → Host** on one MiSTer and **Join** on
+  the others. That turns **Network** on as well; reset the PC once. With a
+  server the room takes up to eight, and the OSD lists who is in it; without
+  one, two MiSTers play directly with `peer=`, as on the other cores.
+- **The DOS kit** (`games/AO486/NETPLAY.IMG`): Scripts → **ao486_netplay_install**
+  puts it on every DOS hard disk in `games/AO486` at once (the ready-made
+  disks work; Windows 95/98 disks are left alone), and copies your DOS game
+  shortcuts (such as `_DOS Games`) to **Netplay → DOS Games**, where they
+  start the netplay core; **ao486_netplay_uninstall** takes it all off again. Then, with the network on,
+  the PC asks at boot: **1 Online** loads the drivers and opens the network
+  game menu, **2 Single player** (or no key for 10 seconds) boots the disk as
+  before.
+- **The menu** shows the network games on the disk and the other players in
+  the room. Doom-style games get the players, mode and skill from the menu;
+  the others start and show how their own menus set up network play. Press
+  **J** to follow another player's game with the same settings.
+- **NPIPX**, our own IPX driver on the packet driver: Intel's PDIPX passes no
+  received packet on with the NE2000 driver, so Doom never found the other
+  player.
+- With **Netplay Off** and Network On, the card is on the MiSTer's own network
+  instead (DHCP and the internet from DOS; needs an Ethernet cable).
+
+### Credits: the network card is georgemog's
+
+The NE2000 network card in the ao486 core is not ours. It comes from
+**georgemog**'s pull request #238 to MiSTer-devel/ao486_MiSTer, "Add NE2000
+network card" (github.com/georgemog/ao486_MiSTer, branch `ne2000-nic`), which
+is not merged upstream. It brought the card itself in the FPGA, its wiring to
+the ao486's I/O and interrupts, the shared-memory window in DDR3 through which
+the ARM side moves the frames, its test benches and DOS test tools. The card's
+core is the RTL8019AS/NE2000 from **apolkosnik**'s Minimig-AGA_MiSTer
+(Ethernet_shmem2), which the pull request adapted. The card is their work,
+not ours; what we changed is listed below.
+
+We took the pull request as it is (`patches/ao486_MiSTer/0001`) and fixed what
+the hardware showed, since it had not been built in Quartus or run on a MiSTer
+before:
+
+- The OSD's Network option used a status bit that has been the core's
+  Low-Res option since 2020, so turning the network on changed the video
+  mode; it moved to free bits, and the status wire carries all 128 bits (only
+  64 were connected).
+- The card now keeps the MAC address it took from the MiSTer through its own
+  reset: a DOS driver read the PROM right after the reset and got the
+  built-in address, and the replies to it were filtered away.
+- On the ARM side, our Main binary moves the frames in place of the pull
+  request's Python daemon, reading the core's eight-slot transmit ring (the
+  daemon still read the earlier single buffer, so nothing was sent).
+
+The rooms between MiSTers, the server's switch, the DOS menu and our IPX
+driver (NPIPX) are new in this release. Details: SPEC.md section 15.
+
+### Server
+
+- ao486 rooms of up to eight, with the server as the room's network switch.
+  The key is checked as before, and the rooms of all other cores are not
+  changed. Update the server for rooms of more than two (an older Main
+  works with it too, without the list of names).
+
+### Known limits
+
+- Rooms of three or more and the direct link have been tested in the
+  automated tests only (three MiSTer programs through a real server); Doom,
+  the menu and the boot question on two MiSTers through the server.
+- Of the games in the menu's list (`GAMES.INI`), only Doom has been played
+  between MiSTers so far. The others are set up from how each game starts its
+  network play, and have not been played over the network on MiSTers yet. A
+  game that does not start right can be changed in `C:\NETPLAY\GAMES.INI`.
+- Only one ao486 room per server can be joined without picking it: with two
+  open, Join waits ("pick one"), and there is no room folder for ao486 yet.
+- Games that only play over a serial cable or modem, or with two players on
+  one PC, cannot use the network card. The ao486 has no maths coprocessor
+  (no Quake).
+
 ## v0.6: Neo Geo
 
 ### New: Neo Geo netplay

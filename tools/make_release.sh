@@ -8,7 +8,8 @@
 # Main_MiSTer (rebuilt here, it is quick) and the server (server/build.sh when
 # Docker runs, else the existing builds must be newer than the Go files).
 # The binaries stay out of git (releases/ is ignored); the tag <version> in this
-# repo and in NES_MiSTer, SNES_MiSTer, Gameboy2P_MiSTer, GBA_MiSTer, NeoGeo_MiSTer, jtcores and Main_MiSTer marks their source.
+# repo and in NES_MiSTer, SNES_MiSTer, Gameboy2P_MiSTer, GBA_MiSTer, NeoGeo_MiSTer, ao486_MiSTer, jtcores and Main_MiSTer marks their source.
+# The ao486 DOS kit floppy (NETPLAY.IMG) is built here (Open Watcom in Docker).
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,7 +24,7 @@ fail() { echo "not released: $*"; exit 1; }
 # SOURCE.txt: where the binaries come from (the public repo's tag, the upstreams)
 write_source() {
 	{
-		echo "NES, SNES, Game Boy 2P, GBA wireless, Neo Geo and arcade netplay $ver, $(date '+%Y-%m-%d')"
+		echo "NES, SNES, Game Boy 2P, GBA wireless, Neo Geo, arcade and ao486 netplay $ver, $(date '+%Y-%m-%d')"
 		echo
 		echo "Source code: https://github.com/vivitheblackmage/misternetplay, tag $ver"
 		echo "  NES core:    github.com/MiSTer-devel/NES_MiSTer  $(sed -n 's/^NES_BASE=\(.......\).*/\1/p' setup.sh) + patches/NES_MiSTer ($(ls patches/NES_MiSTer/*.patch | wc -l) patches)"
@@ -31,9 +32,12 @@ write_source() {
 		echo "  Game Boy 2P: github.com/pomstazlesa/Gameboy2PUW_MiSTer $(sed -n 's/^GB2P_BASE=\(.......\).*/\1/p' setup.sh) + patches/Gameboy2P_MiSTer ($(ls patches/Gameboy2P_MiSTer/*.patch | wc -l) patches)"
 		echo "  GBA:         github.com/MiSTer-devel/GBA_MiSTer  $(sed -n 's/^GBA_BASE=\(.......\).*/\1/p' setup.sh) + patches/GBA_MiSTer ($(ls patches/GBA_MiSTer/*.patch | wc -l) patches)"
 		echo "  Neo Geo:     github.com/MiSTer-devel/NeoGeo_MiSTer $(sed -n 's/^NEOGEO_BASE=\(.......\).*/\1/p' setup.sh) + patches/NeoGeo_MiSTer ($(ls patches/NeoGeo_MiSTer/*.patch | wc -l) patches)"
+		echo "  ao486 (PC):  github.com/MiSTer-devel/ao486_MiSTer $(sed -n 's/^AO486_BASE=\(.......\).*/\1/p' setup.sh) + patches/ao486_MiSTer ($(ls patches/ao486_MiSTer/*.patch | wc -l) patches; the NE2000 card from ao486_MiSTer PR #238 by georgemog, its core from apolkosnik's Minimig-AGA_MiSTer)"
 		echo "  Arcade:      github.com/jotego/jtcores        $(sed -n 's/^JTCORES_BASE=\(.......\).*/\1/p' setup.sh) + patches/jtcores ($(ls patches/jtcores/*.patch | wc -l) patches)"
 		echo "  Main binary: github.com/MiSTer-devel/Main_MiSTer $(sed -n 's/^MAIN_BASE=\(.......\).*/\1/p' setup.sh) + patches/Main_MiSTer ($(ls patches/Main_MiSTer/*.patch | wc -l) patches)"
-		echo "  Server, tools, NetPong: in the repository itself."
+		echo "  Server, tools, NetPong, the ao486 DOS kit (games/AO486/NETPLAY.IMG): in the repository"
+		echo "  itself (tools/ao486/dos: NPMENU and NPIPX are ours, GPL-2.0-or-later; NE2000.COM is"
+		echo "  the Crynwr packet driver, GPL-1.0, its source in tools/ao486/dos/crynwr)."
 		echo
 		echo "./setup.sh at that tag recreates the source trees. Licence GPL-3.0."
 	} > "$1"
@@ -49,15 +53,16 @@ clean SNES_MiSTer
 clean Gameboy2P_MiSTer
 clean GBA_MiSTer
 clean NeoGeo_MiSTer
+clean ao486_MiSTer
 clean jtcores
 clean Main_MiSTer
-for r in . NES_MiSTer SNES_MiSTer Gameboy2P_MiSTer GBA_MiSTer NeoGeo_MiSTer jtcores Main_MiSTer; do
+for r in . NES_MiSTer SNES_MiSTer Gameboy2P_MiSTer GBA_MiSTer NeoGeo_MiSTer ao486_MiSTer jtcores Main_MiSTer; do
 	git -C "$r" rev-parse -q --verify "refs/tags/$ver" >/dev/null && fail "tag $ver exists in $r"
 done
 
 # patches/ must be what the repos' netplay branches hold
-for r in NES_MiSTer SNES_MiSTer Gameboy2P_MiSTer GBA_MiSTer NeoGeo_MiSTer jtcores Main_MiSTer; do
-	case $r in NES_MiSTer) var=NES_BASE;; SNES_MiSTer) var=SNES_BASE;; Gameboy2P_MiSTer) var=GB2P_BASE;; GBA_MiSTer) var=GBA_BASE;; NeoGeo_MiSTer) var=NEOGEO_BASE;; jtcores) var=JTCORES_BASE;; *) var=MAIN_BASE;; esac
+for r in NES_MiSTer SNES_MiSTer Gameboy2P_MiSTer GBA_MiSTer NeoGeo_MiSTer ao486_MiSTer jtcores Main_MiSTer; do
+	case $r in NES_MiSTer) var=NES_BASE;; SNES_MiSTer) var=SNES_BASE;; Gameboy2P_MiSTer) var=GB2P_BASE;; GBA_MiSTer) var=GBA_BASE;; NeoGeo_MiSTer) var=NEOGEO_BASE;; ao486_MiSTer) var=AO486_BASE;; jtcores) var=JTCORES_BASE;; *) var=MAIN_BASE;; esac
 	base=$(sed -n "s/^$var=\(.*\)/\1/p" setup.sh)
 	n_repo=$(git -C "$r" rev-list --count "$base..HEAD")
 	n_patch=$(ls patches/"$r"/*.patch | wc -l)
@@ -66,7 +71,7 @@ done
 
 # core: the .rbf must be newer than every tracked source file (not the ones
 # Quartus itself rewrites at the end of a build: .qsf, .cdf, pin dump)
-for core in NES SNES Gameboy2P GBA NeoGeo; do
+for core in NES SNES Gameboy2P GBA NeoGeo ao486; do
 	case $core in Gameboy2P) rbf=Gameboy2P_MiSTer/output_files/Gameboy.rbf;; *) rbf=${core}_MiSTer/output_files/$core.rbf;; esac
 	[ -f "$rbf" ] || fail "no $rbf (CORE=$core tools/quartus_build.sh)"
 	newest=$(cd ${core}_MiSTer && git ls-files -z -- . ':!*.md' ':!sim/*' ':!npsim/*' ':!*.qsf' ':!*.cdf' ':!*pin_model_dump.txt' | xargs -0 stat -c '%Y %n' | sort -n | tail -1)
@@ -93,16 +98,26 @@ for f in netplay-server.exe netplay-server-linux-amd64 netplay-server-linux-arm6
 	done
 done
 
+# the ao486 DOS kit floppy, from the committed sources (make_kit.sh takes it)
+tools/ao486/dos/netplay/build.sh dist/ao486-dos >/dev/null 2>&1 || fail "ao486 DOS kit build (tools/ao486/dos/netplay/build.sh, needs Docker)"
+
 tools/make_kit.sh >/dev/null
 
 mkdir -p "$out/server"
-cp NES_MiSTer/output_files/NES.rbf "$out/NES_netplay.rbf"
-cp SNES_MiSTer/output_files/SNES.rbf "$out/SNES_netplay.rbf"
-cp Gameboy2P_MiSTer/output_files/Gameboy.rbf "$out/GAMEBOY2P_netplay.rbf"
-cp GBA_MiSTer/output_files/GBA.rbf "$out/GBA_netplay.rbf"
-cp NeoGeo_MiSTer/output_files/NeoGeo.rbf "$out/NeoGeo_netplay.rbf"
+# the cores as on the SD card: _Netplay, with their build date (SPEC.md 1.1)
+d() { date -r "$1" +%Y%m%d; }
+mkdir -p "$out/_Netplay"
+cp NES_MiSTer/output_files/NES.rbf "$out/_Netplay/NES_netplay_$(d NES_MiSTer/output_files/NES.rbf).rbf"
+cp SNES_MiSTer/output_files/SNES.rbf "$out/_Netplay/SNES_netplay_$(d SNES_MiSTer/output_files/SNES.rbf).rbf"
+cp Gameboy2P_MiSTer/output_files/Gameboy.rbf "$out/_Netplay/GAMEBOY2P_netplay_$(d Gameboy2P_MiSTer/output_files/Gameboy.rbf).rbf"
+cp GBA_MiSTer/output_files/GBA.rbf "$out/_Netplay/GBA_netplay_$(d GBA_MiSTer/output_files/GBA.rbf).rbf"
+cp NeoGeo_MiSTer/output_files/NeoGeo.rbf "$out/_Netplay/NeoGeo_netplay_$(d NeoGeo_MiSTer/output_files/NeoGeo.rbf).rbf"
+cp ao486_MiSTer/output_files/ao486.rbf "$out/_Netplay/ao486_netplay_$(d ao486_MiSTer/output_files/ao486.rbf).rbf"
+mkdir -p "$out/ao486"
+cp dist/ao486-dos/NETPLAY.IMG "$out/ao486/"
+cp tools/mister-scripts/ao486_netplay_install.sh tools/mister-scripts/ao486_netplay_uninstall.sh "$out/ao486/"
 mkdir -p "$out/arcade"
-cp "$arbf" "$out/arcade/jtbubl-netplay.rbf"
+cp "$arbf" "$out/arcade/jtbubl-netplay_$(d "$arbf").rbf"
 cp tools/arcade/*.mra "$out/arcade/"
 cp Main_MiSTer/bin/MiSTer "$out/MiSTer_online"
 cp dist/netplay-kit.zip "$out/"
@@ -118,7 +133,7 @@ if [ -x tools/check_private.sh ]; then
 	tools/check_private.sh "$out" || { rm -rf "$out"; fail "private data in the release (see above)"; }
 fi
 
-for r in . NES_MiSTer SNES_MiSTer Gameboy2P_MiSTer GBA_MiSTer NeoGeo_MiSTer jtcores Main_MiSTer; do git -C "$r" tag -a "$ver" -m "NES, SNES, Game Boy 2P, GBA wireless, Neo Geo and arcade netplay $ver"; done
+for r in . NES_MiSTer SNES_MiSTer Gameboy2P_MiSTer GBA_MiSTer NeoGeo_MiSTer ao486_MiSTer jtcores Main_MiSTer; do git -C "$r" tag -a "$ver" -m "NES, SNES, Game Boy 2P, GBA wireless, Neo Geo, arcade and ao486 netplay $ver"; done
 echo "releases/$ver:"
 (cd "$out" && find . -type f | sort | sed 's|^\./|  |')
-echo "Tagged $ver in this repo, NES_MiSTer, SNES_MiSTer, Gameboy2P_MiSTer, GBA_MiSTer, NeoGeo_MiSTer, jtcores and Main_MiSTer."
+echo "Tagged $ver in this repo, NES_MiSTer, SNES_MiSTer, Gameboy2P_MiSTer, GBA_MiSTer, NeoGeo_MiSTer, ao486_MiSTer, jtcores and Main_MiSTer."
